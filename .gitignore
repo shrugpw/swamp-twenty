@@ -1,0 +1,51 @@
+# === PUBLIC MIRROR whitelist (github.com/shrugpw/swamp-twenty) ===
+# This dir is BOTH the local swamp dev tree (nested .swamp/ runtime state +
+# vault keys, CLAUDE.md, and the PRIVATE design/ dir) AND the git checkout of
+# the PUBLIC package mirror. Whitelist strategy: ignore everything, then
+# re-include only the published package files, so dev/secret/infra state can
+# NEVER be committed to the public repo.
+
+# Ignore everything...
+/*
+
+# ...but keep the published package files.
+!/.gitignore
+!/README.md
+!/LICENSE.txt
+!/CHANGELOG.md
+!/manifest.yaml
+!/extensions/
+!/.claude/
+
+# Within extensions/, ignore everything then re-include only the source
+# (models + tests). No reports for this package (yet).
+extensions/*
+!extensions/models/
+
+# Within .claude/, ignore everything then re-include only the bundled skill.
+.claude/*
+!/.claude/skills/
+
+# Belt-and-suspenders: the PRIVATE design dir must NEVER be published.
+/design/
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section

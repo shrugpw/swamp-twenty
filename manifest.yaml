@@ -1,0 +1,37 @@
+manifestVersion: 1
+name: "@shrug/twenty"
+version: "2026.09.05.1"
+description: "Drive a Twenty CRM instance over its REST v1 API (validated against v2.38.1): read/create People, Companies, Opportunities, and Notes, look records up idempotently by an immutable leadId marker (or composite email/domain filters), and self-provision the custom leadId/isEmergency fields. Its core is push_leads — a single fan-out method that ingests a batch of contact-form leads in one execution: it validates and sanitizes every field first (a bad lead writes nothing), dedups within the batch and against Twenty on leadId, reuses but never structurally mutates an existing Person, creates/links a Company only for business leads on a real corporate domain, always ensures the per-lead message Note, and flags emergency leads independently of the idempotency skip so an urgent alert can never be dropped. Mutations are confirm-gated with a no-write dryRun plan, run a live reachability pre-flight, and log the vaulted bearer token length-only. The token inherits whatever role you assign its API key in-workspace (Twenty gates by object-, field-, and row-level permissions); the REST API cannot manage roles, so emergency-record visibility is a documented UI pre-config rather than an API call. Ships a Claude skill playbook for driving the model."
+
+repository: https://github.com/shrugpw/swamp-twenty
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+  - CHANGELOG.md
+
+# twenty.ts is the whole model: the generic Twenty REST-v1 surface (People/
+# Companies/Opportunities/Notes CRUD + leadId/email/domain finders + schema
+# introspection + custom-field provisioning + emergency marker) AND the
+# push_leads fan-out that composes those primitives into the contact-form lead
+# sink. Kept in one file/type so push_leads shares the transport, validation,
+# and idempotency helpers directly rather than looping model-method calls.
+models:
+  - twenty.ts
+
+# Bundled Claude skill: a task playbook for driving the model (first-run field
+# provisioning, the push_leads idempotency/emergency contract, reading the
+# pushRun audit, and Twenty's role/permission model). Resolved manifest-relative
+# from .claude/skills/twenty/.
+skills:
+  - twenty
+
+# Empty platforms == universal. The model talks HTTPS to the Twenty REST API
+# via fetch(); no host binaries are shelled out, so it runs anywhere.
+platforms: []
+
+labels:
+  - twenty
+  - crm
+  - lead-intake
+  - contact-form
