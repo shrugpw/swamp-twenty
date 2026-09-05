@@ -589,6 +589,200 @@ async function createOpportunity(
   return unwrapRecord(json, "createOpportunity");
 }
 
+// --- Generalized opportunity upsert helpers ---------------------------------
+
+/**
+ * Twenty CURRENCY composite for a whole-currency amount. Twenty stores money as
+ * integer micros (1 unit = 1_000_000 micros), so $50,000 -> 50_000_000_000.
+ */
+export function toCurrency(
+  amount: number,
+  currencyCode: string,
+): { amountMicros: number; currencyCode: string } {
+  return { amountMicros: Math.round(amount * 1_000_000), currencyCode };
+}
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Normalize a close date to an ISO datetime (Twenty's closeDate is DATE_TIME).
+ * A bare `YYYY-MM-DD` is anchored to midnight UTC; any other parseable string is
+ * passed through Date. Returns null for empty/unparseable input.
+ */
+export function normalizeCloseDate(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (DATE_ONLY_RE.test(s)) return `${s}T00:00:00.000Z`;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+/** Fields writable on an Opportunity by upsertOpportunity. */
+interface OpportunityWriteFields {
+  name?: string;
+  stage?: string;
+  amount?: { amountMicros: number; currencyCode: string };
+  closeDate?: string;
+  pointOfContactId?: string;
+  companyId?: string;
+  isEmergency?: boolean;
+}
+
+/** Assemble a REST body from only the fields that are set (partial-update safe). */
+function buildOpportunityBody(
+  f: OpportunityWriteFields,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (f.name !== undefined) body.name = f.name;
+  if (f.stage !== undefined) body.stage = f.stage;
+  if (f.amount !== undefined) body.amount = f.amount;
+  if (f.closeDate !== undefined) body.closeDate = f.closeDate;
+  if (f.pointOfContactId) body.pointOfContactId = f.pointOfContactId;
+  if (f.companyId) body.companyId = f.companyId;
+  if (f.isEmergency !== undefined) body.isEmergency = f.isEmergency;
+  return body;
+}
+
+/** Create an Opportunity with the full generalized field set, keyed on leadId. */
+async function createOpportunityFull(
+  cfg: TwentyCfg,
+  leadId: string,
+  f: OpportunityWriteFields,
+): Promise<Record<string, unknown>> {
+  const body = { ...buildOpportunityBody(f), leadId };
+  const json = await twentyRequest(cfg, "POST", "/rest/opportunities", body);
+  return unwrapRecord(json, "createOpportunity");
+}
+
+/** Patch an existing Opportunity by id with only the provided fields. */
+async function updateOpportunity(
+  cfg: TwentyCfg,
+  id: string,
+  f: OpportunityWriteFields,
+): Promise<Record<string, unknown>> {
+  const json = await twentyRequest(
+    cfg,
+    "PATCH",
+    `/rest/opportunities/${id}`,
+    buildOpportunityBody(f),
+  );
+  return unwrapRecord(json, "updateOpportunity");
+}
+
+/**
+ * Twenty filter-DSL operator characters. A value containing any of these is not
+ * safe to interpolate into a `filter=field[eq]:<value>` expression even
+ * URL-encoded, so callers reject/skip such values (defense-in-depth beyond the
+ * URL-encoding in buildFilterPath).
+ */
+const FILTER_UNSAFE_RE = /[[\]():;,]/;
+
+/** True if a free-text value is safe to use as a filter [eq] value. */
+export function isFilterSafe(value: string): boolean {
+  return value.length > 0 && !FILTER_UNSAFE_RE.test(value);
+}
+
+/**
+ * Find exactly one Company by domain. Throws on an ambiguous (>1) match rather
+ * than silently taking the first, so a mislink can't happen unnoticed.
+ */
+async function findOneCompanyByDomain(
+  cfg: TwentyCfg,
+  domain: string,
+): Promise<Record<string, unknown> | null> {
+  const list = unwrapList(
+    await twentyRequest(
+      cfg,
+      "GET",
+      buildFilterPath("/rest/companies", "domainName.primaryLinkUrl", domain),
+    ),
+    "companies",
+  );
+  if (list.length > 1) {
+    throw new Error(
+      `Ambiguous company domain '${domain}': ${list.length} matches`,
+    );
+  }
+  return list[0] ?? null;
+}
+
+/**
+ * Find exactly one Company by exact name. The name must already be filter-safe
+ * (see isFilterSafe). Throws on an ambiguous (>1) match; returns null if the
+ * name field is not filterable on this instance rather than aborting the call.
+ */
+async function findOneCompanyByName(
+  cfg: TwentyCfg,
+  name: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const list = unwrapList(
+      await twentyRequest(
+        cfg,
+        "GET",
+        buildFilterPath("/rest/companies", "name", name),
+      ),
+      "companies",
+    );
+    if (list.length > 1) {
+      throw new Error(
+        `Ambiguous company name '${name}': ${list.length} matches`,
+      );
+    }
+    return list[0] ?? null;
+  } catch (e) {
+    if (e instanceof Error && /^Ambiguous/.test(e.message)) throw e;
+    return null; // name not filterable on this instance
+  }
+}
+
+/** Find exactly one Person by primary email. Throws on an ambiguous match. */
+async function findOnePersonByEmail(
+  cfg: TwentyCfg,
+  email: string,
+): Promise<Record<string, unknown> | null> {
+  const list = unwrapList(
+    await twentyRequest(
+      cfg,
+      "GET",
+      buildFilterPath("/rest/people", "emails.primaryEmail", email),
+    ),
+    "people",
+  );
+  if (list.length > 1) {
+    throw new Error(
+      `Ambiguous person email '${email}': ${list.length} matches`,
+    );
+  }
+  return list[0] ?? null;
+}
+
+/**
+ * Read the Opportunity object's live metadata: the `stage` SELECT enum values
+ * and the `closeDate` field type (DATE vs DATE_TIME). Used to fail fast on an
+ * invalid stage and to format closeDate correctly for the instance.
+ */
+async function fetchOpportunityMeta(
+  cfg: TwentyCfg,
+): Promise<{ stages: string[]; closeDateType: string | null }> {
+  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
+  const objs = ((json as { data?: unknown }).data ?? []) as Array<
+    Record<string, unknown>
+  >;
+  const opp = objs.find((o) => String(o.nameSingular ?? "") === "opportunity");
+  const fields = (opp?.fields ?? []) as Array<Record<string, unknown>>;
+  const list = Array.isArray(fields) ? fields : [];
+  const stageField = list.find((f) => String(f.name ?? "") === "stage");
+  const opts = (stageField?.options ?? []) as Array<Record<string, unknown>>;
+  const stages = Array.isArray(opts)
+    ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
+    : [];
+  const cdField = list.find((f) => String(f.name ?? "") === "closeDate");
+  const closeDateType = cdField ? (String(cdField.type ?? "") || null) : null;
+  return { stages, closeDateType };
+}
+
 async function findNoteByLeadId(
   cfg: TwentyCfg,
   leadId: string,
@@ -819,6 +1013,32 @@ const PushRunSchema = z.object({
   }),
 });
 
+const OpportunityUpsertSchema = z.object({
+  baseUrl: z.string(),
+  action: z.enum(["created", "updated", "planned-create", "planned-update"]),
+  dryRun: z.boolean(),
+  leadId: z.string(),
+  opportunityId: z.string().optional(),
+  name: z.string(),
+  stage: z.string(),
+  amount: z.number().optional().describe("Deal value in whole currency units"),
+  currencyCode: z.string().optional(),
+  closeDate: z.string().optional(),
+  companyId: z.string().optional(),
+  companyLinked: z.boolean().describe("A company was found/created and linked"),
+  companyNote: z
+    .string()
+    .optional()
+    .describe("Why a company was not linked (degraded path), if applicable"),
+  pointOfContactId: z.string().optional(),
+  pocSkipped: z
+    .string()
+    .optional()
+    .describe("Why the point of contact was not linked, if applicable"),
+  noteEnsured: z.boolean(),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface MethodLogger {
@@ -1005,10 +1225,20 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.05.1",
+  version: "2026.09.05.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.09.05.2",
+      description:
+        "Add the generalized upsertOpportunity method and opportunityUpsert resource. globalArguments is unchanged, so this is a no-op attribute migration (existing instances upgrade cleanly with no field changes).",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+  ],
   resources: {
     "capability": {
       description: "Reachability + auth probe snapshot",
@@ -1040,6 +1270,13 @@ export const model = {
       description:
         "Audit of one push_leads run: counts + per-lead results (no raw PII beyond leadId)",
       schema: PushRunSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "opportunityUpsert": {
+      description:
+        "Result of an upsertOpportunity run: the action taken and the resolved opportunity/company/contact ids",
+      schema: OpportunityUpsertSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -1406,13 +1643,326 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    upsertOpportunity: {
+      description:
+        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
+      arguments: z.object({
+        leadId: z
+          .string()
+          .describe(
+            "Stable idempotency key for this opportunity (upsert marker, e.g. 'jfw-aap-2.7-2026')",
+          ),
+        name: z.string().describe("Opportunity name"),
+        amount: z
+          .number()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Deal value in whole currency units (e.g. 50000 = $50,000)",
+          ),
+        currencyCode: z
+          .string()
+          .optional()
+          .describe(
+            "ISO 4217 currency code for amount (defaults to USD on create; on an amount-only update the existing currency is preserved)",
+          ),
+        stage: z
+          .string()
+          .optional()
+          .describe(
+            "Opportunity stage (NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER). Defaults to the model's opportunityStage.",
+          ),
+        closeDate: z
+          .string()
+          .default("")
+          .describe("Expected/actual close date (YYYY-MM-DD or ISO datetime)"),
+        companyName: z
+          .string()
+          .default("")
+          .describe("Company to find-or-create and link"),
+        companyDomain: z
+          .string()
+          .default("")
+          .describe("Company domain, used to dedup/link the company"),
+        pointOfContactName: z
+          .string()
+          .default("")
+          .describe(
+            "Point-of-contact full name (used only if the email is new)",
+          ),
+        pointOfContactEmail: z
+          .string()
+          .default("")
+          .describe(
+            "Point-of-contact email — the find-or-create key for the Person",
+          ),
+        isEmergency: z
+          .boolean()
+          .optional()
+          .describe("Set the isEmergency marker on the opportunity"),
+        noteBody: z
+          .string()
+          .default("")
+          .describe("Optional markdown note attached to the opportunity"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true for a real run (writes to Twenty)"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Resolve + plan, but write nothing"),
+      }),
+      execute: async (
+        args: {
+          leadId: string;
+          name: string;
+          amount?: number;
+          currencyCode?: string;
+          stage?: string;
+          closeDate: string;
+          companyName: string;
+          companyDomain: string;
+          pointOfContactName: string;
+          pointOfContactEmail: string;
+          isEmergency?: boolean;
+          noteBody: string;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to write without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        const leadId = validateLeadId(args.leadId);
+        if (!leadId) {
+          throw new Error(
+            "Invalid leadId (allowed: A-Za-z0-9._:- up to 128 chars)",
+          );
+        }
+        const name = sanitizeText(args.name, 200);
+        if (!name) throw new Error("name is required");
+        // Live Opportunity metadata: used to validate stage against the SELECT
+        // enum and to learn the closeDate field type. Best-effort — if metadata
+        // is unreadable, skip validation rather than block a write.
+        let oppMeta: { stages: string[]; closeDateType: string | null } = {
+          stages: [],
+          closeDateType: null,
+        };
+        try {
+          oppMeta = await fetchOpportunityMeta(cfg);
+        } catch (_e) {
+          context.logger.warning(
+            "Opportunity metadata unreadable; skipping stage validation",
+            {},
+          );
+        }
+
+        // All lookups + writes are wrapped so a Twenty 4xx that echoes a
+        // submitted value (email, company name) is redacted before it reaches
+        // logs — matching the no-raw-PII guarantee elsewhere in this file.
+        try {
+          // Idempotency lookup FIRST — decides create vs update and lets an update
+          // preserve fields (stage, currency) the caller did not set.
+          const existingOpp = await findOpportunityByLeadId(cfg, leadId);
+
+          // stage: apply the default only on CREATE; on update omit it unless the
+          // caller set one, so a re-run never resets a manually advanced stage.
+          const stageToWrite = args.stage ??
+            (existingOpp ? undefined : cfg.opportunityStage);
+          if (
+            stageToWrite !== undefined && oppMeta.stages.length &&
+            !oppMeta.stages.includes(stageToWrite)
+          ) {
+            throw new Error(
+              `Invalid stage '${stageToWrite}'. Valid stages: ${
+                oppMeta.stages.join(", ")
+              }`,
+            );
+          }
+
+          // amount: default USD only on create; on an amount-only update preserve
+          // the record's existing currency rather than silently forcing USD.
+          let amount:
+            | { amountMicros: number; currencyCode: string }
+            | undefined;
+          if (args.amount !== undefined) {
+            const existingCcy =
+              ((existingOpp?.amount as Record<string, unknown> | undefined)
+                ?.currencyCode) as string | undefined;
+            const ccy = args.currencyCode ?? existingCcy ?? "USD";
+            amount = toCurrency(args.amount, ccy);
+          }
+
+          // closeDate: bare date for a DATE field, anchored datetime for DATE_TIME
+          // (avoids an off-by-one day west of UTC on DATE fields).
+          let closeDate: string | undefined;
+          if (args.closeDate) {
+            const nd = normalizeCloseDate(args.closeDate);
+            if (!nd) {
+              throw new Error(`Unparseable closeDate: ${args.closeDate}`);
+            }
+            closeDate = oppMeta.closeDateType === "DATE" ? nd.slice(0, 10) : nd;
+          }
+
+          // Company (optional): dedup by domain, else by exact (filter-safe) name.
+          // Create ONLY when a domain is supplied; a name-only miss is left
+          // unlinked (recorded) rather than blind-created, to avoid duplicates.
+          let companyId: string | undefined;
+          let companyNote: string | undefined;
+          const companyName = sanitizeText(args.companyName, 120);
+          const companyDomain = validateDomain(args.companyDomain) ?? undefined;
+          if (companyDomain || companyName) {
+            let existingCo: Record<string, unknown> | null = null;
+            if (companyDomain) {
+              existingCo = await findOneCompanyByDomain(cfg, companyDomain);
+            }
+            if (!existingCo && companyName && isFilterSafe(companyName)) {
+              existingCo = await findOneCompanyByName(cfg, companyName);
+            }
+            if (existingCo) {
+              companyId = String(existingCo.id ?? "");
+            } else if (companyDomain && !args.dryRun) {
+              const co = await createCompany(cfg, {
+                name: companyName || companyDomain,
+                domain: companyDomain,
+              });
+              companyId = String(co.id ?? "");
+            } else if (!companyDomain) {
+              companyNote = companyName && !isFilterSafe(companyName)
+                ? "company not linked: name has filter-unsafe characters and no domain to dedup by"
+                : "company not linked: name-only with no domain match (not blind-created to avoid duplicates)";
+            }
+          }
+
+          // Point of contact (optional): LINK-ONLY. Dedup by email; never create a
+          // Person or stamp this lead's leadId onto one (that would poison the
+          // leadId->person namespace push_leads relies on).
+          let pointOfContactId: string | undefined;
+          let pocSkipped: string | undefined;
+          const pocEmail = validateEmail(args.pointOfContactEmail);
+          if (pocEmail) {
+            const existingPerson = await findOnePersonByEmail(cfg, pocEmail);
+            if (existingPerson) {
+              pointOfContactId = String(existingPerson.id ?? "");
+            } else {
+              pocSkipped =
+                "no existing person for the given email (link-only; not created)";
+            }
+          } else if (args.pointOfContactName) {
+            pocSkipped =
+              "point-of-contact name supplied without a resolvable email; skipped";
+          }
+
+          // Opportunity: upsert on leadId, with a create->conflict->update fallback
+          // for the check-then-act race (leadId is not a unique column in Twenty).
+          const fields: OpportunityWriteFields = {
+            name,
+            ...(stageToWrite !== undefined ? { stage: stageToWrite } : {}),
+            ...(amount ? { amount } : {}),
+            ...(closeDate ? { closeDate } : {}),
+            ...(pointOfContactId ? { pointOfContactId } : {}),
+            ...(companyId ? { companyId } : {}),
+            ...(args.isEmergency !== undefined
+              ? { isEmergency: args.isEmergency }
+              : {}),
+          };
+          let opportunityId = existingOpp ? String(existingOpp.id ?? "") : "";
+          let action:
+            | "created"
+            | "updated"
+            | "planned-create"
+            | "planned-update";
+          if (args.dryRun) {
+            action = existingOpp ? "planned-update" : "planned-create";
+          } else if (existingOpp) {
+            await updateOpportunity(cfg, opportunityId, fields);
+            action = "updated";
+          } else {
+            try {
+              const created = await createOpportunityFull(cfg, leadId, fields);
+              opportunityId = String(created.id ?? "");
+              action = "created";
+            } catch (e) {
+              // A concurrent run may have created it between our lookup and POST.
+              const raced = await findOpportunityByLeadId(cfg, leadId);
+              if (raced) {
+                opportunityId = String(raced.id ?? "");
+                await updateOpportunity(cfg, opportunityId, fields);
+                action = "updated";
+              } else {
+                throw e;
+              }
+            }
+          }
+
+          // Note (optional): strip tags/control chars THEN markdown-escape.
+          let noteEnsured = false;
+          const noteBody = sanitizeText(args.noteBody, 5000);
+          if (noteBody && !args.dryRun && opportunityId) {
+            const note = await ensureNoteForLead(cfg, {
+              leadId,
+              body: escapeMarkdown(noteBody),
+              opportunityId,
+              personId: pointOfContactId,
+            });
+            noteEnsured = Boolean(note.noteId);
+          }
+
+          // Report the stage in effect (written, or the preserved existing one).
+          const reportedStage = stageToWrite ??
+            String((existingOpp?.stage as string | undefined) ?? "");
+
+          context.logger.info(
+            "upsertOpportunity {leadId}: {action} (opp {opp}){dry}",
+            {
+              leadId,
+              action,
+              opp: opportunityId || "-",
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+
+          const handle = await context.writeResource(
+            "opportunityUpsert",
+            `opportunity-${leadId}`,
+            {
+              baseUrl: cfg.baseUrl,
+              action,
+              dryRun: args.dryRun,
+              leadId,
+              ...(opportunityId ? { opportunityId } : {}),
+              name,
+              stage: reportedStage,
+              ...(args.amount !== undefined ? { amount: args.amount } : {}),
+              ...(amount ? { currencyCode: amount.currencyCode } : {}),
+              ...(closeDate ? { closeDate } : {}),
+              ...(companyId ? { companyId } : {}),
+              companyLinked: Boolean(companyId),
+              ...(companyNote ? { companyNote } : {}),
+              ...(pointOfContactId ? { pointOfContactId } : {}),
+              ...(pocSkipped ? { pocSkipped } : {}),
+              noteEnsured,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
   },
   checks: {
     "reachable": {
       description:
         "Verify the Twenty instance responds and the API token authenticates (authed GET /rest/people?limit=1) before a write.",
       labels: ["live"],
-      appliesTo: ["ensureLeadFields", "push_leads"],
+      appliesTo: ["ensureLeadFields", "push_leads", "upsertOpportunity"],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },
       ): Promise<{ pass: boolean; errors?: string[] }> => {

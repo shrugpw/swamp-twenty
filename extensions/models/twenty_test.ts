@@ -13,13 +13,16 @@ import {
   domainOfEmail,
   escapeMarkdown,
   isBlockedDomain,
+  isFilterSafe,
   model,
+  normalizeCloseDate,
   normalizePhone,
   planLead,
   redactError,
   sanitizeText,
   selectBatch,
   splitName,
+  toCurrency,
   validateDomain,
   validateEmail,
   validateLeadId,
@@ -332,4 +335,248 @@ Deno.test("push_leads refuses a real run without confirm:true", async () => {
     Error,
     "confirm:true",
   );
+});
+
+// --- upsertOpportunity helpers ----------------------------------------------
+
+Deno.test("toCurrency converts whole units to integer micros", () => {
+  assertEquals(toCurrency(50000, "USD"), {
+    amountMicros: 50_000_000_000,
+    currencyCode: "USD",
+  });
+  // No float drift on fractional amounts.
+  assertEquals(toCurrency(19.99, "USD").amountMicros, 19_990_000);
+  assertEquals(Number.isInteger(toCurrency(19.99, "USD").amountMicros), true);
+});
+
+Deno.test("normalizeCloseDate anchors a bare date and passes through ISO", () => {
+  assertEquals(normalizeCloseDate("2026-09-30"), "2026-09-30T00:00:00.000Z");
+  assertEquals(
+    normalizeCloseDate("2026-09-30T12:34:56Z"),
+    "2026-09-30T12:34:56.000Z",
+  );
+  for (const bad of ["", "   ", "not-a-date", null]) {
+    assertEquals(normalizeCloseDate(bad), null);
+  }
+});
+
+Deno.test("isFilterSafe rejects Twenty filter metacharacters", () => {
+  assert(isFilterSafe("Jackson Family Enterprises"));
+  assert(isFilterSafe("Acme & Co - West"));
+  for (const bad of ["", "a[eq]:b", "a,b", "a(b)", "a;b", "a:b"]) {
+    assertEquals(isFilterSafe(bad), false);
+  }
+});
+
+Deno.test("upsertOpportunity refuses a real run without confirm:true", async () => {
+  const ctx = {
+    globalArgs: {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      opportunityStage: "NEW",
+      emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+      emergencyRestrictedRole: "",
+    },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: () => Promise.resolve({ name: "n" }),
+  };
+  await assertRejects(
+    () =>
+      model.methods.upsertOpportunity.execute(
+        {
+          leadId: "jfw-aap-2.7-2026",
+          name: "Test",
+          currencyCode: "USD",
+          closeDate: "",
+          companyName: "",
+          companyDomain: "",
+          pointOfContactName: "",
+          pointOfContactEmail: "",
+          noteBody: "",
+          confirm: false,
+          dryRun: false,
+        },
+        ctx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("upsertOpportunity rejects an invalid leadId before any I/O", async () => {
+  const ctx = {
+    globalArgs: {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      opportunityStage: "NEW",
+      emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+      emergencyRestrictedRole: "",
+    },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: () => Promise.resolve({ name: "n" }),
+  };
+  await assertRejects(
+    () =>
+      model.methods.upsertOpportunity.execute(
+        {
+          leadId: "bad id with spaces!",
+          name: "Test",
+          currencyCode: "USD",
+          closeDate: "",
+          companyName: "",
+          companyDomain: "",
+          pointOfContactName: "",
+          pointOfContactEmail: "",
+          noteBody: "",
+          confirm: true,
+          dryRun: true,
+        },
+        ctx as never,
+      ),
+    Error,
+    "Invalid leadId",
+  );
+});
+
+// A fetch stub for upsertOpportunity write-path tests. Routes by method+path
+// and records every call so assertions can inspect the request bodies.
+function stubTwentyFetch(
+  handlers: (method: string, path: string, body: unknown) => unknown,
+): {
+  calls: Array<{ method: string; path: string; body: unknown }>;
+  restore: () => void;
+} {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => {
+    const path = String(url).replace("https://crm.example.com", "");
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    const payload = handlers(method, path, body) ?? {};
+    return Promise.resolve(
+      {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: () => Promise.resolve(JSON.stringify(payload)),
+      } as Response,
+    );
+  }) as typeof fetch;
+  return { calls, restore: () => (globalThis.fetch = orig) };
+}
+
+const UPSERT_CTX = {
+  globalArgs: {
+    baseUrl: "https://crm.example.com",
+    apiToken: "tok",
+    opportunityStage: "NEW",
+    emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+    emergencyRestrictedRole: "",
+  },
+  logger: { debug() {}, info() {}, warning() {}, error() {} },
+  writeResource: () => Promise.resolve({ name: "n" }),
+};
+
+const OPP_META = {
+  data: [{
+    nameSingular: "opportunity",
+    fields: [
+      {
+        name: "stage",
+        options: [{ value: "NEW" }, { value: "PROPOSAL" }, {
+          value: "CUSTOMER",
+        }],
+      },
+      { name: "closeDate", type: "DATE_TIME" },
+    ],
+  }],
+};
+
+Deno.test("upsertOpportunity does NOT clobber stage/currency on an amount-only update", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return {
+        data: {
+          opportunities: [{
+            id: "opp1",
+            stage: "PROPOSAL",
+            amount: { amountMicros: 1_000_000, currencyCode: "EUR" },
+          }],
+        },
+      };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "jfw-aap-2.7-2026",
+        name: "JFW",
+        amount: 999, // no stage, no currencyCode supplied
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    // stage omitted => existing PROPOSAL preserved (the regression).
+    assertEquals("stage" in body, false);
+    // currency preserved from the existing record, not forced to USD.
+    assertEquals(
+      (body.amount as Record<string, unknown>).currencyCode,
+      "EUR",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity applies the default stage on create", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } }; // none exists => create
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "brand-new-2026",
+        name: "New Deal",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the opportunity");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.stage, "NEW");
+    assertEquals(body.leadId, "brand-new-2026");
+  } finally {
+    restore();
+  }
 });

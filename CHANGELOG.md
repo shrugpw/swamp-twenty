@@ -2,6 +2,29 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.05.2
+
+### Added
+
+- **`upsertOpportunity`** — generalized, idempotent Opportunity upsert keyed on
+  `leadId` (create → conflict → update fallback for the check-then-act race).
+  Sets the full field set the lead-sink `createOpportunity` omits: `name`,
+  `amount` (whole units → currency micros), `stage` (validated against the live
+  SELECT enum), `closeDate` (formatted per the live DATE vs DATE_TIME field
+  type), a linked Company (dedup by domain, else filter-safe exact name;
+  created only when a domain is supplied), a link-only point-of-contact Person
+  (dedup by email; never created or leadId-stamped), and an optional Note.
+  Defaults the stage only on create and preserves an existing opportunity's
+  stage/currency on an amount-only update. `confirm`-gated with a no-write
+  `dryRun`; writes an `opportunityUpsert` resource.
+- **`opportunityUpsert` resource** — records the action taken and the resolved
+  opportunity/company/contact ids plus any skip/degrade notes.
+
+### Changed
+
+- Version bump to `2026.09.05.2` with a no-op `upgrades[]` entry (globalArguments
+  unchanged) so existing pinned instances upgrade lazily.
+
 ## 2026.09.05.1
 
 Initial release.
