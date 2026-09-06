@@ -1485,3 +1485,371 @@ Deno.test("ensureStageOption aborts on concurrent drift (SO-3)", async () => {
     restore();
   }
 });
+
+// --- upsertPerson (TWENTY-PERSON-UPSERT) ------------------------------------
+
+const PERSON_ARGS = {
+  companyDomain: "",
+  companyName: "",
+  confirm: false,
+  dryRun: false,
+};
+
+Deno.test("upsertPerson refuses a real run without confirm:true", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertPerson.execute(
+          { ...PERSON_ARGS, email: "a@corp.com" } as never,
+          ctx as never,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson dryRun create: planned-create, no write", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [] } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "new@corp.com",
+        firstName: "Ada",
+        lastName: "Lovelace",
+        phone: "781-555-0100",
+        jobTitle: "CTO",
+        dryRun: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "planned-create");
+    assert(!calls.some((c) => c.method === "POST" || c.method === "PATCH"));
+    const fs = writes[0].data.fieldsSet as string[];
+    for (const f of ["name", "phone", "jobTitle"]) assert(fs.includes(f), f);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson create: POSTs email+name+fields, NO leadId stamped", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [] } } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      return { body: { data: { createPerson: { id: "p1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "ada@corp.com",
+        firstName: "Ada",
+        lastName: "Lovelace",
+        phone: "781-555-0100",
+        jobTitle: "CTO",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    assertEquals(writes[0].data.personId, "p1");
+    const post = calls.find((c) => c.method === "POST");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(
+      (body.emails as Record<string, unknown>).primaryEmail,
+      "ada@corp.com",
+    );
+    assertEquals(body.name, { firstName: "Ada", lastName: "Lovelace" });
+    assertEquals(body.jobTitle, "CTO");
+    assertEquals(
+      (body.phones as Record<string, unknown>).primaryPhoneNumber,
+      "+17815550100",
+    );
+    // Curated contacts NEVER enter the leadId namespace.
+    assertEquals("leadId" in body, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson update jobTitle only: PATCH omits name/phone (PU-2)", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return {
+        body: {
+          data: {
+            people: [{
+              id: "p1",
+              name: { firstName: "Ada", lastName: "Lovelace" },
+            }],
+          },
+        },
+      };
+    }
+    if (method === "PATCH" && path === "/rest/people/p1") {
+      return { body: { data: { updatePerson: { id: "p1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "ada@corp.com",
+        jobTitle: "VP Eng",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "updated");
+    const patch = calls.find((c) => c.method === "PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals(body.jobTitle, "VP Eng");
+    assertEquals("name" in body, false);
+    assertEquals("phones" in body, false);
+    assertEquals(writes[0].data.fieldsSet, ["jobTitle"]);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson update firstName only: merges existing lastName (PU-2)", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return {
+        body: {
+          data: {
+            people: [{
+              id: "p1",
+              name: { firstName: "Ada", lastName: "Lovelace" },
+            }],
+          },
+        },
+      };
+    }
+    if (method === "PATCH") {
+      return { body: { data: { updatePerson: { id: "p1" } } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "ada@corp.com",
+        firstName: "Augusta",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    // firstName updated, lastName preserved from the existing record.
+    assertEquals(body.name, { firstName: "Augusta", lastName: "Lovelace" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: companyDomain absent => creates + links company", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [] } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      return { body: { data: { companies: [] } } };
+    }
+    if (method === "POST" && path === "/rest/companies") {
+      return { body: { data: { createCompany: { id: "co9" } } } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      return { body: { data: { createPerson: { id: "p2" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "sue@corp.com",
+        companyDomain: "corp.com",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.companyLinked, true);
+    assertEquals(writes[0].data.companyId, "co9");
+    const post = calls.find((c) =>
+      c.method === "POST" && c.path === "/rest/people"
+    );
+    assertEquals((post!.body as Record<string, unknown>).companyId, "co9");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: name-only company miss => unlinked + companyNote", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [] } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      return { body: { data: { companies: [] } } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      return { body: { data: { createPerson: { id: "p3" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "sue@corp.com",
+        companyName: "Acme Inc",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.companyLinked, false);
+    assert(String(writes[0].data.companyNote ?? "").includes("name-only"));
+    // A company is NEVER blind-created from a name.
+    assert(
+      !calls.some((c) => c.method === "POST" && c.path === "/rest/companies"),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: bad phone => person still created without phone", async () => {
+  const { calls, restore } = stubFetchStatus((method, path, body) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [] } } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      // First attempt carries phones and is rejected; retry without it succeeds.
+      if ((body as Record<string, unknown>)?.phones) {
+        return { status: 400, body: { messages: ["phone number is invalid"] } };
+      }
+      return { body: { data: { createPerson: { id: "p4" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "x@corp.com",
+        firstName: "X",
+        phone: "+123",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    assertEquals(writes[0].data.personId, "p4");
+    const posts = calls.filter((c) =>
+      c.method === "POST" && c.path === "/rest/people"
+    );
+    assertEquals(posts.length, 2);
+    // The successful (second) POST dropped phones but kept the name.
+    const ok = posts[1].body as Record<string, unknown>;
+    assertEquals("phones" in ok, false);
+    assertEquals(ok.name, { firstName: "X", lastName: "" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: create->conflict->refind->update converges (PU-1)", async () => {
+  let peopleGets = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      peopleGets++;
+      // First lookup: absent. Post-conflict refind: a racing create landed.
+      if (peopleGets === 1) return { body: { data: { people: [] } } };
+      return {
+        body: {
+          data: {
+            people: [{ id: "praced", name: { firstName: "", lastName: "" } }],
+          },
+        },
+      };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      return { status: 409, body: { messages: ["duplicate"] } };
+    }
+    if (method === "PATCH" && path === "/rest/people/praced") {
+      return { body: { data: { updatePerson: { id: "praced" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "race@corp.com",
+        jobTitle: "Eng",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "updated");
+    assertEquals(writes[0].data.personId, "praced");
+    assert(
+      calls.some((c) =>
+        c.method === "PATCH" && c.path === "/rest/people/praced"
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: ambiguous email throws with redacted PII (PU-5)", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { body: { data: { people: [{ id: "a" }, { id: "b" }] } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.upsertPerson.execute(
+          { ...PERSON_ARGS, email: "dup@corp.com", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "Ambiguous",
+    );
+    assert(!err.message.includes("dup@corp.com"), err.message);
+  } finally {
+    restore();
+  }
+});

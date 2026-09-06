@@ -532,6 +532,94 @@ async function createPerson(
   }
 }
 
+// --- Curated contact writer helpers (TWENTY-PERSON-UPSERT) ------------------
+
+/** Fields writable on a Person by upsertPerson (partial-update safe). */
+interface PersonWriteFields {
+  name?: { firstName: string; lastName: string };
+  phone?: string;
+  jobTitle?: string;
+  city?: string;
+  companyId?: string;
+}
+
+/** Assemble a REST body from only the fields that are set (partial-update safe). */
+function buildPersonBody(f: PersonWriteFields): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (f.name !== undefined) body.name = f.name;
+  if (f.phone) body.phones = { primaryPhoneNumber: f.phone };
+  if (f.jobTitle !== undefined) body.jobTitle = f.jobTitle;
+  if (f.city !== undefined) body.city = f.city;
+  if (f.companyId) body.companyId = f.companyId;
+  return body;
+}
+
+/** The Person field names actually being written (for the upsert snapshot). */
+function personFieldsSet(f: PersonWriteFields): string[] {
+  const s: string[] = [];
+  if (f.name !== undefined) s.push("name");
+  if (f.phone) s.push("phone");
+  if (f.jobTitle !== undefined) s.push("jobTitle");
+  if (f.city !== undefined) s.push("city");
+  if (f.companyId) s.push("company");
+  return s;
+}
+
+/**
+ * Create a curated Person keyed on primaryEmail, WITHOUT stamping a leadId —
+ * unlike {@link createPerson}, which requires one. Curated contacts must not
+ * enter the leadId->person namespace push_leads relies on. Retries once without
+ * the phone on a phone-shaped error so a bad number never blocks the contact.
+ */
+async function createPersonCurated(
+  cfg: TwentyCfg,
+  email: string,
+  f: PersonWriteFields,
+): Promise<Record<string, unknown>> {
+  const body: Record<string, unknown> = {
+    ...buildPersonBody(f),
+    emails: { primaryEmail: email },
+  };
+  try {
+    const json = await twentyRequest(cfg, "POST", "/rest/people", body);
+    return unwrapRecord(json, "createPerson");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (body.phones && /phone/i.test(msg)) {
+      delete body.phones;
+      const json = await twentyRequest(cfg, "POST", "/rest/people", body);
+      return unwrapRecord(json, "createPerson");
+    }
+    throw e;
+  }
+}
+
+/** Patch an existing Person by id with only the provided fields (phone-retry). */
+async function updatePerson(
+  cfg: TwentyCfg,
+  id: string,
+  f: PersonWriteFields,
+): Promise<Record<string, unknown>> {
+  const body = buildPersonBody(f);
+  try {
+    const json = await twentyRequest(cfg, "PATCH", `/rest/people/${id}`, body);
+    return unwrapRecord(json, "updatePerson");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (body.phones && /phone/i.test(msg)) {
+      delete body.phones;
+      const json = await twentyRequest(
+        cfg,
+        "PATCH",
+        `/rest/people/${id}`,
+        body,
+      );
+      return unwrapRecord(json, "updatePerson");
+    }
+    throw e;
+  }
+}
+
 async function findCompanyByDomain(
   cfg: TwentyCfg,
   domain: string,
@@ -1426,6 +1514,29 @@ const StageOptionSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Curated contact snapshot (TWENTY-PERSON-UPSERT) ------------------------
+// Carries NO raw PII (no email/name/phone) — only the id, which fields were
+// set, and the company link — matching opportunityUpsert's posture.
+
+const PersonUpsertSchema = z.object({
+  baseUrl: z.string(),
+  action: z.enum(["created", "updated", "planned-create", "planned-update"]),
+  dryRun: z.boolean(),
+  personId: z.string().optional(),
+  fieldsSet: z
+    .array(z.string())
+    .describe(
+      "Which Person fields the write set (name/phone/jobTitle/city/company)",
+    ),
+  companyId: z.string().optional(),
+  companyLinked: z.boolean(),
+  companyNote: z
+    .string()
+    .optional()
+    .describe("Why a company was not linked (degraded path), if applicable"),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface MethodLogger {
@@ -1612,7 +1723,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.06.2",
+  version: "2026.09.06.3",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -1637,6 +1748,14 @@ export const model = {
       toVersion: "2026.09.06.2",
       description:
         "Add ensureStageOption (confirm-gated, allowlisted SELECT-option provisioning) and the stageOption snapshot. globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.06.3",
+      description:
+        "Add upsertPerson (idempotent-on-email curated contact writer, confirm-gated) and the personUpsert snapshot. globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1715,6 +1834,13 @@ export const model = {
       description:
         "Result of an ensureStageOption run: the target picklist, the option, the action taken, and the full option set",
       schema: StageOptionSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "personUpsert": {
+      description:
+        "Result of an upsertPerson run: the action taken, which fields were set, and the company link (no raw PII)",
+      schema: PersonUpsertSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -2919,6 +3045,249 @@ export const model = {
         }
       },
     },
+    upsertPerson: {
+      description:
+        "Idempotent, confirm-gated curated-contact writer keyed on primaryEmail. Find-or-create a Person and set name/phone/jobTitle/city and an optional company link: hit => PATCH only the provided fields (a re-run never clobbers an unset field, and a partial name never nulls the other subfield); miss => create. Unlike push_leads/createPerson this NEVER stamps a leadId (curated contacts stay out of the lead namespace). Company is deduped by domain then exact name and created only when a domain is supplied. amount of PII in the snapshot: none (id + which fields were set only). confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots a `personUpsert` resource.",
+      arguments: z.object({
+        email: z
+          .string()
+          .describe("Primary email — the find-or-create idempotency key"),
+        firstName: z.string().optional().describe("First name"),
+        lastName: z.string().optional().describe("Last name"),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            "Full name; split into first/last when firstName/lastName are omitted",
+          ),
+        phone: z.string().optional().describe(
+          "Phone (normalized toward E.164)",
+        ),
+        jobTitle: z.string().optional().describe("Job title"),
+        city: z.string().optional().describe("City"),
+        companyDomain: z
+          .string()
+          .default("")
+          .describe("Company domain — dedup/link (create only with a domain)"),
+        companyName: z
+          .string()
+          .default("")
+          .describe("Company name — dedup by exact name (best-effort)"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true for a real run (writes to Twenty)"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Resolve + plan, but write nothing"),
+      }),
+      execute: async (
+        args: {
+          email: string;
+          firstName?: string;
+          lastName?: string;
+          name?: string;
+          phone?: string;
+          jobTitle?: string;
+          city?: string;
+          companyDomain: string;
+          companyName: string;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to write without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        const email = validateEmail(args.email);
+        if (!email) throw new Error("Invalid email");
+
+        // PU-5: the ENTIRE flow is wrapped so an ambiguous-email throw or any 4xx
+        // that echoes a submitted value is redacted before it reaches logs.
+        try {
+          // Resolve the provided name parts. A single `name` splits into
+          // first/last; explicit firstName/lastName win. `nameProvided` gates
+          // whether an update touches the name at all (PU-2).
+          let providedFirst: string | undefined;
+          let providedLast: string | undefined;
+          if (args.name != null && String(args.name).trim()) {
+            const sp = splitName(args.name);
+            providedFirst = sp.firstName;
+            providedLast = sp.lastName;
+          } else {
+            if (args.firstName != null) {
+              providedFirst = sanitizeText(args.firstName, 120);
+            }
+            if (args.lastName != null) {
+              providedLast = sanitizeText(args.lastName, 120);
+            }
+          }
+          const nameProvided = providedFirst !== undefined ||
+            providedLast !== undefined;
+
+          // Non-name fields, included only when actually provided + non-empty.
+          const phone = args.phone != null ? normalizePhone(args.phone) : "";
+          const jobTitle = args.jobTitle != null
+            ? sanitizeText(args.jobTitle, 120)
+            : undefined;
+          const city = args.city != null
+            ? sanitizeText(args.city, 120)
+            : undefined;
+
+          // Company (optional): dedup by domain, else exact filter-safe name.
+          // Create ONLY when a domain is supplied; a name-only miss is left
+          // unlinked (recorded), mirroring upsertOpportunity to avoid duplicates.
+          let companyId: string | undefined;
+          let companyNote: string | undefined;
+          const companyName = sanitizeText(args.companyName, 120);
+          const companyDomain = validateDomain(args.companyDomain) ?? undefined;
+          if (companyDomain || companyName) {
+            let existingCo: Record<string, unknown> | null = null;
+            if (companyDomain) {
+              existingCo = await findOneCompanyByDomain(cfg, companyDomain);
+            }
+            if (!existingCo && companyName && isFilterSafe(companyName)) {
+              existingCo = await findOneCompanyByName(cfg, companyName);
+            }
+            if (existingCo) {
+              companyId = String(existingCo.id ?? "");
+            } else if (companyDomain && !args.dryRun) {
+              const co = await createCompany(cfg, {
+                name: companyName || companyDomain,
+                domain: companyDomain,
+              });
+              companyId = String(co.id ?? "");
+            } else if (!companyDomain) {
+              companyNote = companyName && !isFilterSafe(companyName)
+                ? "company not linked: name has filter-unsafe characters and no domain to dedup by"
+                : "company not linked: name-only with no domain match (not blind-created to avoid duplicates)";
+            }
+          }
+
+          // PU-2: build the name field. On create, use the provided parts (empty
+          // where unset). On update, MERGE with the existing record so a partial
+          // {firstName|lastName} never nulls the other subfield; omit name
+          // entirely when the caller provided none.
+          const nameFieldFor = (
+            existing: Record<string, unknown> | null,
+          ): { firstName: string; lastName: string } | undefined => {
+            if (!existing) {
+              return {
+                firstName: providedFirst ?? "",
+                lastName: providedLast ?? "",
+              };
+            }
+            if (!nameProvided) return undefined;
+            const en =
+              (existing.name as { firstName?: unknown; lastName?: unknown }) ??
+                {};
+            return {
+              firstName: providedFirst ?? String(en.firstName ?? ""),
+              lastName: providedLast ?? String(en.lastName ?? ""),
+            };
+          };
+
+          const commonFields: PersonWriteFields = {
+            ...(phone ? { phone } : {}),
+            ...(jobTitle ? { jobTitle } : {}),
+            ...(city ? { city } : {}),
+            ...(companyId ? { companyId } : {}),
+          };
+
+          // Idempotency lookup — decides create vs update.
+          const existingPerson = await findOnePersonByEmail(cfg, email);
+
+          let personId = existingPerson ? String(existingPerson.id ?? "") : "";
+          let action:
+            | "created"
+            | "updated"
+            | "planned-create"
+            | "planned-update";
+          let writeFields: PersonWriteFields;
+
+          if (existingPerson) {
+            const nameField = nameFieldFor(existingPerson);
+            writeFields = {
+              ...commonFields,
+              ...(nameField ? { name: nameField } : {}),
+            };
+            action = args.dryRun ? "planned-update" : "updated";
+            if (!args.dryRun) {
+              await updatePerson(cfg, personId, writeFields);
+            }
+          } else {
+            const nameField = nameFieldFor(null);
+            writeFields = {
+              ...commonFields,
+              ...(nameField ? { name: nameField } : {}),
+            };
+            if (args.dryRun) {
+              action = "planned-create";
+            } else {
+              try {
+                const created = await createPersonCurated(
+                  cfg,
+                  email,
+                  writeFields,
+                );
+                personId = String(created.id ?? "");
+                action = "created";
+              } catch (e) {
+                // PU-1: a concurrent run may have created this email between our
+                // lookup and POST — converge on it instead of duplicating.
+                const raced = await findOnePersonByEmail(cfg, email);
+                if (raced) {
+                  personId = String(raced.id ?? "");
+                  const mergedName = nameFieldFor(raced);
+                  writeFields = {
+                    ...commonFields,
+                    ...(mergedName ? { name: mergedName } : {}),
+                  };
+                  await updatePerson(cfg, personId, writeFields);
+                  action = "updated";
+                } else {
+                  throw e;
+                }
+              }
+            }
+          }
+
+          context.logger.info(
+            "upsertPerson: {action} (person {person}){dry}",
+            {
+              action,
+              person: personId || "-",
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            action,
+            dryRun: args.dryRun,
+            ...(personId ? { personId } : {}),
+            fieldsSet: personFieldsSet(writeFields),
+            ...(companyId ? { companyId } : {}),
+            companyLinked: Boolean(companyId),
+            ...(companyNote ? { companyNote } : {}),
+            retrievedAt: new Date().toISOString(),
+          };
+          const handle = await context.writeResource(
+            "personUpsert",
+            personId ? `person-upsert-${personId}` : "person-upsert-planned",
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
   },
   checks: {
     "reachable": {
@@ -2930,6 +3299,7 @@ export const model = {
         "push_leads",
         "upsertOpportunity",
         "ensureStageOption",
+        "upsertPerson",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },
