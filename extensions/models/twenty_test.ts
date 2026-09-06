@@ -29,6 +29,7 @@ import {
   sanitizeText,
   selectBatch,
   splitName,
+  titleCaseToken,
   toCurrency,
   validateDomain,
   validateEmail,
@@ -636,6 +637,12 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   assertEquals("currencyCode" in bare, false);
 });
 
+Deno.test("titleCaseToken title-cases an option token", () => {
+  assertEquals(titleCaseToken("CLOSED"), "Closed");
+  assertEquals(titleCaseToken("CLOSED_WON"), "Closed Won");
+  assertEquals(titleCaseToken("NEW"), "New");
+});
+
 // exactly-one refinements live on the arg schema (enforced before execute).
 Deno.test("findPerson requires exactly one of email|leadId", () => {
   const s = model.methods.findPerson.arguments;
@@ -1116,6 +1123,364 @@ Deno.test("listOpportunities rejects a non-UUID companyId", async () => {
       "Invalid companyId",
     );
     assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// --- ensureStageOption (TWENTY-STAGE-OPTION) --------------------------------
+
+const STAGE_OPTS = [
+  { id: "o1", value: "NEW", label: "New", color: "blue", position: 0 },
+  {
+    id: "o2",
+    value: "SCREENING",
+    label: "Screening",
+    color: "turquoise",
+    position: 1,
+  },
+  { id: "o3", value: "MEETING", label: "Meeting", color: "sky", position: 2 },
+  {
+    id: "o4",
+    value: "PROPOSAL",
+    label: "Proposal",
+    color: "purple",
+    position: 3,
+  },
+  {
+    id: "o5",
+    value: "CUSTOMER",
+    label: "Customer",
+    color: "green",
+    position: 4,
+  },
+];
+
+function stageMeta(opts: unknown[] = STAGE_OPTS) {
+  return {
+    data: [{
+      nameSingular: "opportunity",
+      id: "obj1",
+      fields: [{ name: "stage", id: "fld1", type: "SELECT", options: opts }],
+    }],
+  };
+}
+
+const STAGE_ARGS = {
+  objectNameSingular: "opportunity",
+  fieldName: "stage",
+  color: "gray",
+  confirm: false,
+  dryRun: false,
+};
+
+Deno.test("ensureStageOption dryRun CLOSED: planned-create, no write, 5 preserved", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta() };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureStageOption.execute(
+      { ...STAGE_ARGS, value: "CLOSED", dryRun: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "planned-create");
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not write on dryRun",
+    );
+    const opts = writes[0].data.options as Array<{ value: string }>;
+    assertEquals(opts.length, 6);
+    for (const v of ["NEW", "SCREENING", "MEETING", "PROPOSAL", "CUSTOMER"]) {
+      assert(opts.some((o) => o.value === v), `missing ${v}`);
+    }
+    assert(opts.some((o) => o.value === "CLOSED"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption confirm: PATCHes full array (options-only), 5 unchanged", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta() };
+    }
+    if (method === "PATCH" && path === "/rest/metadata/fields/fld1") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureStageOption.execute(
+      { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    // Options-only body — no sibling attrs sent, so none can be clobbered.
+    assertEquals(Object.keys(body), ["options"]);
+    const opts = body.options as Array<
+      { id?: string; value: string; label: string; color: string }
+    >;
+    assertEquals(opts.length, 6);
+    // The 5 originals survive with the same ids/labels/colors.
+    for (const orig of STAGE_OPTS) {
+      const kept = opts.find((o) => o.value === orig.value);
+      assert(kept, `dropped ${orig.value}`);
+      assertEquals(kept!.id, orig.id);
+      assertEquals(kept!.label, orig.label);
+      assertEquals(kept!.color, orig.color);
+    }
+    const closed = opts.find((o) => o.value === "CLOSED");
+    assertEquals(closed!.label, "Closed");
+    assertEquals(closed!.color, "gray");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption re-run (value present): action present, no write", async () => {
+  const withClosed = [...STAGE_OPTS, {
+    id: "o6",
+    value: "CLOSED",
+    label: "Closed",
+    color: "gray",
+    position: 5,
+  }];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta(withClosed) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureStageOption.execute(
+      { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assert(!calls.some((c) => c.method === "PATCH"));
+    assertEquals("mismatchNote" in writes[0].data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption present-with-mismatch: reports note, no mutation", async () => {
+  const withClosed = [...STAGE_OPTS, {
+    id: "o6",
+    value: "CLOSED",
+    label: "Done",
+    color: "red",
+    position: 5,
+  }];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta(withClosed) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureStageOption.execute(
+      { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assert(String(writes[0].data.mismatchNote ?? "").includes("Done"));
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption rejects a space/lowercase value before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "clo sed", dryRun: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid option value",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption rejects an off-allowlist target before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          {
+            ...STAGE_ARGS,
+            objectNameSingular: "person",
+            fieldName: "status",
+            value: "VIP",
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "allowlist",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption rejects an invalid color before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          {
+            ...STAGE_ARGS,
+            value: "CLOSED",
+            color: "chartreuse",
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid color",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption rejects MULTI_SELECT (SO-6, SELECT-only v1)", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        body: {
+          data: [{
+            nameSingular: "opportunity",
+            id: "obj1",
+            fields: [{
+              name: "stage",
+              id: "fld1",
+              type: "MULTI_SELECT",
+              options: STAGE_OPTS,
+            }],
+          }],
+        },
+      };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "not SELECT",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption HARD-stops on a lossy option (missing color) (SO-1)", async () => {
+  const lossy = [
+    { id: "o1", value: "NEW", label: "New", position: 0 }, // no color
+  ];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta(lossy) };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "lossy",
+    );
+    assert(!calls.some((c) => c.method === "PATCH"), "must not write");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption HARD-stops when the object is unreadable", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: { data: [] } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "not found",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption aborts on concurrent drift (SO-3)", async () => {
+  let getCount = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      getCount++;
+      // First read: 5 options. Second (pre-write) read: a drifted set.
+      if (getCount === 1) return { body: stageMeta() };
+      return { body: stageMeta(STAGE_OPTS.slice(0, 4)) };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "changed between read and write",
+    );
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not write after drift",
+    );
   } finally {
     restore();
   }

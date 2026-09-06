@@ -945,6 +945,138 @@ async function fetchOpportunityMeta(
   return { stages, closeDateType };
 }
 
+// --- SELECT-option provisioning helpers (TWENTY-STAGE-OPTION) ----------------
+
+// SO-4: only these (object,field) pairs may be targeted, so a typo/CEL slip can
+// never append an option to the wrong picklist. Extend deliberately.
+const STAGE_OPTION_ALLOWLIST = new Set<string>(["opportunity.stage"]);
+
+// Twenty option tokens are UPPER_SNAKE (letters/digits/underscore, no spaces).
+const STAGE_OPTION_VALUE_RE = /^[A-Z][A-Z0-9_]*$/;
+
+// Twenty's SELECT-option color palette. `gray` is the neutral default.
+const STAGE_OPTION_COLORS = new Set<string>([
+  "green",
+  "turquoise",
+  "sky",
+  "blue",
+  "purple",
+  "pink",
+  "red",
+  "orange",
+  "yellow",
+  "gray",
+]);
+
+/** Default label for an option token: CLOSED -> "Closed", CLOSED_WON -> "Closed Won". */
+export function titleCaseToken(value: string): string {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((w) => w[0] + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+interface SelectOption {
+  id?: string;
+  value: string;
+  label: string;
+  color: string;
+  position: number;
+}
+
+interface SelectFieldMeta {
+  objectId: string;
+  fieldId: string;
+  type: string;
+  options: SelectOption[];
+}
+
+/**
+ * Read a SELECT field's full metadata: object id, field id, type, and every
+ * existing option as a complete {id?,value,label,color,position} object. Richer
+ * than {@link fetchOpportunityMeta} (which returns stage VALUES only) because a
+ * safe append-and-PATCH must rebuild the WHOLE options array verbatim.
+ *
+ * HARD-stops (throws) rather than degrading if: the object/field is absent, the
+ * field is not exactly SELECT (SO-6 — MULTI_SELECT and every other type are
+ * rejected in v1), the field has no id, or ANY existing option is missing
+ * value/label/color/position (SO-1 — never write a lossy array that would drop
+ * fields the server round-trips). Reading metadata is mandatory here, unlike
+ * upsertOpportunity's best-effort posture.
+ */
+async function fetchSelectField(
+  cfg: TwentyCfg,
+  objectNameSingular: string,
+  fieldName: string,
+): Promise<SelectFieldMeta> {
+  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
+  const objs = ((json as { data?: unknown }).data ?? []) as Array<
+    Record<string, unknown>
+  >;
+  const obj = objs.find((o) =>
+    String(o.nameSingular ?? "") === objectNameSingular
+  );
+  if (!obj) {
+    throw new Error(
+      `Object '${objectNameSingular}' not found in workspace metadata`,
+    );
+  }
+  const objectId = String(obj.id ?? "");
+  const fields = (obj.fields ?? []) as Array<Record<string, unknown>>;
+  const field = (Array.isArray(fields) ? fields : []).find((f) =>
+    String(f.name ?? "") === fieldName
+  );
+  if (!field) {
+    throw new Error(
+      `Field '${objectNameSingular}.${fieldName}' not found in workspace metadata`,
+    );
+  }
+  const type = String(field.type ?? "");
+  if (type !== "SELECT") {
+    throw new Error(
+      `Field '${objectNameSingular}.${fieldName}' is type '${type}', not SELECT — v1 supports SELECT only`,
+    );
+  }
+  const fieldId = String(field.id ?? "");
+  if (!fieldId) {
+    throw new Error(
+      `Field '${objectNameSingular}.${fieldName}' has no id in metadata; cannot safely PATCH its options`,
+    );
+  }
+  const rawOpts = field.options;
+  if (!Array.isArray(rawOpts)) {
+    throw new Error(
+      `Field '${objectNameSingular}.${fieldName}' exposes no readable options array; refusing a lossy write`,
+    );
+  }
+  const options: SelectOption[] = rawOpts.map((o, i) => {
+    const opt = o as Record<string, unknown>;
+    const { value, label, color, position } = opt;
+    if (
+      typeof value !== "string" || typeof label !== "string" ||
+      typeof color !== "string" || typeof position !== "number"
+    ) {
+      throw new Error(
+        `Option #${i} on '${objectNameSingular}.${fieldName}' is missing value/label/color/position; refusing to rebuild a lossy options array`,
+      );
+    }
+    const so: SelectOption = { value, label, color, position };
+    if (typeof opt.id === "string" && opt.id) so.id = opt.id;
+    return so;
+  });
+  return { objectId, fieldId, type, options };
+}
+
+/** True if two option arrays are equivalent (keyed by value; id/label/color/position). */
+function optionsEquivalent(a: SelectOption[], b: SelectOption[]): boolean {
+  if (a.length !== b.length) return false;
+  const key = (o: SelectOption) =>
+    JSON.stringify([o.value, o.label, o.color, o.position, o.id ?? ""]);
+  const setB = new Set(b.map(key));
+  return a.every((o) => setB.has(key(o)));
+}
+
 async function findNoteByLeadId(
   cfg: TwentyCfg,
   leadId: string,
@@ -1265,6 +1397,35 @@ const OpportunityListSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- SELECT-option snapshot (TWENTY-STAGE-OPTION) ---------------------------
+
+const StageOptionSchema = z.object({
+  baseUrl: z.string(),
+  object: z.string(),
+  field: z.string(),
+  value: z.string(),
+  label: z.string(),
+  color: z.string(),
+  action: z.enum(["present", "created", "planned-create"]),
+  mismatchNote: z
+    .string()
+    .optional()
+    .describe(
+      "Set when the value already exists with a different label/color (left unchanged)",
+    ),
+  options: z
+    .array(
+      z.object({
+        value: z.string(),
+        label: z.string(),
+        color: z.string(),
+        position: z.number(),
+      }),
+    )
+    .describe("The resulting (or planned, on dryRun) full option set"),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface MethodLogger {
@@ -1451,7 +1612,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.06.1",
+  version: "2026.09.06.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -1468,6 +1629,14 @@ export const model = {
       toVersion: "2026.09.06.1",
       description:
         "Add the read surface: findPerson/findCompany/getOpportunity/listOpportunities plus getPersonById/getCompanyById, and the personRef/companyRef/opportunityRef/opportunityList snapshots. All additive and side-effect-free; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.06.2",
+      description:
+        "Add ensureStageOption (confirm-gated, allowlisted SELECT-option provisioning) and the stageOption snapshot. globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1539,6 +1708,13 @@ export const model = {
       description:
         "Snapshot from listOpportunities: a filtered, paginated set of opportunity views + truncation flag",
       schema: OpportunityListSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "stageOption": {
+      description:
+        "Result of an ensureStageOption run: the target picklist, the option, the action taken, and the full option set",
+      schema: StageOptionSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -1717,6 +1893,191 @@ export const model = {
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+    ensureStageOption: {
+      description:
+        "Idempotently ensure a SELECT option exists on an allowlisted picklist field (default opportunity.stage), so an Opportunity can be set to a stage the workspace didn't ship with (e.g. CLOSED). Reads the field's FULL option set and appends the new option, preserving every existing option (id/label/color/position) verbatim — never a drop, reorder, or recolor. If the value already exists it is a no-op (action:present; a differing label/color is reported, never mutated). Confirm-gated (mutates workspace metadata); dryRun previews the planned option array without writing. SELECT-only; MULTI_SELECT and unknown targets are rejected. Snapshots a `stageOption` resource.",
+      arguments: z.object({
+        objectNameSingular: z
+          .string()
+          .default("opportunity")
+          .describe(
+            "Object owning the field (allowlisted; default opportunity)",
+          ),
+        fieldName: z
+          .string()
+          .default("stage")
+          .describe("SELECT field name (allowlisted; default stage)"),
+        value: z
+          .string()
+          .describe("Option token to ensure — UPPER_SNAKE (e.g. CLOSED)"),
+        label: z
+          .string()
+          .optional()
+          .describe("Display label; defaults to a title-cased value"),
+        color: z
+          .string()
+          .default("gray")
+          .describe("Option color from Twenty's palette; defaults gray"),
+        position: z
+          .number()
+          .int()
+          .optional()
+          .describe("Sort position; defaults to append after the current max"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — mutates workspace metadata"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Preview the planned option array; write nothing"),
+      }),
+      execute: async (
+        args: {
+          objectNameSingular: string;
+          fieldName: string;
+          value: string;
+          label?: string;
+          color: string;
+          position?: number;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          // SO-4: reject any target not on the allowlist BEFORE any I/O.
+          const target = `${args.objectNameSingular}.${args.fieldName}`;
+          if (!STAGE_OPTION_ALLOWLIST.has(target)) {
+            throw new Error(
+              `Target '${target}' is not on the ensureStageOption allowlist (allowed: ${
+                [...STAGE_OPTION_ALLOWLIST].join(", ")
+              })`,
+            );
+          }
+          const value = String(args.value ?? "").trim();
+          if (!STAGE_OPTION_VALUE_RE.test(value)) {
+            throw new Error(
+              "Invalid option value: must be UPPER_SNAKE (A-Z, 0-9, _), no spaces",
+            );
+          }
+          const color = String(args.color ?? "gray");
+          if (!STAGE_OPTION_COLORS.has(color)) {
+            throw new Error(
+              `Invalid color '${color}' (allowed: ${
+                [...STAGE_OPTION_COLORS].join(", ")
+              })`,
+            );
+          }
+          const label = args.label != null && String(args.label).trim()
+            ? sanitizeText(args.label, 60)
+            : titleCaseToken(value);
+          // dryRun is allowed without confirm; a real write requires confirm.
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to ensure a stage option without confirm:true (mutates workspace metadata). Use dryRun:true to preview.",
+            );
+          }
+
+          // SO-1: mandatory full-shape read; HARD-stops on a lossy/absent option set.
+          const field = await fetchSelectField(
+            cfg,
+            args.objectNameSingular,
+            args.fieldName,
+          );
+          const existing = field.options.find((o) => o.value === value);
+
+          let action: "present" | "created" | "planned-create";
+          let mismatchNote: string | undefined;
+          let resultOptions: SelectOption[];
+
+          if (existing) {
+            action = "present";
+            resultOptions = field.options;
+            if (existing.label !== label || existing.color !== color) {
+              mismatchNote =
+                `Option '${value}' already exists with label='${existing.label}' color='${existing.color}'; ` +
+                `requested label='${label}' color='${color}' — left unchanged (no mutation).`;
+            }
+          } else {
+            const maxPos = field.options.reduce(
+              (m, o) => Math.max(m, o.position),
+              -1,
+            );
+            const position = args.position ?? maxPos + 1;
+            // A client-generated id: Twenty's metadata SELECT options carry ids;
+            // supplying one keeps the append explicit. Existing ids pass through
+            // untouched. (Live PATCH-body shape must be reconfirmed before a real
+            // confirm run — see the item's build-time-verify note.)
+            const newOpt: SelectOption = {
+              id: crypto.randomUUID(),
+              value,
+              label,
+              color,
+              position,
+            };
+            resultOptions = [...field.options, newOpt];
+            if (args.dryRun) {
+              action = "planned-create";
+            } else {
+              // SO-3: re-read immediately before the write and abort if the option
+              // set drifted (best-effort optimistic concurrency — no server ETag).
+              const fresh = await fetchSelectField(
+                cfg,
+                args.objectNameSingular,
+                args.fieldName,
+              );
+              if (!optionsEquivalent(fresh.options, field.options)) {
+                throw new Error(
+                  `Options for '${target}' changed between read and write (concurrent edit); aborting to avoid a lossy overwrite. Re-run.`,
+                );
+              }
+              // SO-2: options-only PATCH — Twenty's metadata field PATCH is a
+              // partial update, so sibling attributes (name/label/type/isNullable)
+              // are preserved. We deliberately send ONLY options.
+              await twentyRequest(
+                cfg,
+                "PATCH",
+                `/rest/metadata/fields/${field.fieldId}`,
+                { options: resultOptions },
+              );
+              action = "created";
+            }
+          }
+
+          context.logger.info(
+            "ensureStageOption {target} value={value}: {action}",
+            { target, value, action },
+          );
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            object: args.objectNameSingular,
+            field: args.fieldName,
+            value,
+            label,
+            color,
+            action,
+            options: resultOptions.map((o) => ({
+              value: o.value,
+              label: o.label,
+              color: o.color,
+              position: o.position,
+            })),
+            retrievedAt: new Date().toISOString(),
+          };
+          if (mismatchNote) snap.mismatchNote = mismatchNote;
+          const handle = await context.writeResource(
+            "stageOption",
+            `stageopt-${args.objectNameSingular}-${args.fieldName}-${value}`,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
       },
     },
     findPersonByLeadId: {
@@ -2564,7 +2925,12 @@ export const model = {
       description:
         "Verify the Twenty instance responds and the API token authenticates (authed GET /rest/people?limit=1) before a write.",
       labels: ["live"],
-      appliesTo: ["ensureLeadFields", "push_leads", "upsertOpportunity"],
+      appliesTo: [
+        "ensureLeadFields",
+        "push_leads",
+        "upsertOpportunity",
+        "ensureStageOption",
+      ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },
       ): Promise<{ pass: boolean; errors?: string[] }> => {
