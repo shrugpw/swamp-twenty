@@ -758,6 +758,168 @@ async function findOnePersonByEmail(
   return list[0] ?? null;
 }
 
+// --- Read-surface helpers (TWENTY-READ-SURFACE) -----------------------------
+
+// A Twenty record id is a UUID. Validating it before path interpolation keeps a
+// hostile value from breaking out of `/rest/<object>/<id>` (path-injection) and
+// lets get-by-id reject junk before a round-trip.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Validate a Twenty UUID id (lowercased); null if malformed. */
+export function validateUuid(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  return UUID_RE.test(s) ? s : null;
+}
+
+/** Inverse of {@link toCurrency}: integer micros back to whole currency units. */
+export function amountFromMicros(micros: number): number {
+  return micros / 1_000_000;
+}
+
+/** Pull {amount (whole units), currencyCode} out of a Twenty CURRENCY composite. */
+function extractAmount(
+  rec: Record<string, unknown>,
+): { amount?: number; currencyCode?: string } {
+  const a = rec.amount as
+    | { amountMicros?: unknown; currencyCode?: unknown }
+    | null
+    | undefined;
+  if (!a || typeof a.amountMicros !== "number") return {};
+  const out: { amount?: number; currencyCode?: string } = {
+    amount: amountFromMicros(a.amountMicros),
+  };
+  if (a.currencyCode) out.currencyCode = String(a.currencyCode);
+  return out;
+}
+
+/** Reconcile-facing view of an Opportunity record (no bulk PII). */
+export interface OppView {
+  id: string;
+  leadId?: string;
+  name: string;
+  stage: string;
+  amount?: number;
+  currencyCode?: string;
+  closeDate?: string;
+  companyId?: string;
+}
+
+/** Map a raw Opportunity REST record to the compact {@link OppView}. */
+export function mapOppView(rec: Record<string, unknown>): OppView {
+  const { amount, currencyCode } = extractAmount(rec);
+  const v: OppView = {
+    id: String(rec.id ?? ""),
+    name: String(rec.name ?? ""),
+    stage: String(rec.stage ?? ""),
+  };
+  if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
+  if (amount !== undefined) v.amount = amount;
+  if (currencyCode) v.currencyCode = currencyCode;
+  if (rec.closeDate) v.closeDate = String(rec.closeDate);
+  if (rec.companyId) v.companyId = String(rec.companyId);
+  return v;
+}
+
+/**
+ * GET a single record by id, returning null on a 404 (record absent) rather than
+ * throwing. `op` is the singular object key in the `{data:{<op>:{...}}}` envelope
+ * Twenty returns for a by-id read. Any non-404 error still throws.
+ */
+async function getByIdOrNull(
+  cfg: TwentyCfg,
+  path: string,
+  op: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const json = await twentyRequest(cfg, "GET", path);
+    const rec = unwrapRecord(json, op);
+    return rec && Object.keys(rec).length ? rec : null;
+  } catch (e) {
+    if (e instanceof Error && /failed: 404\b/.test(e.message)) return null;
+    throw e;
+  }
+}
+
+const getOpportunityById = (cfg: TwentyCfg, id: string) =>
+  getByIdOrNull(cfg, `/rest/opportunities/${id}`, "opportunity");
+const getPersonById = (cfg: TwentyCfg, id: string) =>
+  getByIdOrNull(cfg, `/rest/people/${id}`, "person");
+const getCompanyById = (cfg: TwentyCfg, id: string) =>
+  getByIdOrNull(cfg, `/rest/companies/${id}`, "company");
+
+// Twenty caps a single REST page at 60 records; MAX_LIST_CAP bounds how many a
+// single listOpportunities call will page through before flagging `truncated`.
+const PAGE_SIZE = 60;
+const MAX_LIST_CAP = 500;
+
+/**
+ * Fan-out read (repo rule 6): page through all Opportunities matching the given
+ * filters in ONE call. Filters compose with AND (comma-joined `field[eq]:value`
+ * clauses in a single `filter=` param — each value is UUID/filter-safe validated
+ * by the caller and URL-encoded here). Cursor pagination advances on
+ * `pageInfo.endCursor`; a no-progress guard (a page yielding zero *new* ids, a
+ * missing/repeated cursor) hard-stops so a wrong cursor field can never
+ * infinite-loop, and items are deduped by id. `truncated` is set only when the
+ * result is actually capped at MAX_LIST_CAP/limit with more records available.
+ */
+async function listOpportunitiesFiltered(
+  cfg: TwentyCfg,
+  opts: { companyId?: string; stage?: string; limit: number },
+): Promise<{ items: Array<Record<string, unknown>>; truncated: boolean }> {
+  const cap = Math.min(Math.max(1, Math.floor(opts.limit)), MAX_LIST_CAP);
+  const clauses: string[] = [];
+  if (opts.companyId) {
+    clauses.push(`companyId[eq]:${encodeURIComponent(opts.companyId)}`);
+  }
+  if (opts.stage) clauses.push(`stage[eq]:${encodeURIComponent(opts.stage)}`);
+  const filterQ = clauses.length ? `filter=${clauses.join(",")}&` : "";
+
+  const seen = new Set<string>();
+  const items: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  let truncated = false;
+  // Backstop on page count in case the instance never reports hasNextPage:false.
+  const maxPages = Math.ceil(cap / PAGE_SIZE) + 2;
+  for (let page = 0; page < maxPages; page++) {
+    const path = `/rest/opportunities?${filterQ}limit=${PAGE_SIZE}` +
+      (cursor ? `&starting_after=${encodeURIComponent(cursor)}` : "");
+    const json = await twentyRequest(cfg, "GET", path);
+    const batch = unwrapList(json, "opportunities");
+    let newInPage = 0;
+    let hitCap = false;
+    for (const rec of batch) {
+      const id = String(rec.id ?? "");
+      if (!id || seen.has(id)) continue;
+      newInPage++;
+      if (items.length >= cap) {
+        hitCap = true;
+        break;
+      }
+      seen.add(id);
+      items.push(rec);
+    }
+    if (hitCap) {
+      truncated = true;
+      break;
+    }
+    // No-progress guard: a wrong/looping cursor surfaces zero new ids -> stop.
+    if (newInPage === 0) break;
+    const pageInfo = (json as {
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    }).pageInfo;
+    if (
+      !pageInfo?.hasNextPage || !pageInfo.endCursor ||
+      pageInfo.endCursor === cursor
+    ) {
+      break;
+    }
+    cursor = pageInfo.endCursor;
+  }
+  return { items, truncated };
+}
+
 /**
  * Read the Opportunity object's live metadata: the `stage` SELECT enum values
  * and the `closeDate` field type (DATE vs DATE_TIME). Used to fail fast on an
@@ -1039,6 +1201,70 @@ const OpportunityUpsertSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Read-surface snapshots (TWENTY-READ-SURFACE) ---------------------------
+// Existence-check snapshots for the reconcile audit. `found` distinguishes
+// "looked, not there" from "never looked". Deliberately carry NO bulk PII — only
+// the opaque join keys the caller supplied or needs (ids, leadId, companyId,
+// business domain/name), never an email/phone body.
+
+const PersonRefSchema = z.object({
+  baseUrl: z.string(),
+  found: z.boolean(),
+  id: z.string().optional(),
+  leadId: z.string().optional(),
+  companyId: z.string().optional(),
+  retrievedAt: z.iso.datetime(),
+});
+
+const CompanyRefSchema = z.object({
+  baseUrl: z.string(),
+  found: z.boolean(),
+  id: z.string().optional(),
+  domain: z.string().optional(),
+  name: z.string().optional(),
+  retrievedAt: z.iso.datetime(),
+});
+
+const OpportunityRefSchema = z.object({
+  baseUrl: z.string(),
+  found: z.boolean(),
+  id: z.string().optional(),
+  leadId: z.string().optional(),
+  name: z.string().optional(),
+  stage: z.string().optional(),
+  amount: z.number().optional().describe("Deal value in whole currency units"),
+  currencyCode: z.string().optional(),
+  closeDate: z.string().optional(),
+  companyId: z.string().optional(),
+  pointOfContactId: z.string().optional(),
+  retrievedAt: z.iso.datetime(),
+});
+
+const OppViewSchema = z.object({
+  id: z.string(),
+  leadId: z.string().optional(),
+  name: z.string(),
+  stage: z.string(),
+  amount: z.number().optional(),
+  currencyCode: z.string().optional(),
+  closeDate: z.string().optional(),
+  companyId: z.string().optional(),
+});
+
+const OpportunityListSchema = z.object({
+  baseUrl: z.string(),
+  count: z.number(),
+  truncated: z
+    .boolean()
+    .describe("True if the result was capped with more records available"),
+  filter: z.object({
+    companyId: z.string().optional(),
+    stage: z.string().optional(),
+  }),
+  items: z.array(OppViewSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface MethodLogger {
@@ -1225,7 +1451,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.05.2",
+  version: "2026.09.06.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -1234,6 +1460,14 @@ export const model = {
       toVersion: "2026.09.05.2",
       description:
         "Add the generalized upsertOpportunity method and opportunityUpsert resource. globalArguments is unchanged, so this is a no-op attribute migration (existing instances upgrade cleanly with no field changes).",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.06.1",
+      description:
+        "Add the read surface: findPerson/findCompany/getOpportunity/listOpportunities plus getPersonById/getCompanyById, and the personRef/companyRef/opportunityRef/opportunityList snapshots. All additive and side-effect-free; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1277,6 +1511,34 @@ export const model = {
       description:
         "Result of an upsertOpportunity run: the action taken and the resolved opportunity/company/contact ids",
       schema: OpportunityUpsertSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "personRef": {
+      description:
+        "Existence-check snapshot from findPerson/getPersonById (found + join keys, no bulk PII)",
+      schema: PersonRefSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "companyRef": {
+      description:
+        "Existence-check snapshot from findCompany/getCompanyById (found + id/domain/name)",
+      schema: CompanyRefSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "opportunityRef": {
+      description:
+        "Snapshot from getOpportunity: the reconcile-critical opportunity fields (id, leadId, name, stage, amount, ...)",
+      schema: OpportunityRefSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "opportunityList": {
+      description:
+        "Snapshot from listOpportunities: a filtered, paginated set of opportunity views + truncation flag",
+      schema: OpportunityListSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -1516,6 +1778,346 @@ export const model = {
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+    findPerson: {
+      description:
+        "Look up a Person by primary email OR leadId (exactly one). Read-only existence check for reconcile/dedup: records a `personRef` on both hit (found:true + id) and miss (found:false), so callers can tell 'looked, not there' from 'never looked'. Throws on an ambiguous (>1) email match. No writes.",
+      arguments: z
+        .object({
+          email: z.string().optional().describe(
+            "Primary email — exactly one of email|leadId",
+          ),
+          leadId: z.string().optional().describe(
+            "Opaque upstream lead id — exactly one of email|leadId",
+          ),
+        })
+        .refine((a) => (a.email == null) !== (a.leadId == null), {
+          message: "Provide exactly one of email or leadId",
+        }),
+      execute: async (
+        args: { email?: string; leadId?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          let person: Record<string, unknown> | null = null;
+          let byLeadId: string | undefined;
+          if (args.email != null) {
+            const email = validateEmail(args.email);
+            if (!email) throw new Error("Invalid email");
+            person = await findOnePersonByEmail(cfg, email);
+          } else {
+            const leadId = validateLeadId(args.leadId);
+            if (!leadId) throw new Error("Invalid leadId");
+            byLeadId = leadId;
+            person = await findPersonByLeadId(cfg, leadId);
+          }
+          const found = person != null;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found,
+            retrievedAt: new Date().toISOString(),
+          };
+          let name: string;
+          if (found && person) {
+            const id = String(person.id ?? "");
+            snap.id = id;
+            if (person.leadId != null && person.leadId !== "") {
+              snap.leadId = String(person.leadId);
+            } else if (byLeadId) snap.leadId = byLeadId;
+            if (person.companyId) snap.companyId = String(person.companyId);
+            name = `person-${id}`;
+          } else {
+            if (byLeadId) snap.leadId = byLeadId;
+            name = byLeadId ? `person-miss-${byLeadId}` : "person-miss";
+          }
+          const handle = await context.writeResource("personRef", name, snap);
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    getPersonById: {
+      description:
+        "Fetch a Person by UUID (GET /rest/people/{id}); records a `personRef` with found:false on a 404. Read-only — lets the reconcile report walk from an opportunity's pointOfContactId back to a contact.",
+      arguments: z.object({
+        id: z.string().describe("Person UUID"),
+      }),
+      execute: async (
+        args: { id: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const id = validateUuid(args.id);
+          if (!id) throw new Error("Invalid person id");
+          const person = await getPersonById(cfg, id);
+          const found = person != null;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found,
+            retrievedAt: new Date().toISOString(),
+          };
+          if (found && person) {
+            snap.id = String(person.id ?? id);
+            if (person.leadId != null && person.leadId !== "") {
+              snap.leadId = String(person.leadId);
+            }
+            if (person.companyId) snap.companyId = String(person.companyId);
+          }
+          const handle = await context.writeResource(
+            "personRef",
+            found ? `person-${id}` : `person-miss-${id}`,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    findCompany: {
+      description:
+        "Look up a Company by domain OR exact name (exactly one). Records a `companyRef` on hit and miss. Throws on an ambiguous (>1) match; the name path returns found:false gracefully if the name field is not filterable on the instance. No writes.",
+      arguments: z
+        .object({
+          domain: z.string().optional().describe(
+            "Company domain — exactly one of domain|name",
+          ),
+          name: z.string().optional().describe(
+            "Exact company name (must be filter-safe) — exactly one of domain|name",
+          ),
+        })
+        .refine((a) => (a.domain == null) !== (a.name == null), {
+          message: "Provide exactly one of domain or name",
+        }),
+      execute: async (
+        args: { domain?: string; name?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          let company: Record<string, unknown> | null = null;
+          let queriedDomain: string | undefined;
+          let queriedName: string | undefined;
+          if (args.domain != null) {
+            const domain = validateDomain(args.domain);
+            if (!domain) throw new Error("Invalid domain");
+            queriedDomain = domain;
+            company = await findOneCompanyByDomain(cfg, domain);
+          } else {
+            const name = String(args.name ?? "").trim();
+            if (!isFilterSafe(name)) {
+              throw new Error("Company name contains filter-unsafe characters");
+            }
+            queriedName = name;
+            company = await findOneCompanyByName(cfg, name);
+          }
+          const found = company != null;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found,
+            retrievedAt: new Date().toISOString(),
+          };
+          let name: string;
+          if (found && company) {
+            const id = String(company.id ?? "");
+            snap.id = id;
+            if (company.name) snap.name = String(company.name);
+            const dn = (company.domainName as { primaryLinkUrl?: unknown })
+              ?.primaryLinkUrl;
+            if (dn) snap.domain = String(dn);
+            else if (queriedDomain) snap.domain = queriedDomain;
+            name = `company-${id}`;
+          } else {
+            if (queriedDomain) snap.domain = queriedDomain;
+            name = queriedDomain
+              ? `company-miss-${queriedDomain}`
+              : "company-miss";
+          }
+          void queriedName;
+          const handle = await context.writeResource("companyRef", name, snap);
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    getCompanyById: {
+      description:
+        "Fetch a Company by UUID (GET /rest/companies/{id}); records a `companyRef` with found:false on a 404. Read-only — lets the reconcile report resolve an opportunity's companyId.",
+      arguments: z.object({
+        id: z.string().describe("Company UUID"),
+      }),
+      execute: async (
+        args: { id: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const id = validateUuid(args.id);
+          if (!id) throw new Error("Invalid company id");
+          const company = await getCompanyById(cfg, id);
+          const found = company != null;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found,
+            retrievedAt: new Date().toISOString(),
+          };
+          if (found && company) {
+            snap.id = String(company.id ?? id);
+            if (company.name) snap.name = String(company.name);
+            const dn = (company.domainName as { primaryLinkUrl?: unknown })
+              ?.primaryLinkUrl;
+            if (dn) snap.domain = String(dn);
+          }
+          const handle = await context.writeResource(
+            "companyRef",
+            found ? `company-${id}` : `company-miss-${id}`,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    getOpportunity: {
+      description:
+        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId); found:false + no fields on a miss. No writes.",
+      arguments: z
+        .object({
+          leadId: z.string().optional().describe(
+            "Opaque upstream lead id — exactly one of leadId|id",
+          ),
+          id: z.string().optional().describe(
+            "Opportunity UUID — exactly one of leadId|id",
+          ),
+        })
+        .refine((a) => (a.leadId == null) !== (a.id == null), {
+          message: "Provide exactly one of leadId or id",
+        }),
+      execute: async (
+        args: { leadId?: string; id?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          let opp: Record<string, unknown> | null = null;
+          let byLeadId: string | undefined;
+          if (args.leadId != null) {
+            const leadId = validateLeadId(args.leadId);
+            if (!leadId) throw new Error("Invalid leadId");
+            byLeadId = leadId;
+            opp = await findOpportunityByLeadId(cfg, leadId);
+          } else {
+            const id = validateUuid(args.id);
+            if (!id) throw new Error("Invalid opportunity id");
+            opp = await getOpportunityById(cfg, id);
+          }
+          const found = opp != null;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found,
+            retrievedAt: new Date().toISOString(),
+          };
+          let name: string;
+          if (found && opp) {
+            const view = mapOppView(opp);
+            const id = view.id;
+            snap.id = id;
+            if (view.leadId) snap.leadId = view.leadId;
+            else if (byLeadId) snap.leadId = byLeadId;
+            if (view.name) snap.name = view.name;
+            if (view.stage) snap.stage = view.stage;
+            if (view.amount !== undefined) snap.amount = view.amount;
+            if (view.currencyCode) snap.currencyCode = view.currencyCode;
+            if (view.closeDate) snap.closeDate = view.closeDate;
+            if (view.companyId) snap.companyId = view.companyId;
+            if (opp.pointOfContactId) {
+              snap.pointOfContactId = String(opp.pointOfContactId);
+            }
+            name = `opportunity-${id}`;
+          } else {
+            if (byLeadId) snap.leadId = byLeadId;
+            name = byLeadId
+              ? `opportunity-miss-${byLeadId}`
+              : "opportunity-miss";
+          }
+          const handle = await context.writeResource(
+            "opportunityRef",
+            name,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    listOpportunities: {
+      description:
+        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views + a `truncated` flag. No writes, no per-id loop.",
+      arguments: z.object({
+        companyId: z.string().optional().describe("Filter: company UUID"),
+        stage: z.string().optional().describe(
+          "Filter: opportunity stage (e.g. PROPOSAL)",
+        ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(`Max results to return (1..${MAX_LIST_CAP})`),
+      }),
+      execute: async (
+        args: { companyId?: string; stage?: string; limit: number },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          let companyId: string | undefined;
+          if (args.companyId != null) {
+            const cid = validateUuid(args.companyId);
+            if (!cid) throw new Error("Invalid companyId");
+            companyId = cid;
+          }
+          let stage: string | undefined;
+          if (args.stage != null) {
+            const s = String(args.stage).trim();
+            if (!isFilterSafe(s)) {
+              throw new Error("stage contains filter-unsafe characters");
+            }
+            stage = s;
+          }
+          const { items, truncated } = await listOpportunitiesFiltered(cfg, {
+            companyId,
+            stage,
+            limit: args.limit,
+          });
+          const views = items.map(mapOppView);
+          const filter: Record<string, string> = {};
+          if (companyId) filter.companyId = companyId;
+          if (stage) filter.stage = stage;
+          const handle = await context.writeResource(
+            "opportunityList",
+            `opps-${companyId ?? "all"}-${stage ?? "all"}`,
+            {
+              baseUrl: cfg.baseUrl,
+              count: views.length,
+              truncated,
+              filter,
+              items: views,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
       },
     },
     push_leads: {

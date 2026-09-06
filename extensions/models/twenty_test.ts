@@ -6,14 +6,21 @@
  * exercised here without a live Twenty. The one impure guard tested is
  * push_leads' confirm-gate, which throws before any I/O.
  */
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
+  assert,
+  assertAlmostEquals,
+  assertEquals,
+  assertRejects,
+} from "jsr:@std/assert@1";
+import {
+  amountFromMicros,
   buildFilterPath,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
   escapeMarkdown,
   isBlockedDomain,
   isFilterSafe,
+  mapOppView,
   model,
   normalizeCloseDate,
   normalizePhone,
@@ -26,6 +33,7 @@ import {
   validateDomain,
   validateEmail,
   validateLeadId,
+  validateUuid,
 } from "./twenty.ts";
 
 // --- validateEmail ----------------------------------------------------------
@@ -576,6 +584,538 @@ Deno.test("upsertOpportunity applies the default stage on create", async () => {
     const body = post!.body as Record<string, unknown>;
     assertEquals(body.stage, "NEW");
     assertEquals(body.leadId, "brand-new-2026");
+  } finally {
+    restore();
+  }
+});
+
+// --- Read surface (TWENTY-READ-SURFACE) -------------------------------------
+
+Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
+  assertEquals(
+    validateUuid("11111111-1111-1111-1111-111111111111"),
+    "11111111-1111-1111-1111-111111111111",
+  );
+  // Lowercased.
+  assertEquals(
+    validateUuid("ABCDEF01-2345-6789-ABCD-EF0123456789"),
+    "abcdef01-2345-6789-abcd-ef0123456789",
+  );
+  for (
+    const bad of ["", "not-a-uuid", "../people", "1/2", "x".repeat(36), null]
+  ) {
+    assertEquals(validateUuid(bad), null);
+  }
+});
+
+Deno.test("amountFromMicros is the inverse of toCurrency", () => {
+  assertEquals(amountFromMicros(50_000_000_000), 50000);
+  assertAlmostEquals(amountFromMicros(43_478_260_000), 43478.26, 1e-6);
+  // Round-trip.
+  assertEquals(amountFromMicros(toCurrency(19.99, "USD").amountMicros), 19.99);
+});
+
+Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
+  const v = mapOppView({
+    id: "opp1",
+    leadId: "L1",
+    name: "AAP 2.7",
+    stage: "PROPOSAL",
+    amount: { amountMicros: 43_478_260_000, currencyCode: "USD" },
+    closeDate: "2026-12-31T00:00:00.000Z",
+    companyId: "co1",
+    pointOfContactId: "poc1",
+  });
+  assertEquals(v.id, "opp1");
+  assertEquals(v.stage, "PROPOSAL");
+  assertAlmostEquals(v.amount!, 43478.26, 1e-6);
+  assertEquals(v.currencyCode, "USD");
+  // A record with no amount composite omits amount/currencyCode.
+  const bare = mapOppView({ id: "opp2", name: "x", stage: "NEW" });
+  assertEquals("amount" in bare, false);
+  assertEquals("currencyCode" in bare, false);
+});
+
+// exactly-one refinements live on the arg schema (enforced before execute).
+Deno.test("findPerson requires exactly one of email|leadId", () => {
+  const s = model.methods.findPerson.arguments;
+  assertEquals(s.safeParse({}).success, false);
+  assertEquals(
+    s.safeParse({ email: "a@b.com", leadId: "L1" }).success,
+    false,
+  );
+  assertEquals(s.safeParse({ email: "a@b.com" }).success, true);
+  assertEquals(s.safeParse({ leadId: "L1" }).success, true);
+});
+
+Deno.test("getOpportunity requires exactly one of leadId|id", () => {
+  const s = model.methods.getOpportunity.arguments;
+  assertEquals(s.safeParse({}).success, false);
+  assertEquals(s.safeParse({ leadId: "L1", id: "x" }).success, false);
+  assertEquals(s.safeParse({ leadId: "L1" }).success, true);
+});
+
+Deno.test("findCompany requires exactly one of domain|name", () => {
+  const s = model.methods.findCompany.arguments;
+  assertEquals(s.safeParse({}).success, false);
+  assertEquals(
+    s.safeParse({ domain: "a.com", name: "A" }).success,
+    false,
+  );
+  assertEquals(s.safeParse({ domain: "a.com" }).success, true);
+});
+
+// A fetch stub that can return a chosen HTTP status (for 404 by-id paths) and
+// records every call. `handler` returns { status?, body? }.
+function stubFetchStatus(
+  handler: (
+    method: string,
+    path: string,
+    body: unknown,
+  ) => { status?: number; body?: unknown } | undefined,
+): {
+  calls: Array<{ method: string; path: string; body: unknown }>;
+  restore: () => void;
+} {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => {
+    const path = String(url).replace("https://crm.example.com", "");
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    const r = handler(method, path, body) ?? {};
+    const status = r.status ?? 200;
+    const ok = status >= 200 && status < 300;
+    return Promise.resolve(
+      {
+        ok,
+        status,
+        statusText: ok ? "OK" : "Error",
+        text: () => Promise.resolve(JSON.stringify(r.body ?? {})),
+      } as Response,
+    );
+  }) as typeof fetch;
+  return { calls, restore: () => (globalThis.fetch = orig) };
+}
+
+function readCtx(): {
+  writes: Array<{ type: string; name: string; data: Record<string, unknown> }>;
+  ctx: unknown;
+} {
+  const writes: Array<
+    { type: string; name: string; data: Record<string, unknown> }
+  > = [];
+  return {
+    writes,
+    ctx: {
+      globalArgs: {
+        baseUrl: "https://crm.example.com",
+        apiToken: "tok",
+        opportunityStage: "NEW",
+        emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+        emergencyRestrictedRole: "",
+      },
+      logger: { debug() {}, info() {}, warning() {}, error() {} },
+      writeResource: (
+        type: string,
+        name: string,
+        data: Record<string, unknown>,
+      ) => {
+        writes.push({ type, name, data });
+        return Promise.resolve({ name });
+      },
+    },
+  };
+}
+
+Deno.test("findPerson by email: hit records found:true + id", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return {
+        body: {
+          data: { people: [{ id: "p1", leadId: "L1", companyId: "c1" }] },
+        },
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.findPerson.execute(
+      { email: "ada@example.com" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].type, "personRef");
+    assertEquals(writes[0].data.found, true);
+    assertEquals(writes[0].data.id, "p1");
+    assertEquals(writes[0].data.companyId, "c1");
+    // Queried the email filter, URL-encoded.
+    assert(
+      calls.some((c) =>
+        c.path.includes("emails.primaryEmail[eq]:ada%40example.com")
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("findPerson by email: miss records found:false, no throw", async () => {
+  const { restore } = stubFetchStatus(() => ({
+    body: { data: { people: [] } },
+  }));
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.findPerson.execute(
+      { email: "absent@example.com" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.found, false);
+    assertEquals("id" in writes[0].data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("findPerson: ambiguous email throws with redacted PII", async () => {
+  const { restore } = stubFetchStatus(() => ({
+    body: { data: { people: [{ id: "a" }, { id: "b" }] } },
+  }));
+  const { ctx } = readCtx();
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.findPerson.execute(
+          { email: "dup@example.com" } as never,
+          ctx as never,
+        ),
+      Error,
+      "Ambiguous",
+    );
+    // Email is scrubbed from the surfaced error (RS-3).
+    assert(!err.message.includes("dup@example.com"), err.message);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getPersonById: 404 records found:false", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people/")) {
+      return { status: 404, body: { messages: ["not found"] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getPersonById.execute(
+      { id: "11111111-1111-1111-1111-111111111111" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.found, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getPersonById rejects a non-UUID id before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.getPersonById.execute(
+          { id: "../opportunities" } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid person id",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("findCompany by domain: hit carries id/name/domain", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      return {
+        body: {
+          data: {
+            companies: [{
+              id: "co1",
+              name: "Jackson Family Enterprises",
+              domainName: { primaryLinkUrl: "jacksonfamilywines.com" },
+            }],
+          },
+        },
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.findCompany.execute(
+      { domain: "jacksonfamilywines.com" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.found, true);
+    assertEquals(writes[0].data.id, "co1");
+    assertEquals(writes[0].data.name, "Jackson Family Enterprises");
+    assertEquals(writes[0].data.domain, "jacksonfamilywines.com");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("findCompany by name: not filterable => found:false gracefully", async () => {
+  // Simulate a non-filterable `name` field: the request errors, findOne* swallows
+  // it and returns null rather than aborting.
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      return { status: 400, body: { messages: ["name not filterable"] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.findCompany.execute(
+      { name: "Jackson Family Enterprises" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.found, false);
+  } finally {
+    restore();
+  }
+});
+
+const JFW_OPP = {
+  id: "opp-aap",
+  leadId: "jfw-aap-2.7-2026",
+  name: "AAP 2.7",
+  stage: "PROPOSAL",
+  amount: { amountMicros: 43_478_260_000, currencyCode: "USD" },
+  closeDate: "2026-12-31T00:00:00.000Z",
+  companyId: "co1",
+  pointOfContactId: "poc1",
+};
+
+Deno.test("getOpportunity by leadId: PROPOSAL + amount 43478.26", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { data: { opportunities: [JFW_OPP] } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getOpportunity.execute(
+      { leadId: "jfw-aap-2.7-2026" } as never,
+      ctx as never,
+    );
+    const d = writes[0].data;
+    assertEquals(d.found, true);
+    assertEquals(d.stage, "PROPOSAL");
+    assertAlmostEquals(d.amount as number, 43478.26, 1e-6);
+    assertEquals(d.currencyCode, "USD");
+    assertEquals(d.pointOfContactId, "poc1");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getOpportunity by id: equivalent snapshot; 404 => found:false", async () => {
+  const uuid = "22222222-2222-2222-2222-222222222222";
+  {
+    const { restore } = stubFetchStatus((method, path) => {
+      if (method === "GET" && path === `/rest/opportunities/${uuid}`) {
+        return { body: { data: { opportunity: JFW_OPP } } };
+      }
+      return {};
+    });
+    const { writes, ctx } = readCtx();
+    try {
+      await model.methods.getOpportunity.execute(
+        { id: uuid } as never,
+        ctx as never,
+      );
+      assertEquals(writes[0].data.found, true);
+      assertEquals(writes[0].data.stage, "PROPOSAL");
+    } finally {
+      restore();
+    }
+  }
+  {
+    const { restore } = stubFetchStatus(() => ({
+      status: 404,
+      body: {},
+    }));
+    const { writes, ctx } = readCtx();
+    try {
+      await model.methods.getOpportunity.execute(
+        { id: uuid } as never,
+        ctx as never,
+      );
+      assertEquals(writes[0].data.found, false);
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("listOpportunities: AND-composes filters and returns both JFW opps", async () => {
+  const cid = "33333333-3333-3333-3333-333333333333";
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return {
+        body: {
+          data: {
+            opportunities: [
+              JFW_OPP,
+              { id: "opp-sow", name: "SOW#26", stage: "CUSTOMER" },
+            ],
+          },
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listOpportunities.execute(
+      { companyId: cid, stage: "PROPOSAL", limit: 60 } as never,
+      ctx as never,
+    );
+    // Single filter param, comma-joined AND clauses.
+    const q = calls[0].path;
+    assert(
+      q.includes(`filter=companyId[eq]:${cid},stage[eq]:PROPOSAL`),
+      q,
+    );
+    assertEquals(writes[0].data.count, 2);
+    assertEquals(writes[0].data.truncated, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listOpportunities: pages past pageSize, then stops (hasNextPage:false)", async () => {
+  const page1 = Array.from({ length: 60 }, (_, i) => ({
+    id: `a${i}`,
+    name: `n${i}`,
+    stage: "NEW",
+  }));
+  const page2 = Array.from({ length: 5 }, (_, i) => ({
+    id: `b${i}`,
+    name: `m${i}`,
+    stage: "NEW",
+  }));
+  const { calls, restore } = stubFetchStatus((_method, path) => {
+    if (path.includes("starting_after=")) {
+      return {
+        body: {
+          data: { opportunities: page2 },
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    return {
+      body: {
+        data: { opportunities: page1 },
+        pageInfo: { hasNextPage: true, endCursor: "CURSOR1" },
+      },
+    };
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listOpportunities.execute(
+      { limit: 200 } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.count, 65);
+    assertEquals(writes[0].data.truncated, false);
+    // Second page requested with the returned cursor.
+    assert(calls.some((c) => c.path.includes("starting_after=CURSOR1")));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listOpportunities: caps at limit and flags truncated", async () => {
+  const { restore } = stubFetchStatus(() => ({
+    body: {
+      data: {
+        opportunities: [
+          { id: "x1", name: "a", stage: "NEW" },
+          { id: "x2", name: "b", stage: "NEW" },
+          { id: "x3", name: "c", stage: "NEW" },
+        ],
+      },
+      pageInfo: { hasNextPage: false },
+    },
+  }));
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listOpportunities.execute(
+      { limit: 2 } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.count, 2);
+    assertEquals(writes[0].data.truncated, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listOpportunities: wrong cursor cannot infinite-loop (no-progress guard)", async () => {
+  // Every page returns the SAME ids and always claims hasNextPage — a broken
+  // cursor. The dedupe + no-progress guard must terminate after one useful page.
+  let pages = 0;
+  const { restore } = stubFetchStatus(() => {
+    pages++;
+    return {
+      body: {
+        data: {
+          opportunities: [
+            { id: "same1", name: "a", stage: "NEW" },
+            { id: "same2", name: "b", stage: "NEW" },
+          ],
+        },
+        pageInfo: { hasNextPage: true, endCursor: "STUCK" },
+      },
+    };
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listOpportunities.execute(
+      { limit: 500 } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.count, 2);
+    // Fetched page 1, then page 2 (all-seen => stop). Never runs away.
+    assert(pages <= 2, `expected <=2 pages, got ${pages}`);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listOpportunities rejects a non-UUID companyId", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.listOpportunities.execute(
+          { companyId: "not-a-uuid", limit: 60 } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid companyId",
+    );
+    assertEquals(calls.length, 0);
   } finally {
     restore();
   }
