@@ -2,6 +2,84 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.06.3
+
+### Added
+
+- **`upsertPerson`** — first-class, idempotent-on-email curated-contact writer
+  mirroring `upsertOpportunity`'s shape, so a Person can be curated directly
+  (name / phone / jobTitle / city + Company link) rather than only as an
+  opportunity's link-only point-of-contact or via the `push_leads` lead flow.
+  Enables backfilling contacts that already exist upstream and adding secondary
+  contacts. Find-or-create by `primaryEmail`: a hit PATCHes only the provided
+  fields (`action=updated`); a miss creates (`action=created`). NEVER stamps a
+  `leadId` — curated contacts stay out of the `leadId`→Person namespace
+  `push_leads` relies on. Company deduped by domain then exact name, created and
+  linked only when a domain is supplied (name-only miss left unlinked with a
+  `companyNote`). Name subfields merge on update so a partial
+  `{firstName|lastName}` never nulls the other; a bad phone is dropped, never
+  blocks the contact. `create → conflict → refind → update` fallback keyed on
+  email so concurrent runs converge on one Person. `confirm`-gated with a
+  no-write `dryRun`; whole execute wrapped in `redactError` (snapshot carries no
+  raw PII).
+- **`personUpsert` resource** — records the action taken, the resolved Person id,
+  the fields set, and the Company link.
+
+### Changed
+
+- Version bump to `2026.09.06.3` with a no-op `upgrades[]` entry
+  (globalArguments unchanged) so existing pinned instances upgrade lazily.
+
+## 2026.09.06.2
+
+### Added
+
+- **`ensureStageOption`** — idempotently provisions a SELECT option on an
+  allowlisted picklist field (default `opportunity.stage`), closing a real gap:
+  `upsertOpportunity` validates stage against the live enum but nothing could
+  ADD to it (e.g. a `CLOSED` stage). Reads every existing option's full
+  `{id,value,label,color,position}` and appends the new one, preserving existing
+  entries verbatim (hard-stops rather than rebuild a lossy array); options-only
+  partial PATCH so sibling metadata survives; re-reads immediately before the
+  write and aborts on drift (optimistic concurrency). `(object,field)` allowlist
+  so a typo can't append to the wrong SELECT; SELECT-only (MULTI_SELECT and
+  every other type rejected); value UPPER_SNAKE-validated, color
+  palette-validated. Confirm-gated, `dryRun`-previewable, execute wrapped in
+  `redactError`; mirrors `ensureLeadFields`.
+- **`stageOption` resource** — records the provisioned option and the field it
+  was appended to.
+
+### Changed
+
+- Version bump to `2026.09.06.2` with a no-op `upgrades[]` entry
+  (globalArguments unchanged) so existing pinned instances upgrade lazily.
+
+## 2026.09.06.1
+
+### Added
+
+- **Read surface** — first-class, side-effect-free READ methods so
+  reconcile/dedup audits no longer abuse `upsertOpportunity --dryRun` as a
+  probe: `findPerson` (email | leadId), `findCompany` (domain | name),
+  `getOpportunity` (leadId | id), `listOpportunities` (companyId and/or stage,
+  paginated fan-out), plus `getPersonById` / `getCompanyById` reverse lookups so
+  the reconcile report can walk an opportunity's `pointOfContactId` /
+  `companyId` back to a contact/company. Cursor pagination with a no-progress
+  guard (zero-new-id or repeated cursor hard-stops) and dedup by id, so a wrong
+  cursor field can never infinite-loop; multi-clause AND composed as one
+  comma-joined `filter=` param with each value UUID/filter-safe validated and
+  URL-encoded; every read wrapped in `redactError` so an ambiguous-match throw or
+  4xx never leaks the raw email/name. Additive only — `push_leads` and every
+  write path untouched.
+- **`personRef` / `companyRef` / `opportunityRef` / `opportunityList`
+  snapshots** — misses recorded as `found:false` ("looked, not there" vs "never
+  looked").
+
+### Changed
+
+- Version bump to `2026.09.06.1` with a no-op `upgrades[]` entry
+  (globalArguments unchanged) so existing pinned instances upgrade lazily.
+
 ## 2026.09.05.2
 
 ### Added
