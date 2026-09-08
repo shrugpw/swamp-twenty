@@ -1058,26 +1058,39 @@ Deno.test("listOpportunities: pages past pageSize, then stops (hasNextPage:false
   }
 });
 
-Deno.test("listOpportunities: caps at limit and flags truncated", async () => {
-  const { restore } = stubFetchStatus(() => ({
-    body: {
-      data: {
-        opportunities: [
-          { id: "x1", name: "a", stage: "NEW" },
-          { id: "x2", name: "b", stage: "NEW" },
-          { id: "x3", name: "c", stage: "NEW" },
-        ],
+Deno.test("listOpportunities: soft cap rounds up to a whole page and flags truncated", async () => {
+  // Whole-page capping: a full page (3 rows) is consumed even though limit=2,
+  // and because more pages remain the call flags truncated with count=3 (the
+  // soft floor rounded up to the page boundary — CR-A-1/CR-A-2).
+  const { restore } = stubFetchStatus((_method, path) => {
+    if (path.includes("starting_after=")) {
+      return {
+        body: {
+          data: { opportunities: [{ id: "x4", name: "d", stage: "NEW" }] },
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    return {
+      body: {
+        data: {
+          opportunities: [
+            { id: "x1", name: "a", stage: "NEW" },
+            { id: "x2", name: "b", stage: "NEW" },
+            { id: "x3", name: "c", stage: "NEW" },
+          ],
+        },
+        pageInfo: { hasNextPage: true, endCursor: "CURSOR1" },
       },
-      pageInfo: { hasNextPage: false },
-    },
-  }));
+    };
+  });
   const { writes, ctx } = readCtx();
   try {
     await model.methods.listOpportunities.execute(
       { limit: 2 } as never,
       ctx as never,
     );
-    assertEquals(writes[0].data.count, 2);
+    assertEquals(writes[0].data.count, 3);
     assertEquals(writes[0].data.truncated, true);
   } finally {
     restore();
@@ -1924,7 +1937,7 @@ Deno.test("listFiltered pages + continues, dedups by id, reconciles => complete"
   }
 });
 
-Deno.test("listFiltered cap-reached => truncated + hasMore + nextCursor + incomplete", async () => {
+Deno.test("listFiltered cap-reached => whole page, truncated + hasMore + boundary nextCursor, NOT incomplete", async () => {
   const { restore } = servePages(
     "people",
     [
@@ -1938,10 +1951,11 @@ Deno.test("listFiltered cap-reached => truncated + hasMore + nextCursor + incomp
     assertEquals(p.items.length, 2);
     assertEquals(p.truncated, true);
     assertEquals(p.hasMore, true);
-    // Resume from the cursor of the page holding our last kept item (no gap).
+    // nextCursor is the endCursor of the LAST fully-fetched page (a boundary).
     assertEquals(p.nextCursor, "c0");
     assertEquals(p.stopReason, "cap-reached");
-    assertEquals(p.incomplete, true);
+    // Continuation is available => NOT incomplete (CR-A-3).
+    assertEquals(p.incomplete, false);
   } finally {
     restore();
   }
@@ -1977,7 +1991,7 @@ Deno.test("listFiltered no-progress guard (all dup ids) => incomplete + no-progr
   }
 });
 
-Deno.test("listFiltered max-pages backstop => incomplete + max-pages", async () => {
+Deno.test("listFiltered max-pages backstop => continuable (hasMore + nextCursor), NOT incomplete (CR-A-6)", async () => {
   const { restore } = servePages("people", [
     { items: [{ id: "a" }], endCursor: "c0", hasNextPage: true },
     { items: [{ id: "b" }], endCursor: "c1", hasNextPage: true },
@@ -1988,7 +2002,10 @@ Deno.test("listFiltered max-pages backstop => incomplete + max-pages", async () 
     // cap 60 => maxPages = ceil(60/60)+2 = 3 iterations before the backstop.
     const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
     assertEquals(p.stopReason, "max-pages");
-    assertEquals(p.incomplete, true);
+    // Cursor is a consumed page boundary => don't strand the workflow (CR-A-6).
+    assertEquals(p.hasMore, true);
+    assertEquals(p.nextCursor, "c2");
+    assertEquals(p.incomplete, false);
   } finally {
     restore();
   }
@@ -2046,6 +2063,115 @@ Deno.test("listFiltered sends order_by=createdAt,id + filter + starting_after pa
   }
 });
 
+// --- CR-A: whole-page capping correctness (these FAIL on mid-page slicing) ---
+
+Deno.test("CR-A-1: cap not a page multiple, chained across two calls => NO duplicate ids", async () => {
+  // Pages of 2; cap 3 is not a multiple of the page size. Whole-page capping
+  // must hand back a boundary cursor so call 2 does not re-emit a sliced row.
+  const pages = [
+    { items: [{ id: "a" }, { id: "b" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "c" }, { id: "d" }], endCursor: "c1", hasNextPage: true },
+    { items: [{ id: "e" }, { id: "f" }], endCursor: "c2", hasNextPage: false },
+  ];
+  const { restore } = servePages("people", pages, 6);
+  try {
+    const call1 = await listFiltered(LF_CFG, "people", [], 3, "createdAt,id");
+    assertEquals(call1.stopReason, "cap-reached");
+    assert(call1.hasMore);
+    assert(call1.nextCursor !== undefined);
+    const call2 = await listFiltered(
+      LF_CFG,
+      "people",
+      [],
+      3,
+      "createdAt,id",
+      call1.nextCursor,
+    );
+    const union = [
+      ...call1.items.map((r) => String(r.id)),
+      ...call2.items.map((r) => String(r.id)),
+    ];
+    assertEquals(new Set(union).size, union.length); // no duplicate ids
+    assertEquals(new Set(union), new Set(["a", "b", "c", "d", "e", "f"]));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("CR-A-2: limit < page size with more rows on page 0, chained => NO skipped row", async () => {
+  const pages = [
+    { items: [{ id: "a" }, { id: "b" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "c" }, { id: "d" }], endCursor: "c1", hasNextPage: false },
+  ];
+  const { restore } = servePages("people", pages, 4);
+  try {
+    const call1 = await listFiltered(LF_CFG, "people", [], 1, "createdAt,id");
+    // Sub-page cap returns the FIRST FULL page (both a and b), then stops.
+    assertEquals(call1.items.map((r) => String(r.id)), ["a", "b"]);
+    assertEquals(call1.stopReason, "cap-reached");
+    assert(call1.hasMore);
+    const call2 = await listFiltered(
+      LF_CFG,
+      "people",
+      [],
+      1,
+      "createdAt,id",
+      call1.nextCursor,
+    );
+    const union = [
+      ...call1.items.map((r) => String(r.id)),
+      ...call2.items.map((r) => String(r.id)),
+    ];
+    // Every row is present exactly once — nothing skipped.
+    assertEquals(new Set(union), new Set(["a", "b", "c", "d"]));
+    assertEquals(new Set(union).size, union.length);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("CR-A-3: continuation call reaching hasNextPage=false => complete + NOT incomplete (even if totalCount differs)", async () => {
+  // idx from cursor "c0" resolves to page 1 (the tail), which ends cleanly.
+  const pages = [
+    { items: [{ id: "a" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "b" }], endCursor: "c1", hasNextPage: false },
+  ];
+  const { restore } = servePages("people", pages, 99); // total != window count
+  try {
+    const p = await listFiltered(
+      LF_CFG,
+      "people",
+      [],
+      60,
+      "createdAt,id",
+      "c0",
+    );
+    assertEquals(p.stopReason, "complete");
+    assertEquals(p.incomplete, false);
+    assertEquals(p.hasMore, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("CR-A-6: max-pages/short-page case stays continuable (hasMore + nextCursor)", async () => {
+  const { restore } = servePages("people", [
+    { items: [{ id: "a" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "b" }], endCursor: "c1", hasNextPage: true },
+    { items: [{ id: "c" }], endCursor: "c2", hasNextPage: true },
+    { items: [{ id: "d" }], endCursor: "c3", hasNextPage: true },
+  ]);
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "max-pages");
+    assert(p.hasMore);
+    assert(p.nextCursor !== undefined);
+    assertEquals(p.incomplete, false);
+  } finally {
+    restore();
+  }
+});
+
 // --- compact view mappers ---------------------------------------------------
 
 Deno.test("mapPersonView keeps only join keys (no name/email/phone)", () => {
@@ -2094,6 +2220,15 @@ Deno.test("mapNoteView redacts free-text titles, keeps the machine 'Inbound lead
   assert(!("bodyV2" in kept));
   const dropped = mapNoteView({ id: "n2", title: "Private client meeting" });
   assertEquals(dropped.title, undefined);
+  // CR-A-5: anchored guard drops a free-text tail after a real leadId prefix.
+  const tampered = mapNoteView({
+    id: "n3",
+    title: "Inbound lead L1 and here are my private notes",
+  });
+  assertEquals(tampered.title, undefined);
+  // ...and a prefix followed by a non-leadId token.
+  const badSuffix = mapNoteView({ id: "n4", title: "Inbound lead <script>" });
+  assertEquals(badSuffix.title, undefined);
 });
 
 Deno.test("normalizeDomainHost strips scheme/path/port/userinfo/trailing dot", () => {
@@ -2354,4 +2489,16 @@ Deno.test("redactError scrubs filter= and starting_after= query values (SR-2)", 
   assert(s.includes("starting_after=[redacted]"), s);
   assert(!s.includes("topsecret"), s);
   assert(!s.includes("CURSOR123"), s);
+});
+
+Deno.test("redactError scrubs the bearer token and an exact literal token (SR-2/CR-S-1)", () => {
+  const tok = "sk_live_abc123.DEF-456~789";
+  const s = redactError(
+    `fetch failed for Authorization: Bearer ${tok} against host; token ${tok} echoed`,
+    300,
+    tok,
+  );
+  assert(!s.includes(tok), s);
+  assert(s.includes("Bearer [redacted]"), s);
+  assert(s.includes("[redacted]"), s);
 });

@@ -316,17 +316,31 @@ const LONG_DIGITS_RE = /\+?\d[\d ().-]{6,}\d/g;
 // — the [eq] value alone may not match the email/digit shapes above (SR-2).
 const FILTER_QUERY_RE = /([?&]filter=)[^&\s]*/gi;
 const CURSOR_QUERY_RE = /([?&]starting_after=)[^&\s]*/gi;
+// SR-2/CR-S-1: scrub the bearer token. The transport keeps it in the
+// Authorization header (never echoed), but a future error path could surface it
+// — so `Bearer <token>` is masked generically, and any exact `token` the caller
+// passes is masked literally, so the secret can never leak into durable data.
+const BEARER_RE = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
 
 /**
- * Redact PII-shaped substrings (emails, long digit runs) AND the sensitive
- * `filter=` / `starting_after=` query values from a captured error message, then
- * cap its length, so the per-lead audit and the list snapshots keep their "no
- * raw PII / no attacker-influenced input" guarantee even when Twenty echoes the
- * offending value (or the transport echoes the request URL) back in a 4xx.
+ * Redact secrets + PII from a captured error message and cap its length: the
+ * bearer token (SR-2/CR-S-1), the sensitive `filter=` / `starting_after=` query
+ * values (which embed raw leadId/name/domain + the opaque cursor), and
+ * email/long-digit PII shapes. Keeps the per-lead audit and the list snapshots'
+ * "no secret / no raw PII / no attacker-influenced input" guarantee even when
+ * Twenty echoes the offending value (or the transport echoes the request URL)
+ * back in a 4xx. Pass `token` (e.g. cfg.apiToken) to also mask exact literal
+ * occurrences of the secret.
  */
-export function redactError(raw: unknown, maxLen = 300): string {
+export function redactError(
+  raw: unknown,
+  maxLen = 300,
+  token?: string,
+): string {
   let s = raw instanceof Error ? raw.message : String(raw ?? "");
+  if (token && token.length >= 4) s = s.split(token).join("[redacted]");
   s = s
+    .replace(BEARER_RE, "Bearer [redacted]")
     .replace(FILTER_QUERY_RE, "$1[redacted]")
     .replace(CURSOR_QUERY_RE, "$1[redacted]")
     .replace(EMAIL_IN_TEXT_RE, "[email]")
@@ -995,10 +1009,12 @@ export function mapCompanyView(rec: Record<string, unknown>): CompanyView {
   return v;
 }
 
-// SR-1: the only Note title safe to snapshot is the machine-generated
-// `Inbound lead <leadId>` from ensureNoteForLead. Any other (free-text,
-// user-authored) title is dropped so no free-text note titles ever enter data.
-const INBOUND_LEAD_TITLE_RE = /^Inbound lead /;
+// SR-1 / CR-A-5: the only Note title safe to snapshot is the machine-generated
+// `Inbound lead <leadId>` from ensureNoteForLead. The guard is ANCHORED end-to-
+// end — exactly the prefix + a single non-space leadId token — and the token is
+// re-validated with validateLeadId, so a title with a free-text tail (e.g.
+// `Inbound lead L1 and my notes...`) or a non-leadId suffix is dropped.
+const INBOUND_LEAD_TITLE_RE = /^Inbound lead (\S+)$/;
 
 /**
  * Compact Note-list view — NEVER carries bodyV2/markdown. NOTE: no isEmergency
@@ -1018,7 +1034,8 @@ export interface NoteView {
 export function mapNoteView(rec: Record<string, unknown>): NoteView {
   const v: NoteView = { id: String(rec.id ?? "") };
   const title = rec.title != null ? String(rec.title) : "";
-  if (title && INBOUND_LEAD_TITLE_RE.test(title)) v.title = title; // SR-1
+  const m = title.match(INBOUND_LEAD_TITLE_RE); // SR-1 / CR-A-5
+  if (m && validateLeadId(m[1])) v.title = title;
   if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
   if (rec.createdAt) v.createdAt = String(rec.createdAt);
   if (rec.updatedAt) v.updatedAt = String(rec.updatedAt);
@@ -1101,18 +1118,18 @@ const LIST_ORDER = "createdAt,id";
 // VERIFY-LIVE: the exact OR / IS-NULL syntax + isEmergency defaultValue (V2-1).
 const NON_EMERGENCY_CLAUSE = "or(isEmergency[eq]:false,isEmergency[is]:NULL)";
 
-/** One list method's paged, deduped, reconciled result (see {@link listFiltered}). */
+/** One list method's paged, deduped result (see {@link listFiltered}). */
 export interface ListPage {
   items: Array<Record<string, unknown>>;
-  /** True only when the per-call cap was hit with more rows available. */
+  /** True when the per-call cap was reached with more pages available. */
   truncated: boolean;
   /** True when Twenty still has pages beyond this call (drives workflow loop). */
   hasMore: boolean;
-  /** Last endCursor to pass back as startingAfter; set only when hasMore. */
+  /** endCursor of the LAST fully-fetched page, to pass back as startingAfter. */
   nextCursor?: string;
-  /** Twenty's reported total for the filter, captured for reconciliation. */
+  /** Twenty's reported total for the filter (exposed for workflow-level sums). */
   totalCount?: number;
-  /** True whenever a guard exited or the count did not reconcile w/ totalCount. */
+  /** True only when the cursor is untrustworthy (no-progress / cursor-repeat). */
   incomplete: boolean;
   stopReason:
     | "complete"
@@ -1126,20 +1143,32 @@ export interface ListPage {
 }
 
 /**
- * Fan-out read (repo rule 6): page through all records of `plural` matching the
+ * Fan-out read (repo rule 6): page through records of `plural` matching the
  * AND-composed `clauses` in ONE call — the single generic paginator behind
  * listOpportunities/listPeople/listCompanies/listNotes. Each clause is a
  * ready-to-send `field[eq]:<url-encoded-value>` (or a constant DSL group like
  * {@link NON_EMERGENCY_CLAUSE}) built + validated by the caller; they are
- * comma-joined into one `filter=` param. Sends an explicit immutable
- * `order_by` (AR-4) so paging is gap-free, advances the cursor on
- * `pageInfo.endCursor`, dedups by id across pages, and captures the response
- * `totalCount`. Completeness is reported honestly (AR-2): `stopReason='complete'`
- * + `incomplete=false` ONLY on a clean `hasNextPage:false` at/under cap whose
- * unique count reconciles with totalCount. Every guard exit (cap-reached,
- * no-progress, cursor-repeat, max-pages) and every reconciliation failure
- * (count-mismatch, no-total) sets `incomplete=true` with a non-'complete'
- * stopReason — it never silently asserts completeness.
+ * comma-joined into one `filter=` param. Sends an explicit immutable `order_by`
+ * (AR-4) so paging is gap-free.
+ *
+ * WHOLE-PAGE capping (CR-A-1/CR-A-2): a page is always consumed in full — every
+ * record is appended (deduped by id within the call) and the cursor advances to
+ * that page's `endCursor` — so the cursor handed back is ALWAYS a fully-consumed
+ * page boundary. The next call resumes strictly after it: zero duplication and
+ * zero skipped rows, even when `cap < PAGE_SIZE`. Consequently `cap` (from
+ * `limit`) is a SOFT per-call floor: a call may return up to `PAGE_SIZE - 1`
+ * more rows than `cap`, rounded up to the page boundary.
+ *
+ * Completeness is end-of-cursor (CR-A-3), not per-call reconciliation: a single
+ * call cannot know its cumulative offset, so `complete`/`incomplete=false` is
+ * reported whenever the loop ended on `hasNextPage=false`; `cap-reached` (with a
+ * valid `nextCursor`) and the `max-pages` backstop are continuable, NOT
+ * incomplete. `incomplete=true` is reserved for an untrustworthy cursor
+ * (`no-progress`, `cursor-repeat`). A single-call whole-set read (no
+ * `startingAfter`, `hasMore=false`) is the ONLY place a count is reconciled
+ * against `totalCount` — matching -> `complete`, mismatch -> `count-mismatch`,
+ * absent -> `no-total`; cross-call cumulative reconciliation is the workflow's
+ * job, using the `totalCount` this envelope exposes.
  */
 export async function listFiltered(
   cfg: TwentyCfg,
@@ -1156,7 +1185,6 @@ export async function listFiltered(
   const items: Array<Record<string, unknown>> = [];
   let cursor: string | undefined = startingAfter;
   let totalCount: number | undefined;
-  let truncated = false;
   let hasMore = false;
   let nextCursor: string | undefined;
   let stopReason: ListPage["stopReason"] | undefined;
@@ -1175,40 +1203,27 @@ export async function listFiltered(
     const pageInfo = (json as {
       pageInfo?: { hasNextPage?: boolean; endCursor?: string };
     }).pageInfo;
+    // Consume the WHOLE page — never slice mid-page (CR-A-1/CR-A-2).
     let newInPage = 0;
-    let hitCap = false;
     for (const rec of batch) {
       const id = String(rec.id ?? "");
       if (!id || seen.has(id)) continue;
       newInPage++;
-      if (items.length >= cap) {
-        hitCap = true;
-        break;
-      }
       seen.add(id);
       items.push(rec);
     }
-    if (hitCap) {
-      // Continuation (AR-1): resume from the cursor of the page holding our last
-      // kept item so nothing is skipped (`pageCursor`); fall back to this page's
-      // endCursor only when we never advanced (sub-PAGE_SIZE cap on page 0).
-      truncated = true;
-      hasMore = true;
-      nextCursor = pageCursor ?? pageInfo?.endCursor;
-      stopReason = "cap-reached";
-      break;
-    }
-    // Clean end of data at/under cap.
+    const endCursor = pageInfo?.endCursor;
+    // Clean end of data.
     if (!pageInfo?.hasNextPage) {
       stopReason = "complete";
       break;
     }
-    // Guards: never silently claim completeness (AR-2).
-    if (!pageInfo.endCursor) {
+    // hasNextPage is true — guard an untrustworthy cursor before advancing.
+    if (!endCursor) {
       stopReason = "no-progress";
       break;
     }
-    if (pageInfo.endCursor === pageCursor) {
+    if (endCursor === pageCursor) {
       stopReason = "cursor-repeat";
       break;
     }
@@ -1216,24 +1231,39 @@ export async function listFiltered(
       stopReason = "no-progress";
       break;
     }
-    cursor = pageInfo.endCursor;
-  }
-  if (stopReason === undefined) stopReason = "max-pages";
-
-  // Reconcile a clean end against Twenty's totalCount (AR-2/V2-4).
-  let incomplete = true;
-  if (stopReason === "complete") {
-    if (totalCount === undefined) {
-      stopReason = "no-total"; // never conflated with count-mismatch
-    } else if (items.length === totalCount) {
-      incomplete = false; // the one true clean/complete snapshot
-    } else {
-      stopReason = "count-mismatch";
+    // Advance to this fully-consumed page's boundary, THEN honor the soft cap.
+    cursor = endCursor;
+    if (items.length >= cap) {
+      hasMore = true;
+      nextCursor = endCursor; // endCursor of the last FULLY-fetched page
+      stopReason = "cap-reached";
+      break;
     }
+  }
+  if (stopReason === undefined) {
+    // Max-pages backstop (CR-A-6): the cursor is a consumed page boundary, so
+    // the workflow can still continue — don't strand it, and don't flag it.
+    stopReason = "max-pages";
+    hasMore = true;
+    nextCursor = cursor;
+  }
+
+  let incomplete = false;
+  if (stopReason === "complete" && startingAfter === undefined) {
+    // Single-call whole-set read: the ONLY place a count reconciles (CR-A-3).
+    if (totalCount === undefined) {
+      stopReason = "no-total";
+      incomplete = true;
+    } else if (items.length !== totalCount) {
+      stopReason = "count-mismatch";
+      incomplete = true;
+    }
+  } else if (stopReason === "no-progress" || stopReason === "cursor-repeat") {
+    incomplete = true; // untrustworthy cursor — cannot safely continue
   }
   return {
     items,
-    truncated,
+    truncated: stopReason === "cap-reached",
     hasMore,
     nextCursor,
     totalCount,
@@ -2956,7 +2986,9 @@ export const model = {
           .positive()
           .max(MAX_LIST_CAP)
           .default(60)
-          .describe(`Max results to return (1..${MAX_LIST_CAP})`),
+          .describe(
+            `Soft results floor (1..${MAX_LIST_CAP}) rounded UP to a page boundary — may return up to PAGE_SIZE-1 more`,
+          ),
       }),
       execute: async (
         args: { companyId?: string; stage?: string; limit: number },
@@ -3028,7 +3060,7 @@ export const model = {
           .max(MAX_LIST_CAP)
           .default(60)
           .describe(
-            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+            `Soft per-call floor (1..${MAX_LIST_CAP}) rounded UP to a page boundary — the call stops after the first full page at/over this many rows, so it may return up to PAGE_SIZE-1 more. A safety floor, not a snapshot ceiling: loop on hasMore/nextCursor to collect the rest`,
           ),
       }),
       execute: async (
@@ -3142,7 +3174,7 @@ export const model = {
           );
           return { dataHandles: [handle] };
         } catch (e) {
-          throw new Error(redactError(e));
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },
@@ -3166,7 +3198,7 @@ export const model = {
           .max(MAX_LIST_CAP)
           .default(60)
           .describe(
-            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+            `Soft per-call floor (1..${MAX_LIST_CAP}) rounded UP to a page boundary — the call stops after the first full page at/over this many rows, so it may return up to PAGE_SIZE-1 more. A safety floor, not a snapshot ceiling: loop on hasMore/nextCursor to collect the rest`,
           ),
       }),
       execute: async (
@@ -3279,7 +3311,7 @@ export const model = {
           );
           return { dataHandles: [handle] };
         } catch (e) {
-          throw new Error(redactError(e));
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },
@@ -3300,7 +3332,7 @@ export const model = {
           .max(MAX_LIST_CAP)
           .default(60)
           .describe(
-            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+            `Soft per-call floor (1..${MAX_LIST_CAP}) rounded UP to a page boundary — the call stops after the first full page at/over this many rows, so it may return up to PAGE_SIZE-1 more. A safety floor, not a snapshot ceiling: loop on hasMore/nextCursor to collect the rest`,
           ),
       }),
       execute: async (
@@ -3394,7 +3426,7 @@ export const model = {
           );
           return { dataHandles: [handle] };
         } catch (e) {
-          throw new Error(redactError(e));
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },

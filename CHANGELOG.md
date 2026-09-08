@@ -36,9 +36,40 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
   (single-sourcing cursor advance, dedup, guards, and continuation across all
   four list methods) and sends the immutable `order_by=createdAt,id` for gap-free,
   byte-stable paging. Its `opportunityList` output shape is unchanged.
-- **`redactError`** now also scrubs `filter=` and `starting_after=` query values
-  from captured error strings (which embed raw leadId/name/domain and the opaque
-  cursor), not just the email/digit PII shapes.
+- **`redactError`** now also scrubs the bearer token (`Bearer <token>` and any
+  exact literal token the caller passes) plus the `filter=` and `starting_after=`
+  query values from captured error strings (which embed raw leadId/name/domain
+  and the opaque cursor), not just the email/digit PII shapes.
+- **`limit` is a soft per-call floor, not a hard ceiling.** All four list
+  methods page in whole `PAGE_SIZE` (60) pages: the call stops after the first
+  full page that reaches `limit`, so a call may return up to `PAGE_SIZE - 1` more
+  rows than `limit` (rounded up to the page boundary). This is what makes the
+  continuation cursor safe (see Fixed).
+
+### Fixed
+
+- **Continuation is now gap-free and duplication-free (whole-page capping).** The
+  paginator never slices a page mid-way: it consumes each page in full and only
+  ever hands back the `endCursor` of a fully-consumed page, so the next call
+  resumes strictly after it — no duplicated rows when `limit` is not a multiple
+  of the page size, and no skipped rows when `limit < PAGE_SIZE` (a sub-page
+  `limit` simply returns the first full page then stops with `hasMore=true`).
+- **Per-call completeness no longer masks cross-call state.** A single call
+  cannot know its cumulative offset, so completeness is now end-of-cursor:
+  `stopReason='complete'` + `incomplete=false` whenever the loop ends on
+  `hasNextPage=false`; `cap-reached` (with a valid `nextCursor`) and the
+  `max-pages` backstop are continuable and NOT flagged incomplete. A count is
+  reconciled against `totalCount` only for a single-call whole-set read (no
+  `startingAfter`, `hasMore=false`) → `count-mismatch` / `no-total`; cumulative
+  reconciliation across a page loop is the workflow's job, using the `totalCount`
+  the envelope still exposes. `incomplete=true` is reserved for an untrustworthy
+  cursor (`no-progress` / `cursor-repeat`).
+- **`max-pages` backstop no longer strands the workflow** — it now returns
+  `hasMore=true` + `nextCursor` (the last consumed page boundary) so paging can
+  continue.
+- **Note title guard is anchored** — a title is snapshotted only when it matches
+  exactly `Inbound lead <leadId>` (the leadId re-validated), so a title with a
+  free-text tail or a non-leadId suffix is dropped.
 
 ## 2026.09.06.3
 
