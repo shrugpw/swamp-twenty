@@ -15,14 +15,21 @@ import {
 import {
   amountFromMicros,
   buildFilterPath,
+  canonicalJson,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
   escapeMarkdown,
   isBlockedDomain,
   isFilterSafe,
+  listFiltered,
+  listInstanceHash,
+  mapCompanyView,
+  mapNoteView,
   mapOppView,
+  mapPersonView,
   model,
   normalizeCloseDate,
+  normalizeDomainHost,
   normalizePhone,
   planLead,
   redactError,
@@ -1852,4 +1859,481 @@ Deno.test("upsertPerson: ambiguous email throws with redacted PII (PU-5)", async
   } finally {
     restore();
   }
+});
+
+// --- TWENTY-SNAPSHOT-READS: bulk-list reads ---------------------------------
+
+const LF_CFG = { baseUrl: "https://crm.example.com", apiToken: "tok" };
+
+// Serve a scripted sequence of REST pages keyed by the starting_after cursor:
+// page 0 is served with no cursor; a request carrying starting_after=<endCursor
+// of page n> serves page n+1. Attaches totalCount when provided.
+function servePages(
+  plural: string,
+  pages: Array<
+    {
+      items: Array<Record<string, unknown>>;
+      endCursor?: string;
+      hasNextPage: boolean;
+    }
+  >,
+  totalCount?: number,
+) {
+  return stubFetchStatus((_method, path) => {
+    const m = path.match(/starting_after=([^&]+)/);
+    let idx = 0;
+    if (m) {
+      const cur = decodeURIComponent(m[1]);
+      idx = pages.findIndex((p) => p.endCursor === cur) + 1;
+    }
+    const pg = pages[idx] ?? { items: [], hasNextPage: false };
+    const body: Record<string, unknown> = {
+      data: { [plural]: pg.items },
+      pageInfo: { hasNextPage: pg.hasNextPage, endCursor: pg.endCursor },
+    };
+    if (totalCount !== undefined) body.totalCount = totalCount;
+    return { body };
+  });
+}
+
+Deno.test("listFiltered pages + continues, dedups by id, reconciles => complete", async () => {
+  const { restore } = servePages(
+    "people",
+    [
+      { items: [{ id: "a" }, { id: "b" }], endCursor: "c0", hasNextPage: true },
+      // 'b' repeats across the page boundary — must be deduped, not counted.
+      {
+        items: [{ id: "b" }, { id: "c" }],
+        endCursor: "c1",
+        hasNextPage: false,
+      },
+    ],
+    3,
+  );
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.items.map((r) => r.id), ["a", "b", "c"]);
+    assertEquals(p.totalCount, 3);
+    assertEquals(p.stopReason, "complete");
+    assertEquals(p.incomplete, false);
+    assertEquals(p.truncated, false);
+    assertEquals(p.hasMore, false);
+    assertEquals(p.nextCursor, undefined);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered cap-reached => truncated + hasMore + nextCursor + incomplete", async () => {
+  const { restore } = servePages(
+    "people",
+    [
+      { items: [{ id: "a" }, { id: "b" }], endCursor: "c0", hasNextPage: true },
+      { items: [{ id: "c" }, { id: "d" }], endCursor: "c1", hasNextPage: true },
+    ],
+    99,
+  );
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 2, "createdAt,id");
+    assertEquals(p.items.length, 2);
+    assertEquals(p.truncated, true);
+    assertEquals(p.hasMore, true);
+    // Resume from the cursor of the page holding our last kept item (no gap).
+    assertEquals(p.nextCursor, "c0");
+    assertEquals(p.stopReason, "cap-reached");
+    assertEquals(p.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered cursor-repeat guard => incomplete + cursor-repeat", async () => {
+  const { restore } = servePages("people", [
+    { items: [{ id: "a" }], endCursor: "same", hasNextPage: true },
+    { items: [{ id: "b" }], endCursor: "same", hasNextPage: true },
+  ]);
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "cursor-repeat");
+    assertEquals(p.incomplete, true);
+    assertEquals(p.hasMore, false);
+    assertEquals(p.nextCursor, undefined);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered no-progress guard (all dup ids) => incomplete + no-progress", async () => {
+  const { restore } = servePages("people", [
+    { items: [{ id: "a" }, { id: "b" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "a" }, { id: "b" }], endCursor: "c1", hasNextPage: true },
+  ]);
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "no-progress");
+    assertEquals(p.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered max-pages backstop => incomplete + max-pages", async () => {
+  const { restore } = servePages("people", [
+    { items: [{ id: "a" }], endCursor: "c0", hasNextPage: true },
+    { items: [{ id: "b" }], endCursor: "c1", hasNextPage: true },
+    { items: [{ id: "c" }], endCursor: "c2", hasNextPage: true },
+    { items: [{ id: "d" }], endCursor: "c3", hasNextPage: true },
+  ]);
+  try {
+    // cap 60 => maxPages = ceil(60/60)+2 = 3 iterations before the backstop.
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "max-pages");
+    assertEquals(p.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered clean end but missing totalCount => no-total (never 'complete')", async () => {
+  const { restore } = servePages("people", [
+    { items: [{ id: "a" }, { id: "b" }], hasNextPage: false },
+  ]); // no totalCount
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "no-total");
+    assertEquals(p.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered clean end but count != totalCount => count-mismatch", async () => {
+  const { restore } = servePages(
+    "people",
+    [{ items: [{ id: "a" }, { id: "b" }], hasNextPage: false }],
+    99,
+  );
+  try {
+    const p = await listFiltered(LF_CFG, "people", [], 60, "createdAt,id");
+    assertEquals(p.stopReason, "count-mismatch");
+    assertEquals(p.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listFiltered sends order_by=createdAt,id + filter + starting_after passthrough", async () => {
+  const { calls, restore } = servePages(
+    "people",
+    [{ items: [{ id: "a" }], hasNextPage: false }],
+    1,
+  );
+  try {
+    await listFiltered(
+      LF_CFG,
+      "people",
+      ["leadId[eq]:L1"],
+      60,
+      "createdAt,id",
+      "CUR",
+    );
+    const path = calls[0].path;
+    assert(path.includes("order_by=createdAt,id"), path);
+    assert(path.includes("filter=leadId[eq]:L1"), path);
+    assert(path.includes("starting_after=CUR"), path);
+  } finally {
+    restore();
+  }
+});
+
+// --- compact view mappers ---------------------------------------------------
+
+Deno.test("mapPersonView keeps only join keys (no name/email/phone)", () => {
+  const v = mapPersonView({
+    id: "p1",
+    leadId: "L1",
+    companyId: "co1",
+    isEmergency: false,
+    createdAt: "2026-09-01T00:00:00.000Z",
+    name: { firstName: "Ada", lastName: "L" },
+    emails: { primaryEmail: "ada@x.com" },
+  });
+  assertEquals(v, {
+    id: "p1",
+    leadId: "L1",
+    companyId: "co1",
+    isEmergency: false, // surfaced even when false (AR-5)
+    createdAt: "2026-09-01T00:00:00.000Z",
+  });
+  assert(!("name" in v) && !("emails" in v));
+});
+
+Deno.test("mapCompanyView normalizes domainName.primaryLinkUrl to a bare host", () => {
+  const v = mapCompanyView({
+    id: "co1",
+    name: "Acme",
+    domainName: { primaryLinkUrl: "https://acme.com/contact" },
+    createdAt: "2026-09-01T00:00:00.000Z",
+  });
+  assertEquals(v, {
+    id: "co1",
+    name: "Acme",
+    domain: "acme.com",
+    createdAt: "2026-09-01T00:00:00.000Z",
+  });
+});
+
+Deno.test("mapNoteView redacts free-text titles, keeps the machine 'Inbound lead ' title, drops body", () => {
+  const kept = mapNoteView({
+    id: "n1",
+    title: "Inbound lead L1",
+    leadId: "L1",
+    bodyV2: { markdown: "secret body" },
+  });
+  assertEquals(kept.title, "Inbound lead L1");
+  assert(!("bodyV2" in kept));
+  const dropped = mapNoteView({ id: "n2", title: "Private client meeting" });
+  assertEquals(dropped.title, undefined);
+});
+
+Deno.test("normalizeDomainHost strips scheme/path/port/userinfo/trailing dot", () => {
+  assertEquals(normalizeDomainHost("https://Acme.COM/contact"), "acme.com");
+  assertEquals(normalizeDomainHost("http://user@acme.com:8443/x"), "acme.com");
+  assertEquals(normalizeDomainHost("acme.com."), "acme.com");
+  assertEquals(normalizeDomainHost("  ACME.com  "), "acme.com");
+  assertEquals(normalizeDomainHost(""), null);
+  assertEquals(normalizeDomainHost(null), null);
+});
+
+// --- instance-key determinism (AR-7) ----------------------------------------
+
+Deno.test("canonicalJson sorts keys and drops undefined", () => {
+  assertEquals(canonicalJson({ b: 1, a: 2, c: undefined }), '{"a":2,"b":1}');
+  assertEquals(
+    canonicalJson({ f: { z: undefined, a: null }, after: null }),
+    '{"after":null,"f":{"a":null}}',
+  );
+});
+
+Deno.test("listInstanceHash is deterministic and collision-resistant across filters", async () => {
+  const empty = await listInstanceHash({
+    f: { includeEmergency: false },
+    after: null,
+  });
+  const empty2 = await listInstanceHash({
+    f: { includeEmergency: false },
+    after: null,
+  });
+  assertEquals(empty, empty2);
+  assertEquals(empty.length, 16);
+  // Empty-filter snapshot cannot collide with a literal filter value 'all'.
+  const asAll = await listInstanceHash({
+    f: { companyId: "all", includeEmergency: false },
+    after: null,
+  });
+  assert(empty !== asAll);
+  // A cursor page differs from the first page.
+  const paged = await listInstanceHash({
+    f: { includeEmergency: false },
+    after: "CUR",
+  });
+  assert(empty !== paged);
+});
+
+// --- method-level: filter construction, rejection, keys, views --------------
+
+Deno.test("listPeople default excludes emergency with the NULL-safe OR clause", async () => {
+  const { calls, restore } = servePages(
+    "people",
+    [{ items: [{ id: "a" }], hasNextPage: false }],
+    1,
+  );
+  const { ctx } = readCtx();
+  try {
+    await model.methods.listPeople.execute(
+      { includeEmergency: false, limit: 60 } as never,
+      ctx as never,
+    );
+    assert(
+      calls[0].path.includes("or(isEmergency[eq]:false,isEmergency[is]:NULL)"),
+      calls[0].path,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listPeople includeEmergency:true omits the isEmergency clause", async () => {
+  const { calls, restore } = servePages(
+    "people",
+    [{ items: [{ id: "a" }], hasNextPage: false }],
+    1,
+  );
+  const { ctx } = readCtx();
+  try {
+    await model.methods.listPeople.execute(
+      { includeEmergency: true, limit: 60 } as never,
+      ctx as never,
+    );
+    assert(!calls[0].path.includes("isEmergency"), calls[0].path);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listPeople bounded-rejects a reserved-char leadId with NO request", async () => {
+  const { calls, restore } = servePages("people", []);
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listPeople.execute(
+      { leadId: "a,b(c)", includeEmergency: false, limit: 60 } as never,
+      ctx as never,
+    );
+    assertEquals(calls.length, 0); // never issued a corrupted clause
+    assertEquals(writes[0].type, "peopleList");
+    assertEquals(writes[0].data.stopReason, "unsupported-filter-value");
+    assertEquals(writes[0].data.incomplete, true);
+    assertEquals(writes[0].data.count, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listPeople instance key is deterministic per (filter, cursor) and varies by filter", async () => {
+  const { restore } = servePages(
+    "people",
+    [{ items: [], hasNextPage: false }],
+    0,
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listPeople.execute(
+      { includeEmergency: false, limit: 60 } as never,
+      ctx as never,
+    );
+    await model.methods.listPeople.execute(
+      { includeEmergency: false, limit: 60 } as never,
+      ctx as never,
+    );
+    await model.methods.listPeople.execute(
+      {
+        companyId: "11111111-1111-1111-1111-111111111111",
+        includeEmergency: false,
+        limit: 60,
+      } as never,
+      ctx as never,
+    );
+    assert(writes[0].name.startsWith("people-"));
+    assertEquals(writes[0].name, writes[1].name); // identical inputs => same key
+    assert(writes[0].name !== writes[2].name); // different filter => different key
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listPeople rejects an invalid companyId (redacted)", async () => {
+  const { ctx } = readCtx();
+  await assertRejects(
+    () =>
+      model.methods.listPeople.execute(
+        {
+          companyId: "not-a-uuid",
+          includeEmergency: false,
+          limit: 60,
+        } as never,
+        ctx as never,
+      ),
+    Error,
+    "Invalid companyId",
+  );
+});
+
+Deno.test("listCompanies normalizes the domain filter and the view domain", async () => {
+  const { calls, restore } = servePages(
+    "companies",
+    [{
+      items: [{
+        id: "co1",
+        name: "Acme",
+        domainName: { primaryLinkUrl: "https://acme.com/" },
+      }],
+      hasNextPage: false,
+    }],
+    1,
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listCompanies.execute(
+      { domain: "https://Acme.COM/path", limit: 60 } as never,
+      ctx as never,
+    );
+    assert(
+      calls[0].path.includes("domainName.primaryLinkUrl[eq]:acme.com"),
+      calls[0].path,
+    );
+    const items = writes[0].data.items as Array<Record<string, unknown>>;
+    assertEquals(items[0].domain, "acme.com");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listCompanies bounded-rejects a reserved-char name", async () => {
+  const { calls, restore } = servePages("companies", []);
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listCompanies.execute(
+      { name: "Acme, Inc.", limit: 60 } as never,
+      ctx as never,
+    );
+    assertEquals(calls.length, 0);
+    assertEquals(writes[0].data.stopReason, "unsupported-filter-value");
+    assertEquals(writes[0].data.incomplete, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listNotes drops free-text titles + body end-to-end, filters leadId", async () => {
+  const { calls, restore } = servePages(
+    "notes",
+    [{
+      items: [
+        {
+          id: "n1",
+          title: "Inbound lead L1",
+          leadId: "L1",
+          bodyV2: { markdown: "x" },
+        },
+        { id: "n2", title: "Private meeting", leadId: "L1" },
+      ],
+      hasNextPage: false,
+    }],
+    2,
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listNotes.execute(
+      { leadId: "L1", includeEmergency: false, limit: 60 } as never,
+      ctx as never,
+    );
+    assert(calls[0].path.includes("leadId[eq]:L1"), calls[0].path);
+    const items = writes[0].data.items as Array<Record<string, unknown>>;
+    assertEquals(items[0].title, "Inbound lead L1");
+    assertEquals(items[1].title, undefined);
+    assert(!("bodyV2" in items[0]));
+    assertEquals(writes[0].data.stopReason, "complete");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("redactError scrubs filter= and starting_after= query values (SR-2)", () => {
+  const s = redactError(
+    "Twenty GET /rest/people?filter=leadId[eq]:topsecret&starting_after=CURSOR123 failed: 400 Bad Request",
+  );
+  assert(s.includes("filter=[redacted]"), s);
+  assert(s.includes("starting_after=[redacted]"), s);
+  assert(!s.includes("topsecret"), s);
+  assert(!s.includes("CURSOR123"), s);
 });

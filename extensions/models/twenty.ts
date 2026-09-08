@@ -225,6 +225,27 @@ export function validateDomain(raw: unknown): string | null {
   return DOMAIN_RE.test(s) ? s : null;
 }
 
+/**
+ * Reduce an arbitrary domain-ish value to a bare host (AR-6): lowercase, strip a
+ * `scheme://`, any userinfo, port, path/query/fragment, and trailing dots. Used
+ * BOTH when building the companies domain filter and when flattening
+ * `domainName.primaryLinkUrl` into a CompanyView, so the filter matches and the
+ * snapshot is diff-stable regardless of how the URL is stored. Returns the bare
+ * host (unvalidated shape — callers that need a strict domain still run
+ * {@link validateDomain}), or null when nothing usable remains.
+ */
+export function normalizeDomainHost(raw: unknown): string | null {
+  if (raw == null) return null;
+  let s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, ""); // strip scheme://
+  s = s.replace(/^[^/@]*@/, ""); // strip userinfo
+  s = s.replace(/[/?#].*$/, ""); // strip path/query/fragment
+  s = s.replace(/:\d+$/, ""); // strip port
+  s = s.replace(/\.+$/, ""); // strip trailing dot(s)
+  return s || null;
+}
+
 /** True if the (validated) domain is a consumer/free-mail domain to skip. */
 export function isBlockedDomain(
   domain: string,
@@ -287,18 +308,29 @@ export function escapeMarkdown(s: string): string {
 const EMAIL_IN_TEXT_RE =
   /[^\s@"'<>()[\]\\,;:]+@[^\s@"'<>()[\]\\,;:]+\.[a-z]{2,}/gi;
 const LONG_DIGITS_RE = /\+?\d[\d ().-]{6,}\d/g;
+// The transport echoes the failing request path in its Error message (e.g.
+// `Twenty GET /rest/people?filter=leadId[eq]:...&starting_after=... failed`),
+// which embeds the raw leadId/name/domain filter values and the opaque cursor.
+// Scrub those query values wholesale so an attacker-influenced filter value (or
+// a cursor that positionally encodes a record) can never leak into durable data
+// — the [eq] value alone may not match the email/digit shapes above (SR-2).
+const FILTER_QUERY_RE = /([?&]filter=)[^&\s]*/gi;
+const CURSOR_QUERY_RE = /([?&]starting_after=)[^&\s]*/gi;
 
 /**
- * Redact PII-shaped substrings (emails, long digit runs) from a captured error
- * message and cap its length, so the per-lead audit keeps its "no raw PII beyond
- * leadId" guarantee even when Twenty echoes the offending value back in a 4xx.
+ * Redact PII-shaped substrings (emails, long digit runs) AND the sensitive
+ * `filter=` / `starting_after=` query values from a captured error message, then
+ * cap its length, so the per-lead audit and the list snapshots keep their "no
+ * raw PII / no attacker-influenced input" guarantee even when Twenty echoes the
+ * offending value (or the transport echoes the request URL) back in a 4xx.
  */
 export function redactError(raw: unknown, maxLen = 300): string {
   let s = raw instanceof Error ? raw.message : String(raw ?? "");
-  s = s.replace(EMAIL_IN_TEXT_RE, "[email]").replace(
-    LONG_DIGITS_RE,
-    "[number]",
-  );
+  s = s
+    .replace(FILTER_QUERY_RE, "$1[redacted]")
+    .replace(CURSOR_QUERY_RE, "$1[redacted]")
+    .replace(EMAIL_IN_TEXT_RE, "[email]")
+    .replace(LONG_DIGITS_RE, "[number]");
   return s.length > maxLen ? s.slice(0, maxLen) : s;
 }
 
@@ -910,6 +942,115 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   return v;
 }
 
+// --- Bulk-list compact views (TWENTY-SNAPSHOT-READS) ------------------------
+// Deliberately mirror the *Ref posture: only join keys + non-sensitive scalars,
+// never bulk PII. No person name/email/phone/jobTitle, no company beyond
+// name/domain, and NEVER a Note body.
+
+/** Compact People-list view — mirrors personRef (no name/email/phone/jobTitle). */
+export interface PersonView {
+  id: string;
+  leadId?: string;
+  companyId?: string;
+  isEmergency?: boolean;
+  createdAt?: string;
+}
+
+/** Map a raw Person REST record to the compact {@link PersonView}. */
+export function mapPersonView(rec: Record<string, unknown>): PersonView {
+  const v: PersonView = { id: String(rec.id ?? "") };
+  if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
+  // AR-9: companyId is Twenty's flat relation FK scalar on the person record.
+  if (rec.companyId != null && rec.companyId !== "") {
+    v.companyId = String(rec.companyId);
+  }
+  // AR-5: surface isEmergency (even when false) so consumers can drop restricted
+  // rows even on an includeEmergency:true read.
+  if (rec.isEmergency != null) v.isEmergency = Boolean(rec.isEmergency);
+  if (rec.createdAt) v.createdAt = String(rec.createdAt);
+  return v;
+}
+
+/** Compact Company-list view — mirrors companyRef (id/name/domain). */
+export interface CompanyView {
+  id: string;
+  name: string;
+  domain?: string;
+  createdAt?: string;
+}
+
+/** Map a raw Company REST record to the compact {@link CompanyView}. */
+export function mapCompanyView(rec: Record<string, unknown>): CompanyView {
+  const v: CompanyView = {
+    id: String(rec.id ?? ""),
+    name: String(rec.name ?? ""),
+  };
+  // AR-6: normalize domainName.primaryLinkUrl to a bare host on flatten so the
+  // snapshot is diff-stable and matches companyRef's key regardless of storage.
+  const dn = (rec.domainName as { primaryLinkUrl?: unknown } | null | undefined)
+    ?.primaryLinkUrl;
+  const host = normalizeDomainHost(dn);
+  if (host) v.domain = host;
+  if (rec.createdAt) v.createdAt = String(rec.createdAt);
+  return v;
+}
+
+// SR-1: the only Note title safe to snapshot is the machine-generated
+// `Inbound lead <leadId>` from ensureNoteForLead. Any other (free-text,
+// user-authored) title is dropped so no free-text note titles ever enter data.
+const INBOUND_LEAD_TITLE_RE = /^Inbound lead /;
+
+/** Compact Note-list view — NEVER carries bodyV2/markdown. */
+export interface NoteView {
+  id: string;
+  title?: string;
+  leadId?: string;
+  isEmergency?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/** Map a raw Note REST record to the compact {@link NoteView} (no body). */
+export function mapNoteView(rec: Record<string, unknown>): NoteView {
+  const v: NoteView = { id: String(rec.id ?? "") };
+  const title = rec.title != null ? String(rec.title) : "";
+  if (title && INBOUND_LEAD_TITLE_RE.test(title)) v.title = title; // SR-1
+  if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
+  if (rec.isEmergency != null) v.isEmergency = Boolean(rec.isEmergency);
+  if (rec.createdAt) v.createdAt = String(rec.createdAt);
+  if (rec.updatedAt) v.updatedAt = String(rec.updatedAt);
+  return v;
+}
+
+/**
+ * Deterministic canonical JSON: object keys sorted, `undefined`-valued keys
+ * dropped (matching JSON.stringify's object behavior). Used to hash a list
+ * method's (filter, cursor) into a stable, separator-free instance key so the
+ * empty-filter snapshot can never collide with a literal filter value and no
+ * user value can inject the `-` key separator (AR-7).
+ */
+export function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  const obj = v as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const k of Object.keys(obj).sort()) {
+    if (obj[k] === undefined) continue;
+    parts.push(`${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
+/** First 16 hex chars of the SHA-256 of the canonical JSON of `obj` (AR-7). */
+export async function listInstanceHash(obj: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalJson(obj));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
 /**
  * GET a single record by id, returning null on a 404 (record absent) rather than
  * throwing. `op` is the singular object key in the `{data:{<op>:{...}}}` envelope
@@ -942,39 +1083,95 @@ const getCompanyById = (cfg: TwentyCfg, id: string) =>
 const PAGE_SIZE = 60;
 const MAX_LIST_CAP = 500;
 
+// Canonical unique composite order (AR-4/V2-3): createdAt alone is NOT unique,
+// so the id tiebreaker keeps cursor paging gap-free and snapshots byte-stable.
+// Sent literally (constant, no injection risk); Twenty parses the comma as the
+// two-key separator. VERIFY-LIVE: acceptance of this composite order_by + the
+// starting_after cursor's consistency with it (spec openQuestion V2-3).
+const LIST_ORDER = "createdAt,id";
+
+// NULL-safe non-emergency exclusion (V2-1/criterion 6): matches rows where
+// isEmergency is false OR null/unset — push_leads only stamps the marker on
+// emergencies, so the NULL/unset rows are the majority and a bare
+// isEmergency[eq]:false would silently drop them (and falsely reconcile as
+// 'complete'). Constant DSL (parens/commas are literal grammar, not values).
+// VERIFY-LIVE: the exact OR / IS-NULL syntax + isEmergency defaultValue (V2-1).
+const NON_EMERGENCY_CLAUSE = "or(isEmergency[eq]:false,isEmergency[is]:NULL)";
+
+/** One list method's paged, deduped, reconciled result (see {@link listFiltered}). */
+export interface ListPage {
+  items: Array<Record<string, unknown>>;
+  /** True only when the per-call cap was hit with more rows available. */
+  truncated: boolean;
+  /** True when Twenty still has pages beyond this call (drives workflow loop). */
+  hasMore: boolean;
+  /** Last endCursor to pass back as startingAfter; set only when hasMore. */
+  nextCursor?: string;
+  /** Twenty's reported total for the filter, captured for reconciliation. */
+  totalCount?: number;
+  /** True whenever a guard exited or the count did not reconcile w/ totalCount. */
+  incomplete: boolean;
+  stopReason:
+    | "complete"
+    | "cap-reached"
+    | "no-progress"
+    | "cursor-repeat"
+    | "max-pages"
+    | "count-mismatch"
+    | "no-total"
+    | "unsupported-filter-value";
+}
+
 /**
- * Fan-out read (repo rule 6): page through all Opportunities matching the given
- * filters in ONE call. Filters compose with AND (comma-joined `field[eq]:value`
- * clauses in a single `filter=` param — each value is UUID/filter-safe validated
- * by the caller and URL-encoded here). Cursor pagination advances on
- * `pageInfo.endCursor`; a no-progress guard (a page yielding zero *new* ids, a
- * missing/repeated cursor) hard-stops so a wrong cursor field can never
- * infinite-loop, and items are deduped by id. `truncated` is set only when the
- * result is actually capped at MAX_LIST_CAP/limit with more records available.
+ * Fan-out read (repo rule 6): page through all records of `plural` matching the
+ * AND-composed `clauses` in ONE call — the single generic paginator behind
+ * listOpportunities/listPeople/listCompanies/listNotes. Each clause is a
+ * ready-to-send `field[eq]:<url-encoded-value>` (or a constant DSL group like
+ * {@link NON_EMERGENCY_CLAUSE}) built + validated by the caller; they are
+ * comma-joined into one `filter=` param. Sends an explicit immutable
+ * `order_by` (AR-4) so paging is gap-free, advances the cursor on
+ * `pageInfo.endCursor`, dedups by id across pages, and captures the response
+ * `totalCount`. Completeness is reported honestly (AR-2): `stopReason='complete'`
+ * + `incomplete=false` ONLY on a clean `hasNextPage:false` at/under cap whose
+ * unique count reconciles with totalCount. Every guard exit (cap-reached,
+ * no-progress, cursor-repeat, max-pages) and every reconciliation failure
+ * (count-mismatch, no-total) sets `incomplete=true` with a non-'complete'
+ * stopReason — it never silently asserts completeness.
  */
-async function listOpportunitiesFiltered(
+export async function listFiltered(
   cfg: TwentyCfg,
-  opts: { companyId?: string; stage?: string; limit: number },
-): Promise<{ items: Array<Record<string, unknown>>; truncated: boolean }> {
-  const cap = Math.min(Math.max(1, Math.floor(opts.limit)), MAX_LIST_CAP);
-  const clauses: string[] = [];
-  if (opts.companyId) {
-    clauses.push(`companyId[eq]:${encodeURIComponent(opts.companyId)}`);
-  }
-  if (opts.stage) clauses.push(`stage[eq]:${encodeURIComponent(opts.stage)}`);
+  plural: string,
+  clauses: string[],
+  cap: number,
+  order: string,
+  startingAfter?: string,
+): Promise<ListPage> {
   const filterQ = clauses.length ? `filter=${clauses.join(",")}&` : "";
+  const orderQ = order ? `order_by=${order}&` : "";
 
   const seen = new Set<string>();
   const items: Array<Record<string, unknown>> = [];
-  let cursor: string | undefined;
+  let cursor: string | undefined = startingAfter;
+  let totalCount: number | undefined;
   let truncated = false;
+  let hasMore = false;
+  let nextCursor: string | undefined;
+  let stopReason: ListPage["stopReason"] | undefined;
   // Backstop on page count in case the instance never reports hasNextPage:false.
   const maxPages = Math.ceil(cap / PAGE_SIZE) + 2;
   for (let page = 0; page < maxPages; page++) {
-    const path = `/rest/opportunities?${filterQ}limit=${PAGE_SIZE}` +
-      (cursor ? `&starting_after=${encodeURIComponent(cursor)}` : "");
+    const pageCursor = cursor; // the starting_after used for THIS fetch
+    const path = `/rest/${plural}?${filterQ}${orderQ}limit=${PAGE_SIZE}` +
+      (pageCursor ? `&starting_after=${encodeURIComponent(pageCursor)}` : "");
     const json = await twentyRequest(cfg, "GET", path);
-    const batch = unwrapList(json, "opportunities");
+    if (totalCount === undefined) {
+      const tc = (json as { totalCount?: unknown }).totalCount;
+      if (typeof tc === "number") totalCount = tc;
+    }
+    const batch = unwrapList(json, plural);
+    const pageInfo = (json as {
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    }).pageInfo;
     let newInPage = 0;
     let hitCap = false;
     for (const rec of batch) {
@@ -989,23 +1186,82 @@ async function listOpportunitiesFiltered(
       items.push(rec);
     }
     if (hitCap) {
+      // Continuation (AR-1): resume from the cursor of the page holding our last
+      // kept item so nothing is skipped (`pageCursor`); fall back to this page's
+      // endCursor only when we never advanced (sub-PAGE_SIZE cap on page 0).
       truncated = true;
+      hasMore = true;
+      nextCursor = pageCursor ?? pageInfo?.endCursor;
+      stopReason = "cap-reached";
       break;
     }
-    // No-progress guard: a wrong/looping cursor surfaces zero new ids -> stop.
-    if (newInPage === 0) break;
-    const pageInfo = (json as {
-      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
-    }).pageInfo;
-    if (
-      !pageInfo?.hasNextPage || !pageInfo.endCursor ||
-      pageInfo.endCursor === cursor
-    ) {
+    // Clean end of data at/under cap.
+    if (!pageInfo?.hasNextPage) {
+      stopReason = "complete";
+      break;
+    }
+    // Guards: never silently claim completeness (AR-2).
+    if (!pageInfo.endCursor) {
+      stopReason = "no-progress";
+      break;
+    }
+    if (pageInfo.endCursor === pageCursor) {
+      stopReason = "cursor-repeat";
+      break;
+    }
+    if (newInPage === 0) {
+      stopReason = "no-progress";
       break;
     }
     cursor = pageInfo.endCursor;
   }
-  return { items, truncated };
+  if (stopReason === undefined) stopReason = "max-pages";
+
+  // Reconcile a clean end against Twenty's totalCount (AR-2/V2-4).
+  let incomplete = true;
+  if (stopReason === "complete") {
+    if (totalCount === undefined) {
+      stopReason = "no-total"; // never conflated with count-mismatch
+    } else if (items.length === totalCount) {
+      incomplete = false; // the one true clean/complete snapshot
+    } else {
+      stopReason = "count-mismatch";
+    }
+  }
+  return {
+    items,
+    truncated,
+    hasMore,
+    nextCursor,
+    totalCount,
+    incomplete,
+    stopReason,
+  };
+}
+
+/**
+ * listOpportunities' paginator, kept behavior-identical: builds the same AND
+ * clauses and returns only {items, truncated}, now single-sourced through
+ * {@link listFiltered} (which also sends the immutable order_by — AR-4).
+ */
+async function listOpportunitiesFiltered(
+  cfg: TwentyCfg,
+  opts: { companyId?: string; stage?: string; limit: number },
+): Promise<{ items: Array<Record<string, unknown>>; truncated: boolean }> {
+  const cap = Math.min(Math.max(1, Math.floor(opts.limit)), MAX_LIST_CAP);
+  const clauses: string[] = [];
+  if (opts.companyId) {
+    clauses.push(`companyId[eq]:${encodeURIComponent(opts.companyId)}`);
+  }
+  if (opts.stage) clauses.push(`stage[eq]:${encodeURIComponent(opts.stage)}`);
+  const page = await listFiltered(
+    cfg,
+    "opportunities",
+    clauses,
+    cap,
+    LIST_ORDER,
+  );
+  return { items: page.items, truncated: page.truncated };
 }
 
 /**
@@ -1485,6 +1741,116 @@ const OpportunityListSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Bulk-list snapshots (TWENTY-SNAPSHOT-READS) ----------------------------
+// opportunityList-shaped PLUS continuation (AR-1) + honesty (AR-2) fields.
+
+const ListStopReasonSchema = z.enum([
+  "complete",
+  "cap-reached",
+  "no-progress",
+  "cursor-repeat",
+  "max-pages",
+  "count-mismatch",
+  "no-total",
+  "unsupported-filter-value",
+]);
+
+const PersonViewSchema = z.object({
+  id: z.string(),
+  leadId: z.string().optional(),
+  companyId: z.string().optional(),
+  isEmergency: z.boolean().optional(),
+  createdAt: z.string().optional(),
+});
+
+const CompanyViewSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  domain: z.string().optional(),
+  createdAt: z.string().optional(),
+});
+
+const NoteViewSchema = z.object({
+  id: z.string(),
+  title: z.string().optional(),
+  leadId: z.string().optional(),
+  isEmergency: z.boolean().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+});
+
+const PeopleListSchema = z.object({
+  baseUrl: z.string(),
+  count: z.number().describe("Unique ids collected this call"),
+  truncated: z
+    .boolean()
+    .describe("True only when the per-call cap was hit with more available"),
+  hasMore: z
+    .boolean()
+    .describe("True when Twenty has more pages beyond this call (loop driver)"),
+  nextCursor: z
+    .string()
+    .optional()
+    .describe("Last endCursor to pass back as startingAfter; set iff hasMore"),
+  totalCount: z
+    .number()
+    .optional()
+    .describe("Twenty's reported total for the filter (for reconciliation)"),
+  incomplete: z
+    .boolean()
+    .describe("True on any guard exit or a count that did not reconcile"),
+  stopReason: ListStopReasonSchema,
+  filter: z.object({
+    companyId: z.string().optional(),
+    leadId: z.string().optional(),
+    includeEmergency: z.boolean().optional(),
+  }),
+  items: z.array(PersonViewSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+const CompanyListSchema = z.object({
+  baseUrl: z.string(),
+  count: z.number().describe("Unique ids collected this call"),
+  truncated: z
+    .boolean()
+    .describe("True only when the per-call cap was hit with more available"),
+  hasMore: z
+    .boolean()
+    .describe("True when Twenty has more pages beyond this call (loop driver)"),
+  nextCursor: z.string().optional(),
+  totalCount: z.number().optional(),
+  incomplete: z.boolean(),
+  stopReason: ListStopReasonSchema,
+  filter: z.object({
+    domain: z.string().optional(),
+    name: z.string().optional(),
+  }),
+  items: z.array(CompanyViewSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+const NoteListSchema = z.object({
+  baseUrl: z.string(),
+  count: z.number().describe("Unique ids collected this call"),
+  truncated: z
+    .boolean()
+    .describe("True only when the per-call cap was hit with more available"),
+  hasMore: z
+    .boolean()
+    .describe("True when Twenty has more pages beyond this call (loop driver)"),
+  nextCursor: z.string().optional(),
+  totalCount: z.number().optional(),
+  incomplete: z.boolean(),
+  stopReason: ListStopReasonSchema,
+  filter: z.object({
+    leadId: z.string().optional(),
+    includeEmergency: z.boolean().optional(),
+  }),
+  items: z.array(NoteViewSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- SELECT-option snapshot (TWENTY-STAGE-OPTION) ---------------------------
 
 const StageOptionSchema = z.object({
@@ -1723,7 +2089,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.06.3",
+  version: "2026.09.08.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -1756,6 +2122,14 @@ export const model = {
       toVersion: "2026.09.06.3",
       description:
         "Add upsertPerson (idempotent-on-email curated contact writer, confirm-gated) and the personUpsert snapshot. globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.08.1",
+      description:
+        "Add the bulk read surface: listPeople/listCompanies/listNotes fan-out snapshot reads (+ peopleList/companyList/noteList resources) sharing one generic cursor paginator with listOpportunities (which now also sends the immutable order_by=createdAt,id). globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -1829,6 +2203,29 @@ export const model = {
       schema: OpportunityListSchema,
       lifetime: "infinite",
       garbageCollection: 100,
+    },
+    "peopleList": {
+      description:
+        "Snapshot from listPeople: a filtered, paginated, deduped page of compact person views (join keys only, no bulk PII) + continuation/completeness fields",
+      schema: PeopleListSchema,
+      // SR-4: bulk snapshots get a finite TTL + tight GC — they do NOT inherit
+      // the refs' infinite/100.
+      lifetime: "3d",
+      garbageCollection: 5,
+    },
+    "companyList": {
+      description:
+        "Snapshot from listCompanies: a filtered, paginated, deduped page of compact company views (id/name/domain) + continuation/completeness fields",
+      schema: CompanyListSchema,
+      lifetime: "3d",
+      garbageCollection: 5,
+    },
+    "noteList": {
+      description:
+        "Snapshot from listNotes: a filtered, paginated, deduped page of compact note views (no body; title only on the machine 'Inbound lead ' pattern) + continuation/completeness fields",
+      schema: NoteListSchema,
+      lifetime: "3d",
+      garbageCollection: 5,
     },
     "stageOption": {
       description:
@@ -2600,6 +2997,407 @@ export const model = {
               items: views,
               retrievedAt: new Date().toISOString(),
             },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    listPeople: {
+      description:
+        "Fan-out read (repo rule 6): list People, optionally filtered by companyId and/or leadId (both optional; neither => all, capped-and-continued). Emergency-restricted rows are EXCLUDED by default via a NULL-safe clause (AR-5+SR-3). Composes filters with AND, sends order_by=createdAt,id, pages Twenty's cursor pagination up to a per-call cap (500), dedups by id, and records a `peopleList` page snapshot (join keys only — NO name/email/phone/jobTitle) with continuation + completeness fields. No writes, no per-id loop.",
+      arguments: z.object({
+        companyId: z.string().optional().describe(
+          "Filter: company UUID (Twenty's flat relation FK)",
+        ),
+        leadId: z.string().optional().describe(
+          "Filter: immutable lead marker (TEXT custom field)",
+        ),
+        includeEmergency: z.boolean().default(false).describe(
+          "When false (default) excludes emergency-restricted rows NULL-safely (false OR unset); true opts them in",
+        ),
+        startingAfter: z.string().optional().describe(
+          "Continuation cursor: a prior call's nextCursor, to resume paging past the per-call cap",
+        ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(
+            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+          ),
+      }),
+      execute: async (
+        args: {
+          companyId?: string;
+          leadId?: string;
+          includeEmergency: boolean;
+          startingAfter?: string;
+          limit: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          const includeEmergency = args.includeEmergency;
+          const startingAfter = args.startingAfter
+            ? String(args.startingAfter)
+            : undefined;
+
+          let companyId: string | undefined;
+          if (args.companyId != null) {
+            const cid = validateUuid(args.companyId);
+            if (!cid) throw new Error("Invalid companyId");
+            companyId = cid;
+          }
+          // BOUNDED-REJECT (V2-2): a reserved-char leadId is never sent as a
+          // corrupted clause — the call short-circuits with a distinct stopReason.
+          let leadId: string | undefined;
+          let leadIdAttempt: string | undefined;
+          let rejected = false;
+          if (args.leadId != null) {
+            const s = String(args.leadId).trim();
+            if (s.length) {
+              leadIdAttempt = s;
+              if (isFilterSafe(s)) leadId = s;
+              else rejected = true;
+            }
+          }
+
+          const filter: {
+            companyId?: string;
+            leadId?: string;
+            includeEmergency?: boolean;
+          } = { includeEmergency };
+          if (companyId) filter.companyId = companyId;
+          if (leadId) filter.leadId = leadId;
+
+          const h = await listInstanceHash({
+            f: { companyId, leadId: leadId ?? leadIdAttempt, includeEmergency },
+            after: startingAfter ?? null,
+          });
+          const instanceName = `people-${h}`;
+          const retrievedAt = new Date().toISOString();
+
+          if (rejected) {
+            const handle = await context.writeResource(
+              "peopleList",
+              instanceName,
+              {
+                baseUrl: cfg.baseUrl,
+                count: 0,
+                truncated: false,
+                hasMore: false,
+                incomplete: true,
+                stopReason: "unsupported-filter-value",
+                filter,
+                items: [],
+                retrievedAt,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          const clauses: string[] = [];
+          if (!includeEmergency) clauses.push(NON_EMERGENCY_CLAUSE);
+          if (companyId) {
+            clauses.push(`companyId[eq]:${encodeURIComponent(companyId)}`);
+          }
+          if (leadId) clauses.push(`leadId[eq]:${encodeURIComponent(leadId)}`);
+
+          const page = await listFiltered(
+            cfg,
+            "people",
+            clauses,
+            cap,
+            LIST_ORDER,
+            startingAfter,
+          );
+          const items = page.items.map(mapPersonView);
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            count: items.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            filter,
+            items,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "peopleList",
+            instanceName,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    listCompanies: {
+      description:
+        "Fan-out read (repo rule 6): list Companies, optionally filtered by domain (domainName.primaryLinkUrl) and/or name (both optional; neither => all, capped-and-continued). Composes filters with AND, sends order_by=createdAt,id, pages up to a per-call cap (500), dedups by id, and records a `companyList` page snapshot (id/name/domain) with continuation + completeness fields. No writes, no per-id loop.",
+      arguments: z.object({
+        domain: z.string().optional().describe(
+          "Filter: corporate domain (normalized to a bare host, e.g. acme.com)",
+        ),
+        name: z.string().optional().describe(
+          "Filter: exact company name (filter-safe; reserved chars bounded-reject)",
+        ),
+        startingAfter: z.string().optional().describe(
+          "Continuation cursor: a prior call's nextCursor",
+        ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(
+            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+          ),
+      }),
+      execute: async (
+        args: {
+          domain?: string;
+          name?: string;
+          startingAfter?: string;
+          limit: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          const startingAfter = args.startingAfter
+            ? String(args.startingAfter)
+            : undefined;
+
+          let domain: string | undefined;
+          if (args.domain != null) {
+            // AR-6: normalize to a bare host BEFORE validating/filtering.
+            const host = normalizeDomainHost(args.domain);
+            const validated = host ? validateDomain(host) : null;
+            if (!validated || !isFilterSafe(validated)) {
+              throw new Error("Invalid domain");
+            }
+            domain = validated;
+          }
+          // BOUNDED-REJECT (V2-2): a reserved-char name (e.g. "Acme, Inc.") is
+          // never sent as a corrupted clause.
+          let name: string | undefined;
+          let nameAttempt: string | undefined;
+          let rejected = false;
+          if (args.name != null) {
+            const s = String(args.name).trim();
+            if (s.length) {
+              nameAttempt = s;
+              if (isFilterSafe(s)) name = s;
+              else rejected = true;
+            }
+          }
+
+          const filter: { domain?: string; name?: string } = {};
+          if (domain) filter.domain = domain;
+          if (name) filter.name = name;
+
+          const h = await listInstanceHash({
+            f: { domain, name: name ?? nameAttempt },
+            after: startingAfter ?? null,
+          });
+          const instanceName = `companies-${h}`;
+          const retrievedAt = new Date().toISOString();
+
+          if (rejected) {
+            const handle = await context.writeResource(
+              "companyList",
+              instanceName,
+              {
+                baseUrl: cfg.baseUrl,
+                count: 0,
+                truncated: false,
+                hasMore: false,
+                incomplete: true,
+                stopReason: "unsupported-filter-value",
+                filter,
+                items: [],
+                retrievedAt,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          const clauses: string[] = [];
+          if (domain) {
+            clauses.push(
+              `domainName.primaryLinkUrl[eq]:${encodeURIComponent(domain)}`,
+            );
+          }
+          if (name) clauses.push(`name[eq]:${encodeURIComponent(name)}`);
+
+          const page = await listFiltered(
+            cfg,
+            "companies",
+            clauses,
+            cap,
+            LIST_ORDER,
+            startingAfter,
+          );
+          const items = page.items.map(mapCompanyView);
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            count: items.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            filter,
+            items,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "companyList",
+            instanceName,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    listNotes: {
+      description:
+        "Fan-out read (repo rule 6): list Notes, optionally filtered by leadId (optional; absent => ALL notes, capped-and-continued). Emergency-restricted rows EXCLUDED by default via a NULL-safe clause (AR-5+SR-3). Sends order_by=createdAt,id, pages up to a per-call cap (500), dedups by id, and records a `noteList` page snapshot with continuation + completeness fields. Note body (bodyV2.markdown) is NEVER included; title is emitted ONLY on the machine 'Inbound lead ' pattern (SR-1). No writes, no per-id loop.",
+      arguments: z.object({
+        leadId: z.string().optional().describe(
+          "Filter: immutable lead marker (TEXT custom field on Note)",
+        ),
+        includeEmergency: z.boolean().default(false).describe(
+          "When false (default) excludes emergency-restricted rows NULL-safely (false OR unset); true opts them in",
+        ),
+        startingAfter: z.string().optional().describe(
+          "Continuation cursor: a prior call's nextCursor",
+        ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(
+            `Max results this call (1..${MAX_LIST_CAP}) — a per-call safety cap, not a snapshot ceiling`,
+          ),
+      }),
+      execute: async (
+        args: {
+          leadId?: string;
+          includeEmergency: boolean;
+          startingAfter?: string;
+          limit: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          const includeEmergency = args.includeEmergency;
+          const startingAfter = args.startingAfter
+            ? String(args.startingAfter)
+            : undefined;
+
+          let leadId: string | undefined;
+          let leadIdAttempt: string | undefined;
+          let rejected = false;
+          if (args.leadId != null) {
+            const s = String(args.leadId).trim();
+            if (s.length) {
+              leadIdAttempt = s;
+              if (isFilterSafe(s)) leadId = s;
+              else rejected = true;
+            }
+          }
+
+          const filter: { leadId?: string; includeEmergency?: boolean } = {
+            includeEmergency,
+          };
+          if (leadId) filter.leadId = leadId;
+
+          const h = await listInstanceHash({
+            f: { leadId: leadId ?? leadIdAttempt, includeEmergency },
+            after: startingAfter ?? null,
+          });
+          const instanceName = `notes-${h}`;
+          const retrievedAt = new Date().toISOString();
+
+          if (rejected) {
+            const handle = await context.writeResource(
+              "noteList",
+              instanceName,
+              {
+                baseUrl: cfg.baseUrl,
+                count: 0,
+                truncated: false,
+                hasMore: false,
+                incomplete: true,
+                stopReason: "unsupported-filter-value",
+                filter,
+                items: [],
+                retrievedAt,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          const clauses: string[] = [];
+          if (!includeEmergency) clauses.push(NON_EMERGENCY_CLAUSE);
+          if (leadId) clauses.push(`leadId[eq]:${encodeURIComponent(leadId)}`);
+
+          const page = await listFiltered(
+            cfg,
+            "notes",
+            clauses,
+            cap,
+            LIST_ORDER,
+            startingAfter,
+          );
+          const items = page.items.map(mapNoteView);
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            count: items.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            filter,
+            items,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "noteList",
+            instanceName,
+            snap,
           );
           return { dataHandles: [handle] };
         } catch (e) {
