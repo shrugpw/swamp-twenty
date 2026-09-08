@@ -13,15 +13,18 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
   clauses with AND, sends the immutable composite `order_by=createdAt,id`, pages
   Twenty's cursor pagination at `PAGE_SIZE=60` up to a per-call cap
   (`limit` 1..500, default 60), dedups by id, and records a compact page
-  snapshot. Emergency-restricted rows are excluded by default via a NULL-safe
-  clause (`or(isEmergency[eq]:false,isEmergency[is]:NULL)`) so the NULL/unset
-  majority is kept; `includeEmergency:true` opts them in. A per-CALL cap is not a
-  snapshot ceiling: each call returns `hasMore` + `nextCursor` for a workflow to
-  continue via `startingAfter`, and an honesty envelope (`incomplete` +
-  `stopReason`) that reports `complete` only on a clean end reconciled against
-  Twenty's `totalCount`. No writes, no per-id loop; compact views carry only join
-  keys — never person name/email/phone, never a Note body, and a Note title only
-  when it matches the machine `Inbound lead ` pattern.
+  snapshot. For `listPeople`, emergency-restricted rows are excluded by default
+  via a NULL-safe clause (`or(isEmergency[eq]:false,isEmergency[is]:NULL)`) so the
+  NULL/unset majority is kept; `includeEmergency:true` opts them in. `listNotes`
+  omits emergency filtering entirely (no `includeEmergency` arg, no `isEmergency`
+  in its view) because this extension does not provision `isEmergency` on Note —
+  only on Person/Opportunity — so there is no marker on a Note to filter or
+  surface. A per-CALL cap is not a snapshot ceiling: each call returns `hasMore` +
+  `nextCursor` for a workflow to continue via `startingAfter`, and an honesty
+  envelope (`incomplete` + `stopReason`) that reports `complete` only on a clean
+  end reconciled against Twenty's `totalCount`. No writes, no per-id loop; compact
+  views carry only join keys — never person name/email/phone, never a Note body,
+  and a Note title only when it matches the machine `Inbound lead ` pattern.
 - **`peopleList` / `companyList` / `noteList` resources** — the bulk snapshots,
   keyed by a SHA-256 of the canonical `(filter, cursor)` so each page gets its
   own instance. Finite `lifetime: 3d` + `garbageCollection: 5` — bulk snapshots

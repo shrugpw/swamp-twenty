@@ -1000,12 +1000,16 @@ export function mapCompanyView(rec: Record<string, unknown>): CompanyView {
 // user-authored) title is dropped so no free-text note titles ever enter data.
 const INBOUND_LEAD_TITLE_RE = /^Inbound lead /;
 
-/** Compact Note-list view — NEVER carries bodyV2/markdown. */
+/**
+ * Compact Note-list view — NEVER carries bodyV2/markdown. NOTE: no isEmergency
+ * field: this extension does not provision isEmergency on Note (only on
+ * Person/Opportunity — see REQUIRED_FIELDS / setEmergencyMarker), so a Note has
+ * no such marker to surface or filter on.
+ */
 export interface NoteView {
   id: string;
   title?: string;
   leadId?: string;
-  isEmergency?: boolean;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -1016,7 +1020,6 @@ export function mapNoteView(rec: Record<string, unknown>): NoteView {
   const title = rec.title != null ? String(rec.title) : "";
   if (title && INBOUND_LEAD_TITLE_RE.test(title)) v.title = title; // SR-1
   if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
-  if (rec.isEmergency != null) v.isEmergency = Boolean(rec.isEmergency);
   if (rec.createdAt) v.createdAt = String(rec.createdAt);
   if (rec.updatedAt) v.updatedAt = String(rec.updatedAt);
   return v;
@@ -1774,7 +1777,6 @@ const NoteViewSchema = z.object({
   id: z.string(),
   title: z.string().optional(),
   leadId: z.string().optional(),
-  isEmergency: z.boolean().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
 });
@@ -1845,7 +1847,6 @@ const NoteListSchema = z.object({
   stopReason: ListStopReasonSchema,
   filter: z.object({
     leadId: z.string().optional(),
-    includeEmergency: z.boolean().optional(),
   }),
   items: z.array(NoteViewSchema),
   retrievedAt: z.iso.datetime(),
@@ -3284,13 +3285,10 @@ export const model = {
     },
     listNotes: {
       description:
-        "Fan-out read (repo rule 6): list Notes, optionally filtered by leadId (optional; absent => ALL notes, capped-and-continued). Emergency-restricted rows EXCLUDED by default via a NULL-safe clause (AR-5+SR-3). Sends order_by=createdAt,id, pages up to a per-call cap (500), dedups by id, and records a `noteList` page snapshot with continuation + completeness fields. Note body (bodyV2.markdown) is NEVER included; title is emitted ONLY on the machine 'Inbound lead ' pattern (SR-1). No writes, no per-id loop.",
+        "Fan-out read (repo rule 6): list Notes, optionally filtered by leadId (optional; absent => ALL notes, capped-and-continued). Sends order_by=createdAt,id, pages up to a per-call cap (500), dedups by id, and records a `noteList` page snapshot with continuation + completeness fields. Note body (bodyV2.markdown) is NEVER included; title is emitted ONLY on the machine 'Inbound lead ' pattern (SR-1). No emergency filtering: this extension does not provision isEmergency on Note (only Person/Opportunity), so there is no marker to exclude on. No writes, no per-id loop.",
       arguments: z.object({
         leadId: z.string().optional().describe(
           "Filter: immutable lead marker (TEXT custom field on Note)",
-        ),
-        includeEmergency: z.boolean().default(false).describe(
-          "When false (default) excludes emergency-restricted rows NULL-safely (false OR unset); true opts them in",
         ),
         startingAfter: z.string().optional().describe(
           "Continuation cursor: a prior call's nextCursor",
@@ -3308,7 +3306,6 @@ export const model = {
       execute: async (
         args: {
           leadId?: string;
-          includeEmergency: boolean;
           startingAfter?: string;
           limit: number;
         },
@@ -3320,7 +3317,6 @@ export const model = {
             Math.max(1, Math.floor(args.limit)),
             MAX_LIST_CAP,
           );
-          const includeEmergency = args.includeEmergency;
           const startingAfter = args.startingAfter
             ? String(args.startingAfter)
             : undefined;
@@ -3337,13 +3333,11 @@ export const model = {
             }
           }
 
-          const filter: { leadId?: string; includeEmergency?: boolean } = {
-            includeEmergency,
-          };
+          const filter: { leadId?: string } = {};
           if (leadId) filter.leadId = leadId;
 
           const h = await listInstanceHash({
-            f: { leadId: leadId ?? leadIdAttempt, includeEmergency },
+            f: { leadId: leadId ?? leadIdAttempt },
             after: startingAfter ?? null,
           });
           const instanceName = `notes-${h}`;
@@ -3369,7 +3363,6 @@ export const model = {
           }
 
           const clauses: string[] = [];
-          if (!includeEmergency) clauses.push(NON_EMERGENCY_CLAUSE);
           if (leadId) clauses.push(`leadId[eq]:${encodeURIComponent(leadId)}`);
 
           const page = await listFiltered(

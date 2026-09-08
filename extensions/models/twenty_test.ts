@@ -2314,7 +2314,7 @@ Deno.test("listNotes drops free-text titles + body end-to-end, filters leadId", 
   const { writes, ctx } = readCtx();
   try {
     await model.methods.listNotes.execute(
-      { leadId: "L1", includeEmergency: false, limit: 60 } as never,
+      { leadId: "L1", limit: 60 } as never,
       ctx as never,
     );
     assert(calls[0].path.includes("leadId[eq]:L1"), calls[0].path);
@@ -2323,6 +2323,24 @@ Deno.test("listNotes drops free-text titles + body end-to-end, filters leadId", 
     assertEquals(items[1].title, undefined);
     assert(!("bodyV2" in items[0]));
     assertEquals(writes[0].data.stopReason, "complete");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listNotes never sends an isEmergency clause (Note has no such field)", async () => {
+  const { calls, restore } = servePages(
+    "notes",
+    [{ items: [{ id: "n1" }], hasNextPage: false }],
+    1,
+  );
+  const { ctx } = readCtx();
+  try {
+    await model.methods.listNotes.execute(
+      { limit: 60 } as never,
+      ctx as never,
+    );
+    assert(!calls[0].path.includes("isEmergency"), calls[0].path);
   } finally {
     restore();
   }
