@@ -1799,6 +1799,80 @@ Deno.test("upsertPerson: bad phone => person still created without phone", async
     const ok = posts[1].body as Record<string, unknown>;
     assertEquals("phones" in ok, false);
     assertEquals(ok.name, { firstName: "X", lastName: "" });
+    // fieldsSet must report what was ACTUALLY written — phone was dropped, so it
+    // must NOT be listed (the snapshot can't claim a phone it didn't store).
+    assertEquals(
+      (writes[0].data.fieldsSet as string[]).includes("phone"),
+      false,
+    );
+    assert((writes[0].data.fieldsSet as string[]).includes("name"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertPerson: single-token name on UPDATE preserves existing firstName (PU-2)", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return {
+        body: {
+          data: {
+            people: [{
+              id: "p9",
+              name: { firstName: "Robert", lastName: "Smith" },
+            }],
+          },
+        },
+      };
+    }
+    if (method === "PATCH") {
+      return { body: { data: { updatePerson: { id: "p9" } } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    // A display-name-only integration sends name:"Bono" (splitName => firstName:"").
+    await model.methods.upsertPerson.execute(
+      {
+        ...PERSON_ARGS,
+        email: "r@corp.com",
+        name: "Bono",
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    // firstName must NOT be nulled — the empty split half falls back to existing.
+    assertEquals(body.name, { firstName: "Robert", lastName: "Bono" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption HARD-stops on an option missing its id (SO-1)", async () => {
+  const noId = [
+    { value: "NEW", label: "New", color: "blue", position: 0 }, // no id
+  ];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta(noId) };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureStageOption.execute(
+          { ...STAGE_ARGS, value: "CLOSED", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "missing id",
+    );
+    assert(!calls.some((c) => c.method === "PATCH"), "must not write");
   } finally {
     restore();
   }

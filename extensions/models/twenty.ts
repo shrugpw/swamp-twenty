@@ -617,24 +617,31 @@ function personFieldsSet(f: PersonWriteFields): string[] {
  * enter the leadId->person namespace push_leads relies on. Retries once without
  * the phone on a phone-shaped error so a bad number never blocks the contact.
  */
+/** Result of a curated write: the record, and whether the phone was dropped on
+ * a retry (so the caller's snapshot can report what was actually written). */
+interface PersonWriteResult {
+  record: Record<string, unknown>;
+  phoneDropped: boolean;
+}
+
 async function createPersonCurated(
   cfg: TwentyCfg,
   email: string,
   f: PersonWriteFields,
-): Promise<Record<string, unknown>> {
+): Promise<PersonWriteResult> {
   const body: Record<string, unknown> = {
     ...buildPersonBody(f),
     emails: { primaryEmail: email },
   };
   try {
     const json = await twentyRequest(cfg, "POST", "/rest/people", body);
-    return unwrapRecord(json, "createPerson");
+    return { record: unwrapRecord(json, "createPerson"), phoneDropped: false };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (body.phones && /phone/i.test(msg)) {
       delete body.phones;
       const json = await twentyRequest(cfg, "POST", "/rest/people", body);
-      return unwrapRecord(json, "createPerson");
+      return { record: unwrapRecord(json, "createPerson"), phoneDropped: true };
     }
     throw e;
   }
@@ -645,11 +652,11 @@ async function updatePerson(
   cfg: TwentyCfg,
   id: string,
   f: PersonWriteFields,
-): Promise<Record<string, unknown>> {
+): Promise<PersonWriteResult> {
   const body = buildPersonBody(f);
   try {
     const json = await twentyRequest(cfg, "PATCH", `/rest/people/${id}`, body);
-    return unwrapRecord(json, "updatePerson");
+    return { record: unwrapRecord(json, "updatePerson"), phoneDropped: false };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (body.phones && /phone/i.test(msg)) {
@@ -660,7 +667,7 @@ async function updatePerson(
         `/rest/people/${id}`,
         body,
       );
-      return unwrapRecord(json, "updatePerson");
+      return { record: unwrapRecord(json, "updatePerson"), phoneDropped: true };
     }
     throw e;
   }
@@ -1432,15 +1439,17 @@ async function fetchSelectField(
     const { value, label, color, position } = opt;
     if (
       typeof value !== "string" || typeof label !== "string" ||
-      typeof color !== "string" || typeof position !== "number"
+      typeof color !== "string" || typeof position !== "number" ||
+      typeof opt.id !== "string" || !opt.id
     ) {
       throw new Error(
-        `Option #${i} on '${objectNameSingular}.${fieldName}' is missing value/label/color/position; refusing to rebuild a lossy options array`,
+        `Option #${i} on '${objectNameSingular}.${fieldName}' is missing id/value/label/color/position; refusing to rebuild a lossy options array`,
       );
     }
-    const so: SelectOption = { value, label, color, position };
-    if (typeof opt.id === "string" && opt.id) so.id = opt.id;
-    return so;
+    // Preserve the existing option's id verbatim — omitting it on the full-array
+    // PATCH would risk Twenty treating the entry as a new option (re-create /
+    // duplicate), so a non-string/empty id hard-stops above rather than degrade.
+    return { id: opt.id, value, label, color, position };
   });
   return { objectId, fieldId, type, options };
 }
@@ -4009,9 +4018,13 @@ export const model = {
             const en =
               (existing.name as { firstName?: unknown; lastName?: unknown }) ??
                 {};
+            // Merge, treating an EMPTY provided part as "not provided" so a
+            // single-token `name` (splitName -> firstName:"") never nulls an
+            // existing subfield (PU-2). Use `||`, not `??`, since the empty
+            // string is exactly the case we must fall back to existing on.
             return {
-              firstName: providedFirst ?? String(en.firstName ?? ""),
-              lastName: providedLast ?? String(en.lastName ?? ""),
+              firstName: providedFirst || String(en.firstName ?? ""),
+              lastName: providedLast || String(en.lastName ?? ""),
             };
           };
 
@@ -4032,6 +4045,9 @@ export const model = {
             | "planned-create"
             | "planned-update";
           let writeFields: PersonWriteFields;
+          // Track whether a bad phone was dropped on retry, so `fieldsSet` in the
+          // snapshot reports what was actually written, not what was requested.
+          let phoneDropped = false;
 
           if (existingPerson) {
             const nameField = nameFieldFor(existingPerson);
@@ -4041,7 +4057,8 @@ export const model = {
             };
             action = args.dryRun ? "planned-update" : "updated";
             if (!args.dryRun) {
-              await updatePerson(cfg, personId, writeFields);
+              const res = await updatePerson(cfg, personId, writeFields);
+              phoneDropped = res.phoneDropped;
             }
           } else {
             const nameField = nameFieldFor(null);
@@ -4058,7 +4075,8 @@ export const model = {
                   email,
                   writeFields,
                 );
-                personId = String(created.id ?? "");
+                personId = String(created.record.id ?? "");
+                phoneDropped = created.phoneDropped;
                 action = "created";
               } catch (e) {
                 // PU-1: a concurrent run may have created this email between our
@@ -4071,7 +4089,8 @@ export const model = {
                     ...commonFields,
                     ...(mergedName ? { name: mergedName } : {}),
                   };
-                  await updatePerson(cfg, personId, writeFields);
+                  const res = await updatePerson(cfg, personId, writeFields);
+                  phoneDropped = res.phoneDropped;
                   action = "updated";
                 } else {
                   throw e;
@@ -4079,6 +4098,10 @@ export const model = {
               }
             }
           }
+          // What was actually written: drop `phone` if the retry stripped it.
+          const setFields = personFieldsSet(writeFields).filter(
+            (k) => !(phoneDropped && k === "phone"),
+          );
 
           context.logger.info(
             "upsertPerson: {action} (person {person}){dry}",
@@ -4094,7 +4117,7 @@ export const model = {
             action,
             dryRun: args.dryRun,
             ...(personId ? { personId } : {}),
-            fieldsSet: personFieldsSet(writeFields),
+            fieldsSet: setFields,
             ...(companyId ? { companyId } : {}),
             companyLinked: Boolean(companyId),
             ...(companyNote ? { companyNote } : {}),
