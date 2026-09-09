@@ -417,6 +417,101 @@ const LeadRecordSchema = z.object({
 }).passthrough();
 type LeadRecord = z.infer<typeof LeadRecordSchema>;
 
+/**
+ * One entry of a `kv_export` snapshot from the @shrug/fastly-compute leads
+ * store: `value` is the JSON lead record the Fastly contact worker wrote (utf8).
+ * key/found/valueEncoding are carried through but unused by the adapter.
+ */
+const KvEntrySchema = z.object({
+  key: z.string().optional(),
+  found: z.boolean().optional(),
+  value: z.string().default(""),
+  valueEncoding: z.string().optional(),
+}).passthrough();
+type KvEntry = z.infer<typeof KvEntrySchema>;
+
+/** A `contact_type` value coerced to the LeadRecord enum, or null if unknown. */
+function coerceContactType(
+  v: unknown,
+): "individual" | "business" | "emergency" | null {
+  const s = typeof v === "string" ? v.toLowerCase().trim() : "";
+  return s === "individual" || s === "business" || s === "emergency" ? s : null;
+}
+
+/**
+ * Adapt ONE raw KV lead record (as written by the Fastly contact worker) into
+ * the flat LeadRecord `push_leads` validates. Pure + unit-testable. Bridges the
+ * two on-the-wire shapes — shrugpw's and shrug.host's richer one — losing
+ * nothing:
+ *   - `org` becomes the company name when `company` is absent;
+ *   - the `geo` OBJECT is flattened to a "city, region, country" string;
+ *   - null/absent email & phone become "" (planLead re-validates the email);
+ *   - `contact_type` is honored when a valid enum, else inferred — shrug.host
+ *     leads (`source == "shrug.host-contact"`) default to `business` so the
+ *     company-linking path runs;
+ *   - shrug.host's structured extras (`needs`/`reason`/`timing`/`source`) are
+ *     folded onto the message so they reach the per-lead Note (no first-class
+ *     Twenty field for them yet).
+ */
+export function leadFromKvRecord(raw: Record<string, unknown>): LeadRecord {
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const source = str(raw.source).trim();
+
+  const geoObj = raw.geo && typeof raw.geo === "object"
+    ? raw.geo as Record<string, unknown>
+    : {};
+  const geo = [str(geoObj.city), str(geoObj.region), str(geoObj.country)]
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .join(", ");
+
+  const contact_type = coerceContactType(raw.contact_type) ??
+    (source === "shrug.host-contact" ? "business" : "individual");
+
+  const needs = Array.isArray(raw.needs)
+    ? (raw.needs as unknown[]).map(str).map((x) => x.trim()).filter(Boolean)
+    : [];
+  const extras: string[] = [];
+  if (needs.length) extras.push(`Needs: ${needs.join(", ")}`);
+  if (str(raw.reason).trim()) extras.push(`Reason: ${str(raw.reason).trim()}`);
+  if (str(raw.timing).trim()) extras.push(`Timing: ${str(raw.timing).trim()}`);
+  if (source) extras.push(`Via: ${source}`);
+  const baseMsg = str(raw.message).trim();
+  const message = extras.length
+    ? (baseMsg ? `${baseMsg}\n\n— ${extras.join(" · ")}` : extras.join(" · "))
+    : baseMsg;
+
+  return {
+    id: str(raw.id),
+    name: str(raw.name),
+    email: str(raw.email),
+    phone: str(raw.phone),
+    message,
+    contact_type,
+    company: str(raw.company) || str(raw.org),
+    received_at: str(raw.received_at),
+    status: str(raw.status) || "new",
+    geo,
+  };
+}
+
+/**
+ * Parse one `kv_export` entry into an adapted LeadRecord. Returns null when the
+ * entry has no string value or the value is not JSON — the caller counts these
+ * as unparseable (surfaced in the audit; never silently dropped).
+ */
+export function leadFromKvEntry(entry: KvEntry): LeadRecord | null {
+  if (typeof entry.value !== "string" || entry.value.trim() === "") return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(entry.value);
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== "object") return null;
+  return leadFromKvRecord(raw as Record<string, unknown>);
+}
+
 /** A lead that failed validation (no writes will happen for it). */
 export interface PlannedLeadInvalid {
   ok: false;
@@ -1682,6 +1777,12 @@ const PushRunSchema = z.object({
     processed: z.number(),
     remaining: z.number(),
     emergencies: z.number(),
+    kvParsed: z.number().optional().describe(
+      "Leads adapted from kvEntries this run",
+    ),
+    kvUnparseable: z.number().optional().describe(
+      "kvEntries dropped as non-JSON / empty (never silently ignored)",
+    ),
     perLead: z.array(
       z.object({
         leadId: z.string(),
@@ -3441,12 +3542,19 @@ export const model = {
     },
     push_leads: {
       description:
-        "THE fan-out lead sink (repo rule 6). Ingest a batch of contact-form leads into Twenty in one execution: select status=='new', FIFO by received_at, capped at maxBatch. Per lead, isolated in try/catch: validate + sanitize every field FIRST (bad lead => failed, no writes); reuse but NEVER structurally mutate an existing Person; create/link a Company only for business leads on a real corporate domain; create exactly one Opportunity keyed on leadId (skip if it exists); ALWAYS ensure the per-lead message Note; and set the emergency alert flag + isEmergency marker INDEPENDENTLY of the opportunity skip. dryRun=true does lookups + a plan and writes nothing. confirm=true is required for a real run. Returns counts + per-lead results (no raw PII beyond leadId) in a `pushRun` resource.",
+        "THE fan-out lead sink (repo rule 6). Ingest a batch of contact-form leads into Twenty in one execution: select status=='new', FIFO by received_at, capped at maxBatch. Per lead, isolated in try/catch: validate + sanitize every field FIRST (bad lead => failed, no writes); reuse but NEVER structurally mutate an existing Person; create/link a Company only for business leads on a real corporate domain; create exactly one Opportunity keyed on leadId (skip if it exists); ALWAYS ensure the per-lead message Note; and set the emergency alert flag + isEmergency marker INDEPENDENTLY of the opportunity skip. dryRun=true does lookups + a plan and writes nothing. confirm=true is required for a real run. Accepts leads either pre-shaped (`leads`) or as raw `kvEntries` from a `kv_export` snapshot, which it parses + adapts in-method (shrugpw and shrug.host shapes; org→company, geo object→string, needs/reason/timing/source folded onto the Note). Returns counts + per-lead results (no raw PII beyond leadId) in a `pushRun` resource.",
       arguments: z.object({
         leads: z
           .array(LeadRecordSchema)
+          .default([])
           .describe(
-            "Inbound leads (typically mapped from the Fastly KV store)",
+            "Inbound leads already shaped to the flat lead record. Provide this and/or `kvEntries`.",
+          ),
+        kvEntries: z
+          .array(KvEntrySchema)
+          .default([])
+          .describe(
+            "Raw kv_export entries from the @shrug/fastly-compute leads store; each entry.value is a JSON lead record parsed + adapted in-method (handles both shrugpw's and shrug.host's shapes). Point this at the kv_export snapshot so the workflow stays thin.",
           ),
         confirm: z
           .boolean()
@@ -3468,6 +3576,7 @@ export const model = {
       execute: async (
         args: {
           leads: LeadRecord[];
+          kvEntries?: KvEntry[];
           confirm: boolean;
           dryRun: boolean;
           maxBatch: number;
@@ -3480,8 +3589,18 @@ export const model = {
             "Refusing to push leads without confirm:true (use dryRun:true to plan)",
           );
         }
+        // Adapt raw kv_export entries (if provided) and merge with any leads
+        // passed pre-shaped. Unparseable entries are counted, never dropped silently.
+        const fromKv: LeadRecord[] = [];
+        let kvUnparseable = 0;
+        for (const entry of args.kvEntries ?? []) {
+          const lead = leadFromKvEntry(entry);
+          if (lead) fromKv.push(lead);
+          else kvUnparseable++;
+        }
+        const allLeads = [...(args.leads ?? []), ...fromKv];
         const { batch, cap, remaining, eligible } = selectBatch(
-          args.leads,
+          allLeads,
           args.maxBatch,
         );
         context.logger.info(
@@ -3549,6 +3668,8 @@ export const model = {
             processed: batch.length,
             remaining,
             emergencies,
+            kvParsed: fromKv.length,
+            kvUnparseable,
             perLead: results.map((r) => ({
               leadId: r.leadId,
               action: r.action,

@@ -21,6 +21,8 @@ import {
   escapeMarkdown,
   isBlockedDomain,
   isFilterSafe,
+  leadFromKvEntry,
+  leadFromKvRecord,
   listFiltered,
   listInstanceHash,
   mapCompanyView,
@@ -321,6 +323,104 @@ Deno.test("selectBatch caps the batch and reports the remainder (no starvation)"
   assertEquals(remaining, 3);
   // Oldest two processed first.
   assertEquals(batch.map((l) => l.id), ["L0", "L1"]);
+});
+
+// --- leadFromKvRecord / leadFromKvEntry (KV intake adapter) -----------------
+
+Deno.test("leadFromKvRecord adapts a shrugpw record: geo object -> string, null -> ''", () => {
+  const l = leadFromKvRecord({
+    id: "91c0e5d5",
+    received_at: "2026-09-05T02:01:14.776Z",
+    status: "new",
+    name: "Neil Hanlon",
+    email: "neil@shrug.pw",
+    phone: null,
+    contact_type: "business",
+    message: "Potato engineering",
+    source: null,
+    geo: { city: "bedford", region: "MA", country: "US" },
+  });
+  assertEquals(l.id, "91c0e5d5");
+  assertEquals(l.phone, ""); // null coalesced
+  assertEquals(l.geo, "bedford, MA, US"); // object flattened
+  assertEquals(l.contact_type, "business");
+  assertEquals(l.company, "");
+  assertEquals(l.message, "Potato engineering"); // no extras to fold
+});
+
+Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, folds needs/reason/timing/source", () => {
+  const l = leadFromKvRecord({
+    id: "sh-1",
+    received_at: "2026-09-06T12:00:00.000Z",
+    status: "new",
+    name: "Mike Owens",
+    email: "mike@gmail.com",
+    phone: null,
+    org: "Bob's Roofing",
+    needs: ["web", "files"],
+    reason: "broken",
+    timing: "contract's up in March",
+    message: "", // shrug.host allows an empty message
+    source: "shrug.host-contact",
+    geo: { city: "Bedford", region: "MA", country: "US" },
+  });
+  assertEquals(l.company, "Bob's Roofing"); // org -> company
+  assertEquals(l.contact_type, "business"); // inferred from source
+  // Everything lands in the message (=> the Note), nothing dropped.
+  assertEquals(
+    l.message,
+    "Needs: web, files · Reason: broken · Timing: contract's up in March · Via: shrug.host-contact",
+  );
+});
+
+Deno.test("leadFromKvRecord appends extras after a present message and prefers explicit company/contact_type", () => {
+  const l = leadFromKvRecord({
+    id: "sh-2",
+    name: "Dana Fields",
+    email: "dana@bobsroofing.com",
+    company: "Bob's Roofing LLC", // explicit company beats org
+    org: "ignored org",
+    contact_type: "individual", // explicit enum beats source inference
+    needs: ["email"],
+    message: "Need to move our email.",
+    source: "shrug.host-contact",
+  });
+  assertEquals(l.company, "Bob's Roofing LLC");
+  assertEquals(l.contact_type, "individual");
+  assertEquals(
+    l.message,
+    "Need to move our email.\n\n— Needs: email · Via: shrug.host-contact",
+  );
+});
+
+Deno.test("leadFromKvEntry parses a JSON value; null on non-JSON / empty", () => {
+  const good = leadFromKvEntry({
+    key: "lead/1-abc",
+    found: true,
+    value: JSON.stringify({ id: "abc", email: "a@b.com", status: "new" }),
+    valueEncoding: "utf8",
+  });
+  assert(good !== null);
+  assertEquals(good?.id, "abc");
+  assertEquals(leadFromKvEntry({ value: "not json{" }), null);
+  assertEquals(leadFromKvEntry({ value: "" }), null);
+  assertEquals(leadFromKvEntry({ value: "42" }), null); // JSON, but not an object
+});
+
+Deno.test("adapted shrug.host record flows through planLead as a valid business lead", () => {
+  const l = leadFromKvRecord({
+    id: "sh-3",
+    name: "Dana Fields",
+    email: "dana@bobsroofing.com",
+    org: "Bob's Roofing LLC",
+    source: "shrug.host-contact",
+    status: "new",
+  });
+  const p = planLead(l, DEFAULT_EMAIL_DOMAIN_BLOCKLIST);
+  if (!p.ok) throw new Error("expected ok");
+  assertEquals(p.contactType, "business");
+  assertEquals(p.companyDomain, "bobsroofing.com");
+  assertEquals(p.companyName, "Bob's Roofing LLC");
 });
 
 // --- push_leads confirm-gate (throws before any I/O) ------------------------
