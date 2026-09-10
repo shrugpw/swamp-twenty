@@ -828,6 +828,46 @@ Deno.test("upsertOpportunity omits BOTH segmentation fields when neither is set"
   }
 });
 
+Deno.test("upsertOpportunity treats an empty-string segmentation token as unset (never nulled)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "seg-empty-2026",
+        name: "Empty Segment",
+        lineOfBusiness: "", // unresolved CEL fallback => leave unchanged
+        sourceChannel: "",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    // "" is coerced to unset: omitted from the body, not written as "".
+    assertEquals("lineOfBusiness" in body, false);
+    assertEquals("sourceChannel" in body, false);
+  } finally {
+    restore();
+  }
+});
+
 Deno.test("upsertOpportunity rejects a segmentation token not in the live enum", async () => {
   const { calls, restore } = stubTwentyFetch((method, path) => {
     if (path.startsWith("/rest/metadata/objects")) return OPP_META;

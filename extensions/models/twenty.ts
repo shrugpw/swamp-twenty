@@ -4276,11 +4276,14 @@ export const model = {
 
           // Segmentation SELECT fields (analytics): write only what the caller
           // set — an unset token is omitted from the body on BOTH create and
-          // update, so a re-run never clears a value (never nulled). Validated
-          // against the live enum exactly like stage; an invalid token fails
-          // fast here rather than as a blind Twenty 4xx. Skipped (best-effort)
-          // when the field's options are unreadable, matching stage's posture.
-          const lineOfBusiness = args.lineOfBusiness;
+          // update, so a re-run never clears a value (never nulled). An empty
+          // string (e.g. an unresolved CEL fallback) is coerced to unset so it
+          // means "leave unchanged" rather than nulling the field or aborting
+          // the whole upsert on the enum check. Validated against the live enum
+          // exactly like stage; an invalid token fails fast here rather than as
+          // a blind Twenty 4xx. Skipped (best-effort) when the field's options
+          // are unreadable, matching stage's posture.
+          const lineOfBusiness = args.lineOfBusiness || undefined;
           if (
             lineOfBusiness !== undefined && oppMeta.lineOfBusiness.length &&
             !oppMeta.lineOfBusiness.includes(lineOfBusiness)
@@ -4291,7 +4294,7 @@ export const model = {
               }`,
             );
           }
-          const sourceChannel = args.sourceChannel;
+          const sourceChannel = args.sourceChannel || undefined;
           if (
             sourceChannel !== undefined && oppMeta.sourceChannel.length &&
             !oppMeta.sourceChannel.includes(sourceChannel)
