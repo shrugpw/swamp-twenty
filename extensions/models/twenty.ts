@@ -4228,9 +4228,10 @@ export const model = {
         }
         const name = sanitizeText(args.name, 200);
         if (!name) throw new Error("name is required");
-        // Live Opportunity metadata: used to validate stage against the SELECT
-        // enum and to learn the closeDate field type. Best-effort — if metadata
-        // is unreadable, skip validation rather than block a write.
+        // Live Opportunity metadata: used to validate stage and the two
+        // segmentation SELECTs against their enums and to learn the closeDate
+        // field type. Best-effort — if metadata is unreadable, skip validation
+        // rather than block a write.
         let oppMeta: {
           stages: string[];
           closeDateType: string | null;
@@ -4246,7 +4247,7 @@ export const model = {
           oppMeta = await fetchOpportunityMeta(cfg);
         } catch (_e) {
           context.logger.warning(
-            "Opportunity metadata unreadable; skipping stage validation",
+            "Opportunity metadata unreadable; skipping stage/segmentation validation",
             {},
           );
         }
