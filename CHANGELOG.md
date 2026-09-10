@@ -2,6 +2,24 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.10.2
+
+### Changed
+
+- **`upsertOpportunity` can now write the two Opportunity segmentation `SELECT`
+  fields.** Two optional arguments — `lineOfBusiness` (CONSULTING / HOSTING /
+  GAMES) and `sourceChannel` (DIRECT / REFERRAL / BRAINTRUST / RAMP / CANOPY /
+  CONSULTING_HANDOFF) — let existing opportunities be flagged declaratively.
+  Each token is validated against the live field's enum options (via the same
+  `fetchOpportunityMeta` read that already validates `stage`), so an invalid
+  token fails fast with the valid set rather than a blind Twenty 4xx; validation
+  is skipped best-effort when the field's options are unreadable, matching
+  `stage`. Written on **both** the create and update paths, and — like every
+  other `upsertOpportunity` field — omitted from the request body when unset, so
+  a partial update never nulls a value a re-run didn't set. The `opportunityUpsert`
+  snapshot now carries the two tokens when written. `push_leads` (which stamps
+  `sourceChannel` on the leads it creates) is unchanged.
+
 ## 2026.09.10.1
 
 ### Added

@@ -875,6 +875,8 @@ interface OpportunityWriteFields {
   pointOfContactId?: string;
   companyId?: string;
   isEmergency?: boolean;
+  lineOfBusiness?: string;
+  sourceChannel?: string;
 }
 
 /** Assemble a REST body from only the fields that are set (partial-update safe). */
@@ -889,6 +891,8 @@ function buildOpportunityBody(
   if (f.pointOfContactId) body.pointOfContactId = f.pointOfContactId;
   if (f.companyId) body.companyId = f.companyId;
   if (f.isEmergency !== undefined) body.isEmergency = f.isEmergency;
+  if (f.lineOfBusiness !== undefined) body.lineOfBusiness = f.lineOfBusiness;
+  if (f.sourceChannel !== undefined) body.sourceChannel = f.sourceChannel;
   return body;
 }
 
@@ -1412,13 +1416,19 @@ async function listOpportunitiesFiltered(
 }
 
 /**
- * Read the Opportunity object's live metadata: the `stage` SELECT enum values
- * and the `closeDate` field type (DATE vs DATE_TIME). Used to fail fast on an
- * invalid stage and to format closeDate correctly for the instance.
+ * Read the Opportunity object's live metadata: the `stage` SELECT enum values,
+ * the two segmentation SELECT enums (`lineOfBusiness`, `sourceChannel`), and the
+ * `closeDate` field type (DATE vs DATE_TIME). Used to fail fast on an invalid
+ * stage / segmentation token and to format closeDate correctly for the instance.
  */
 async function fetchOpportunityMeta(
   cfg: TwentyCfg,
-): Promise<{ stages: string[]; closeDateType: string | null }> {
+): Promise<{
+  stages: string[];
+  closeDateType: string | null;
+  lineOfBusiness: string[];
+  sourceChannel: string[];
+}> {
   const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
   const objs = ((json as { data?: unknown }).data ?? []) as Array<
     Record<string, unknown>
@@ -1426,14 +1436,22 @@ async function fetchOpportunityMeta(
   const opp = objs.find((o) => String(o.nameSingular ?? "") === "opportunity");
   const fields = (opp?.fields ?? []) as Array<Record<string, unknown>>;
   const list = Array.isArray(fields) ? fields : [];
-  const stageField = list.find((f) => String(f.name ?? "") === "stage");
-  const opts = (stageField?.options ?? []) as Array<Record<string, unknown>>;
-  const stages = Array.isArray(opts)
-    ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
-    : [];
+  // Extract a SELECT field's option value tokens (value ?? label), the same way
+  // stage validation has always read them — shared so stage and the two
+  // segmentation fields cannot drift.
+  const optionValues = (fieldName: string): string[] => {
+    const f = list.find((x) => String(x.name ?? "") === fieldName);
+    const opts = (f?.options ?? []) as Array<Record<string, unknown>>;
+    return Array.isArray(opts)
+      ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
+      : [];
+  };
+  const stages = optionValues("stage");
+  const lineOfBusiness = optionValues("lineOfBusiness");
+  const sourceChannel = optionValues("sourceChannel");
   const cdField = list.find((f) => String(f.name ?? "") === "closeDate");
   const closeDateType = cdField ? (String(cdField.type ?? "") || null) : null;
-  return { stages, closeDateType };
+  return { stages, closeDateType, lineOfBusiness, sourceChannel };
 }
 
 // --- SELECT-option provisioning helpers (TWENTY-STAGE-OPTION) ----------------
@@ -2143,6 +2161,14 @@ const OpportunityUpsertSchema = z.object({
   opportunityId: z.string().optional(),
   name: z.string(),
   stage: z.string(),
+  lineOfBusiness: z
+    .string()
+    .optional()
+    .describe("Line of Business segmentation token written, if set"),
+  sourceChannel: z
+    .string()
+    .optional()
+    .describe("Source Channel segmentation token written, if set"),
   amount: z.number().optional().describe("Deal value in whole currency units"),
   currencyCode: z.string().optional(),
   closeDate: z.string().optional(),
@@ -2607,7 +2633,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.10.1",
+  version: "2026.09.10.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -2656,6 +2682,14 @@ export const model = {
       toVersion: "2026.09.10.1",
       description:
         'Add the generalized ensureField provisioning method (TEXT/BOOLEAN/NUMBER/DATE_TIME/SELECT, append-only on SELECT) with ensureLeadFields refactored to a thin wrapper over it; add the ensureOpportunitySegmentation fan-out (Line of Business + Source Channel) and the fieldEnsured resource; wire push_leads to stamp the new leadSourceChannel global on created Opportunities. globalArguments gains one OPTIONAL field, leadSourceChannel (default ""), so this is a no-op attribute migration — existing instances lazily acquire the empty default and behave identically until it is set.',
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.10.2",
+      description:
+        "Teach upsertOpportunity to write the two Opportunity segmentation SELECT fields: optional lineOfBusiness and sourceChannel tokens, validated against the live opportunity.lineOfBusiness/sourceChannel enums exactly like stage, written on both the create and update paths and omitted (never nulled) when unset. Additive method arguments + two optional opportunityUpsert snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4079,7 +4113,7 @@ export const model = {
     },
     upsertOpportunity: {
       description:
-        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
+        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact, and the lineOfBusiness/sourceChannel segmentation SELECTs) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
       arguments: z.object({
         leadId: z
           .string()
@@ -4105,6 +4139,18 @@ export const model = {
           .optional()
           .describe(
             "Opportunity stage (NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER). Defaults to the model's opportunityStage.",
+          ),
+        lineOfBusiness: z
+          .string()
+          .optional()
+          .describe(
+            "Line of Business segmentation SELECT option token (UPPER_SNAKE: CONSULTING, HOSTING, GAMES). Validated against the live opportunity.lineOfBusiness enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
+          ),
+        sourceChannel: z
+          .string()
+          .optional()
+          .describe(
+            "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, BRAINTRUST, RAMP, CANOPY, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
           ),
         closeDate: z
           .string()
@@ -4154,6 +4200,8 @@ export const model = {
           amount?: number;
           currencyCode?: string;
           stage?: string;
+          lineOfBusiness?: string;
+          sourceChannel?: string;
           closeDate: string;
           companyName: string;
           companyDomain: string;
@@ -4183,9 +4231,16 @@ export const model = {
         // Live Opportunity metadata: used to validate stage against the SELECT
         // enum and to learn the closeDate field type. Best-effort — if metadata
         // is unreadable, skip validation rather than block a write.
-        let oppMeta: { stages: string[]; closeDateType: string | null } = {
+        let oppMeta: {
+          stages: string[];
+          closeDateType: string | null;
+          lineOfBusiness: string[];
+          sourceChannel: string[];
+        } = {
           stages: [],
           closeDateType: null,
+          lineOfBusiness: [],
+          sourceChannel: [],
         };
         try {
           oppMeta = await fetchOpportunityMeta(cfg);
@@ -4215,6 +4270,35 @@ export const model = {
             throw new Error(
               `Invalid stage '${stageToWrite}'. Valid stages: ${
                 oppMeta.stages.join(", ")
+              }`,
+            );
+          }
+
+          // Segmentation SELECT fields (analytics): write only what the caller
+          // set — an unset token is omitted from the body on BOTH create and
+          // update, so a re-run never clears a value (never nulled). Validated
+          // against the live enum exactly like stage; an invalid token fails
+          // fast here rather than as a blind Twenty 4xx. Skipped (best-effort)
+          // when the field's options are unreadable, matching stage's posture.
+          const lineOfBusiness = args.lineOfBusiness;
+          if (
+            lineOfBusiness !== undefined && oppMeta.lineOfBusiness.length &&
+            !oppMeta.lineOfBusiness.includes(lineOfBusiness)
+          ) {
+            throw new Error(
+              `Invalid lineOfBusiness '${lineOfBusiness}'. Valid options: ${
+                oppMeta.lineOfBusiness.join(", ")
+              }`,
+            );
+          }
+          const sourceChannel = args.sourceChannel;
+          if (
+            sourceChannel !== undefined && oppMeta.sourceChannel.length &&
+            !oppMeta.sourceChannel.includes(sourceChannel)
+          ) {
+            throw new Error(
+              `Invalid sourceChannel '${sourceChannel}'. Valid options: ${
+                oppMeta.sourceChannel.join(", ")
               }`,
             );
           }
@@ -4304,6 +4388,8 @@ export const model = {
             ...(args.isEmergency !== undefined
               ? { isEmergency: args.isEmergency }
               : {}),
+            ...(lineOfBusiness !== undefined ? { lineOfBusiness } : {}),
+            ...(sourceChannel !== undefined ? { sourceChannel } : {}),
           };
           let opportunityId = existingOpp ? String(existingOpp.id ?? "") : "";
           let action:
@@ -4372,6 +4458,8 @@ export const model = {
               ...(opportunityId ? { opportunityId } : {}),
               name,
               stage: reportedStage,
+              ...(lineOfBusiness !== undefined ? { lineOfBusiness } : {}),
+              ...(sourceChannel !== undefined ? { sourceChannel } : {}),
               ...(args.amount !== undefined ? { amount: args.amount } : {}),
               ...(amount ? { currencyCode: amount.currencyCode } : {}),
               ...(closeDate ? { closeDate } : {}),

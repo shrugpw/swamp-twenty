@@ -608,6 +608,18 @@ const OPP_META = {
           value: "CUSTOMER",
         }],
       },
+      {
+        name: "lineOfBusiness",
+        options: [{ value: "CONSULTING" }, { value: "HOSTING" }, {
+          value: "GAMES",
+        }],
+      },
+      {
+        name: "sourceChannel",
+        options: [{ value: "DIRECT" }, { value: "REFERRAL" }, {
+          value: "BRAINTRUST",
+        }],
+      },
       { name: "closeDate", type: "DATE_TIME" },
     ],
   }],
@@ -696,6 +708,158 @@ Deno.test("upsertOpportunity applies the default stage on create", async () => {
     const body = post!.body as Record<string, unknown>;
     assertEquals(body.stage, "NEW");
     assertEquals(body.leadId, "brand-new-2026");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity writes BOTH segmentation fields on create", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } }; // none exists => create
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "seg-both-2026",
+        name: "Segmented Deal",
+        lineOfBusiness: "CONSULTING",
+        sourceChannel: "REFERRAL",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the opportunity");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.lineOfBusiness, "CONSULTING");
+    assertEquals(body.sourceChannel, "REFERRAL");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity writes ONLY the segmentation field that was set (update path)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "seg-one-2026",
+        name: "One Segment",
+        lineOfBusiness: "HOSTING", // sourceChannel deliberately omitted
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals(body.lineOfBusiness, "HOSTING");
+    // Unset field is omitted from the body, never nulled.
+    assertEquals("sourceChannel" in body, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity omits BOTH segmentation fields when neither is set", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "seg-none-2026",
+        name: "No Segments",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals("lineOfBusiness" in body, false);
+    assertEquals("sourceChannel" in body, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity rejects a segmentation token not in the live enum", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "seg-bad-2026",
+            name: "Bad Segment",
+            lineOfBusiness: "AEROSPACE", // not a provisioned option
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "Invalid lineOfBusiness",
+    );
+    // Failed validation => no write was attempted.
+    assertEquals(calls.some((c) => c.method === "POST"), false);
   } finally {
     restore();
   }
