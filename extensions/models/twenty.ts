@@ -106,6 +106,12 @@ const GlobalArgsSchema = z.object({
     .describe(
       "INFORMATIONAL: name of the pre-configured Twenty role whose saved view restricts records carrying the isEmergency marker. Twenty's REST API cannot assign roles, so this is documentation only — setEmergencyVisibility just sets the marker; visibility is enforced by workspace config.",
     ),
+  leadSourceChannel: z
+    .string()
+    .default("")
+    .describe(
+      "Source Channel SELECT option (UPPER_SNAKE, e.g. DIRECT) stamped on Opportunities that push_leads CREATES, for analytics segmentation. Empty (default) = do not set the field — leave empty until the opportunity.sourceChannel SELECT is provisioned (ensureOpportunitySegmentation / ensureField), since writing an unprovisioned field fails the create. Contact-form leads are inbound-direct, so DIRECT is the natural value once the field exists.",
+    ),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
@@ -808,6 +814,7 @@ interface CreateOpportunityInput {
   pointOfContactId: string;
   companyId?: string;
   leadId: string;
+  sourceChannel?: string;
 }
 
 async function createOpportunity(
@@ -821,6 +828,11 @@ async function createOpportunity(
     leadId: o.leadId,
   };
   if (o.companyId) body.companyId = o.companyId;
+  // Analytics segmentation (TWENTY-OPP-SEGMENTATION): stamp Source Channel on
+  // CREATE only, and only when the instance is configured with a value (the
+  // opportunity.sourceChannel SELECT must already be provisioned). An unset
+  // config leaves the create body byte-identical to before this change.
+  if (o.sourceChannel) body.sourceChannel = o.sourceChannel;
   const json = await twentyRequest(cfg, "POST", "/rest/opportunities", body);
   return unwrapRecord(json, "createOpportunity");
 }
@@ -1558,6 +1570,352 @@ function optionsEquivalent(a: SelectOption[], b: SelectOption[]): boolean {
   return a.every((o) => setB.has(key(o)));
 }
 
+// --- Generalized field provisioning helpers (TWENTY-ENSURE-FIELD) ------------
+
+// The field types ensureField provisions. SELECT is handled specially (carries
+// an options array). MULTI_SELECT and RELATION are intentionally out of scope in
+// v1 (RELATION is CRM-TASKS #4, a separate work item).
+type EnsureFieldType = "TEXT" | "BOOLEAN" | "NUMBER" | "DATE_TIME" | "SELECT";
+const ENSURE_FIELD_TYPES = new Set<EnsureFieldType>([
+  "TEXT",
+  "BOOLEAN",
+  "NUMBER",
+  "DATE_TIME",
+  "SELECT",
+]);
+
+// A Twenty custom-field `name` is a camelCase identifier (letter-led, alnum).
+// Gating the metadata POST on this means a typo/CEL slip can never post a garbage
+// field name (mirrors ensureStageOption's value allowlisting discipline).
+const FIELD_NAME_RE = /^[a-z][A-Za-z0-9]*$/;
+
+/** A requested SELECT option before id assignment (label/color defaulted). */
+interface RequestedOption {
+  value: string;
+  label?: string;
+  color?: string;
+}
+
+/** A validated, id-less SELECT option with its position assigned. */
+interface PlannedOption {
+  value: string;
+  label: string;
+  color: string;
+  position: number;
+}
+
+/** The declarative spec for one field ensureField provisions. */
+interface FieldSpec {
+  objectNameSingular: string;
+  name: string;
+  label: string;
+  type: EnsureFieldType;
+  options?: RequestedOption[]; // SELECT only
+  description?: string;
+}
+
+/** Structured outcome of ensuring one field (before snapshot envelope fields). */
+interface FieldEnsureOutcome {
+  object: string;
+  name: string;
+  type: string;
+  action:
+    | "created"
+    | "present"
+    | "planned-create"
+    | "options-appended"
+    | "planned-append";
+  optionsAdded: string[];
+  optionsPresent: string[];
+  mismatchNotes: string[];
+  typeMismatch?: string;
+}
+
+/**
+ * Validate + normalize one requested SELECT option into canonical shape at the
+ * given position. PURE (no id, no I/O) so the planner is deterministic and
+ * unit-testable; the impure caller mints the client uuid. Throws on an invalid
+ * value/color using the SAME rules as ensureStageOption: value UPPER_SNAKE,
+ * color from Twenty's palette, label defaulted to the title-cased token.
+ */
+export function normalizeRequestedOption(
+  raw: RequestedOption,
+  position: number,
+): PlannedOption {
+  const value = String(raw?.value ?? "").trim();
+  if (!STAGE_OPTION_VALUE_RE.test(value)) {
+    throw new Error(
+      `Invalid SELECT option value '${value}': must be UPPER_SNAKE (A-Z, 0-9, _), letter-led`,
+    );
+  }
+  const color = String(raw?.color ?? "gray");
+  if (!STAGE_OPTION_COLORS.has(color)) {
+    throw new Error(
+      `Invalid SELECT option color '${color}' (allowed: ${
+        [...STAGE_OPTION_COLORS].join(", ")
+      })`,
+    );
+  }
+  const label = raw?.label != null && String(raw.label).trim()
+    ? sanitizeText(raw.label, 60)
+    : titleCaseToken(value);
+  return { value, label, color, position };
+}
+
+/**
+ * PURE append-only SELECT-option planner — the shared discipline ensureField
+ * relies on, matching ensureStageOption's guarantee: existing options are kept
+ * VERBATIM (never dropped, reordered, or recolored) and only genuinely-new
+ * options are appended after the current max position. A requested option whose
+ * value already exists is a no-op; a differing label/color is REPORTED
+ * (mismatches) and left unchanged. New options carry no id (the impure caller
+ * mints one before the write). Duplicate requested values are collapsed. Throws
+ * (via normalizeRequestedOption) on any invalid requested option, so a
+ * partially-built plan never reaches a write.
+ */
+export function planSelectOptions(
+  existing: SelectOption[],
+  requested: RequestedOption[],
+): {
+  merged: SelectOption[];
+  added: PlannedOption[];
+  present: string[];
+  mismatches: string[];
+} {
+  const byValue = new Map(existing.map((o) => [o.value, o]));
+  let maxPos = existing.reduce((m, o) => Math.max(m, o.position), -1);
+  const added: PlannedOption[] = [];
+  const present: string[] = [];
+  const mismatches: string[] = [];
+  const seen = new Set<string>();
+  for (const req of requested) {
+    const norm = normalizeRequestedOption(req, 0);
+    if (seen.has(norm.value)) continue; // collapse duplicates within the request
+    seen.add(norm.value);
+    const hit = byValue.get(norm.value);
+    if (hit) {
+      present.push(norm.value);
+      if (hit.label !== norm.label || hit.color !== norm.color) {
+        mismatches.push(
+          `Option '${norm.value}' exists with label='${hit.label}' color='${hit.color}'; ` +
+            `requested label='${norm.label}' color='${norm.color}' — left unchanged (no mutation).`,
+        );
+      }
+      continue;
+    }
+    maxPos += 1;
+    added.push({ ...norm, position: maxPos });
+  }
+  const merged: SelectOption[] = [...existing, ...added.map((o) => ({ ...o }))];
+  return { merged, added, present, mismatches };
+}
+
+/** GET /rest/metadata/objects → the raw object metadata array. */
+async function fetchObjectsMeta(
+  cfg: TwentyCfg,
+): Promise<Array<Record<string, unknown>>> {
+  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
+  const objs = ((json as { data?: unknown }).data ?? []) as Array<
+    Record<string, unknown>
+  >;
+  return Array.isArray(objs) ? objs : [];
+}
+
+/**
+ * Idempotently ensure ONE field exists on an object via the metadata API — the
+ * shared core behind both ensureField (single, throws) and ensureLeadFields
+ * (fan-out, swallows per-field errors into a report). Non-destructive:
+ *   - absent            → POST /rest/metadata/fields (create); SELECT carries
+ *                         its full validated + client-id'd options array;
+ *   - present, scalar   → no-op (a differing type is REPORTED, never mutated);
+ *   - present, SELECT   → append-only plan; if new options, re-read + drift-check
+ *                         (optimistic concurrency, no server ETag) then an
+ *                         options-only PATCH; if none new, a no-op.
+ * `dryRun` validates + plans and writes nothing. Throws on a validation error or
+ * an absent object so the caller can decide whether to swallow or surface it.
+ * `objectsSnapshot` (optional) lets a fan-out caller pass one GET result for
+ * presence detection; the SELECT-append path always re-reads fresh for its
+ * concurrency check regardless.
+ */
+async function ensureFieldOnce(
+  cfg: TwentyCfg,
+  spec: FieldSpec,
+  dryRun: boolean,
+  objectsSnapshot?: Array<Record<string, unknown>>,
+): Promise<FieldEnsureOutcome> {
+  const name = String(spec.name ?? "").trim();
+  if (!FIELD_NAME_RE.test(name)) {
+    throw new Error(
+      `Invalid field name '${name}': must be a camelCase identifier (letter-led, alphanumeric)`,
+    );
+  }
+  if (!ENSURE_FIELD_TYPES.has(spec.type)) {
+    throw new Error(
+      `Unsupported field type '${spec.type}' (allowed: ${
+        [...ENSURE_FIELD_TYPES].join(", ")
+      })`,
+    );
+  }
+  const isSelect = spec.type === "SELECT";
+  const requested = spec.options ?? [];
+  if (isSelect && requested.length === 0) {
+    throw new Error(
+      `SELECT field '${spec.objectNameSingular}.${name}' requires at least one option`,
+    );
+  }
+  if (!isSelect && requested.length > 0) {
+    throw new Error(
+      `Field type '${spec.type}' does not take options (SELECT only)`,
+    );
+  }
+  const label = spec.label != null && String(spec.label).trim()
+    ? sanitizeText(spec.label, 120)
+    : titleCaseToken(name);
+
+  const objs = objectsSnapshot ?? (await fetchObjectsMeta(cfg));
+  const obj = objs.find(
+    (o) => String(o.nameSingular ?? "") === spec.objectNameSingular,
+  );
+  if (!obj) {
+    throw new Error(
+      `Object '${spec.objectNameSingular}' not found in workspace metadata`,
+    );
+  }
+  const objectMetadataId = String(obj.id ?? "");
+  const fields = (obj.fields ?? []) as Array<Record<string, unknown>>;
+  const existingField = (Array.isArray(fields) ? fields : []).find(
+    (f) => String(f.name ?? "") === name,
+  );
+
+  const out: FieldEnsureOutcome = {
+    object: spec.objectNameSingular,
+    name,
+    type: spec.type,
+    action: "present",
+    optionsAdded: [],
+    optionsPresent: [],
+    mismatchNotes: [],
+  };
+
+  // CREATE path.
+  if (!existingField) {
+    if (!objectMetadataId) {
+      throw new Error(
+        `Object '${spec.objectNameSingular}' has no metadata id; cannot create '${name}'`,
+      );
+    }
+    const body: Record<string, unknown> = {
+      name,
+      label,
+      type: spec.type,
+      objectMetadataId,
+    };
+    if (spec.description) {
+      body.description = sanitizeText(spec.description, 500);
+    }
+    if (isSelect) {
+      const plan = planSelectOptions([], requested); // every option is new
+      const withIds = plan.added.map((o) => ({
+        id: crypto.randomUUID(),
+        ...o,
+      }));
+      out.optionsAdded = withIds.map((o) => o.value);
+      body.options = withIds;
+    }
+    if (dryRun) {
+      out.action = "planned-create";
+      return out;
+    }
+    await twentyRequest(cfg, "POST", "/rest/metadata/fields", body);
+    out.action = "created";
+    return out;
+  }
+
+  // PRESENT path — never mutate a scalar; report a type drift.
+  const existingType = String(existingField.type ?? "");
+  if (existingType !== spec.type) {
+    out.typeMismatch =
+      `Field '${spec.objectNameSingular}.${name}' exists as type '${existingType}', ` +
+      `requested '${spec.type}' — left unchanged (no mutation).`;
+  }
+  if (!isSelect || existingType !== "SELECT") {
+    out.action = "present";
+    return out;
+  }
+
+  // PRESENT SELECT — append-only, reusing ensureStageOption's read/plan/PATCH.
+  const field = await fetchSelectField(cfg, spec.objectNameSingular, name);
+  const plan = planSelectOptions(field.options, requested);
+  out.optionsPresent = plan.present;
+  out.mismatchNotes = plan.mismatches;
+  if (plan.added.length === 0) {
+    out.action = "present";
+    return out;
+  }
+  out.optionsAdded = plan.added.map((o) => o.value);
+  if (dryRun) {
+    out.action = "planned-append";
+    return out;
+  }
+  // Optimistic concurrency: re-read immediately before the write and abort if the
+  // option set drifted (best-effort — Twenty exposes no ETag).
+  const fresh = await fetchSelectField(cfg, spec.objectNameSingular, name);
+  if (!optionsEquivalent(fresh.options, field.options)) {
+    throw new Error(
+      `Options for '${spec.objectNameSingular}.${name}' changed between read and write (concurrent edit); aborting to avoid a lossy overwrite. Re-run.`,
+    );
+  }
+  const merged: SelectOption[] = [
+    ...field.options,
+    ...plan.added.map((o) => ({ id: crypto.randomUUID(), ...o })),
+  ];
+  // options-only PATCH — Twenty's metadata field PATCH is a partial update, so
+  // sibling attributes (name/label/type/isNullable) survive. We send ONLY options.
+  await twentyRequest(cfg, "PATCH", `/rest/metadata/fields/${field.fieldId}`, {
+    options: merged,
+  });
+  out.action = "options-appended";
+  return out;
+}
+
+/**
+ * The two Opportunity segmentation SELECT fields (CRM-TASKS #5). Analytics only
+ * — NOT a pipeline gate. `sourceChannel` is what push_leads stamps (see the
+ * `leadSourceChannel` global). Provisioned via the shared append-only ensureField
+ * path so a re-run is a clean no-op.
+ */
+export const OPPORTUNITY_SEGMENTATION_FIELDS: ReadonlyArray<FieldSpec> = [
+  {
+    objectNameSingular: "opportunity",
+    name: "lineOfBusiness",
+    label: "Line of Business",
+    type: "SELECT",
+    options: [
+      { value: "CONSULTING", label: "Consulting", color: "blue" },
+      { value: "HOSTING", label: "Hosting", color: "green" },
+      { value: "GAMES", label: "Games", color: "purple" },
+    ],
+  },
+  {
+    objectNameSingular: "opportunity",
+    name: "sourceChannel",
+    label: "Source Channel",
+    type: "SELECT",
+    options: [
+      { value: "DIRECT", label: "Direct", color: "sky" },
+      { value: "REFERRAL", label: "Referral", color: "turquoise" },
+      { value: "BRAINTRUST", label: "Braintrust", color: "orange" },
+      { value: "RAMP", label: "Ramp", color: "yellow" },
+      { value: "CANOPY", label: "Canopy", color: "pink" },
+      {
+        value: "CONSULTING_HANDOFF",
+        label: "Consulting hand-off",
+        color: "gray",
+      },
+    ],
+  },
+];
+
 async function findNoteByLeadId(
   cfg: TwentyCfg,
   leadId: string,
@@ -1683,23 +2041,6 @@ const REQUIRED_FIELDS: ReadonlyArray<
     type: "BOOLEAN",
   },
 ];
-
-/** Map object nameSingular -> objectMetadataId from GET /rest/metadata/objects. */
-async function objectMetadataIds(
-  cfg: TwentyCfg,
-): Promise<Map<string, string>> {
-  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-  const objs = ((json as { data?: unknown }).data ?? []) as Array<
-    Record<string, unknown>
-  >;
-  const m = new Map<string, string>();
-  for (const o of objs) {
-    const name = String(o.nameSingular ?? "");
-    const id = String(o.id ?? "");
-    if (name && id) m.set(name, id);
-  }
-  return m;
-}
 
 // --- Resource schemas -------------------------------------------------------
 
@@ -2021,6 +2362,41 @@ const StageOptionSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Generalized field-provisioning snapshot (TWENTY-ENSURE-FIELD) ----------
+
+const FieldEnsuredSchema = z.object({
+  baseUrl: z.string(),
+  object: z.string(),
+  name: z.string(),
+  type: z.string(),
+  action: z.enum([
+    "created",
+    "present",
+    "planned-create",
+    "options-appended",
+    "planned-append",
+  ]),
+  dryRun: z.boolean(),
+  optionsAdded: z
+    .array(z.string())
+    .describe("SELECT option values created/appended this run (or planned)"),
+  optionsPresent: z
+    .array(z.string())
+    .describe("SELECT option values that already existed"),
+  mismatchNotes: z
+    .array(z.string())
+    .describe(
+      "Non-mutating notes: an existing option whose label/color differed from the request",
+    ),
+  typeMismatch: z
+    .string()
+    .optional()
+    .describe(
+      "Set when a field with this name exists as a DIFFERENT type (left unchanged)",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Curated contact snapshot (TWENTY-PERSON-UPSERT) ------------------------
 // Carries NO raw PII (no email/name/phone) — only the id, which fields were
 // set, and the company link — matching opportunityUpsert's posture.
@@ -2164,6 +2540,7 @@ async function syncPlannedLead(
         pointOfContactId: personId ?? "",
         companyId,
         leadId: p.leadId,
+        sourceChannel: cfg.leadSourceChannel || undefined,
       });
       opportunityId = String(opp.id ?? "");
       action = "created";
@@ -2230,7 +2607,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.08.1",
+  version: "2026.09.10.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -2271,6 +2648,14 @@ export const model = {
       toVersion: "2026.09.08.1",
       description:
         "Add the bulk read surface: listPeople/listCompanies/listNotes fan-out snapshot reads (+ peopleList/companyList/noteList resources) sharing one generic cursor paginator with listOpportunities (which now also sends the immutable order_by=createdAt,id). globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.10.1",
+      description:
+        'Add the generalized ensureField provisioning method (TEXT/BOOLEAN/NUMBER/DATE_TIME/SELECT, append-only on SELECT) with ensureLeadFields refactored to a thin wrapper over it; add the ensureOpportunitySegmentation fan-out (Line of Business + Source Channel) and the fieldEnsured resource; wire push_leads to stamp the new leadSourceChannel global on created Opportunities. globalArguments gains one OPTIONAL field, leadSourceChannel (default ""), so this is a no-op attribute migration — existing instances lazily acquire the empty default and behave identically until it is set.',
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -2372,6 +2757,13 @@ export const model = {
       description:
         "Result of an ensureStageOption run: the target picklist, the option, the action taken, and the full option set",
       schema: StageOptionSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "fieldEnsured": {
+      description:
+        "Result of an ensureField run: the field, the action taken (created/present/appended/planned), and any SELECT options added/present + non-mutating drift notes",
+      schema: FieldEnsuredSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -2493,46 +2885,35 @@ export const model = {
             "Refusing to ensure fields without confirm:true (mutates workspace metadata)",
           );
         }
-        const ids = await objectMetadataIds(cfg);
-        // Presence per object.
-        const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-        const objs = ((json as { data?: unknown }).data ?? []) as Array<
-          Record<string, unknown>
-        >;
-        const present = new Map<string, Set<string>>();
-        for (const o of objs) {
-          const flds = (o.fields ?? []) as Array<Record<string, unknown>>;
-          present.set(
-            String(o.nameSingular ?? ""),
-            new Set(
-              (Array.isArray(flds) ? flds : []).map((f) =>
-                String(f.name ?? "")
-              ),
-            ),
-          );
-        }
+        // Thin wrapper over the shared ensureFieldOnce core (TWENTY-ENSURE-FIELD):
+        // one metadata read, then ensure each required scalar field, mapping the
+        // structured outcome back onto this method's created/present/failed shape.
+        // A per-field throw (absent object, create 4xx) is captured, never fatal —
+        // preserving ensureLeadFields' original resilience.
+        const objs = await fetchObjectsMeta(cfg);
         const created: string[] = [];
         const alreadyPresent: string[] = [];
         const failed: Array<{ field: string; error: string }> = [];
         for (const rf of REQUIRED_FIELDS) {
           const key = `${rf.object}.${rf.name}`;
-          if (present.get(rf.object)?.has(rf.name)) {
-            alreadyPresent.push(key);
-            continue;
-          }
-          const objectMetadataId = ids.get(rf.object);
-          if (!objectMetadataId) {
-            failed.push({ field: key, error: `object ${rf.object} not found` });
-            continue;
-          }
           try {
-            await twentyRequest(cfg, "POST", "/rest/metadata/fields", {
-              name: rf.name,
-              label: rf.label,
-              type: rf.type,
-              objectMetadataId,
-            });
-            created.push(key);
+            const outcome = await ensureFieldOnce(
+              cfg,
+              {
+                objectNameSingular: rf.object,
+                name: rf.name,
+                label: rf.label,
+                type: rf.type as EnsureFieldType,
+              },
+              false,
+              objs,
+            );
+            if (outcome.action === "created") created.push(key);
+            else if (outcome.typeMismatch) {
+              // A required marker field exists with the WRONG type — surface it
+              // (non-destructive: never mutated) instead of masking it as present.
+              failed.push({ field: key, error: outcome.typeMismatch });
+            } else alreadyPresent.push(key);
           } catch (e) {
             failed.push({ field: key, error: redactError(e) });
           }
@@ -3589,6 +3970,17 @@ export const model = {
             "Refusing to push leads without confirm:true (use dryRun:true to plan)",
           );
         }
+        // Fail fast on a misconfigured Source Channel: if set, it must be an
+        // UPPER_SNAKE option token (a provisioned opportunity.sourceChannel
+        // value) — otherwise every opportunity CREATE would 4xx. Empty disables.
+        if (
+          cfg.leadSourceChannel &&
+          !STAGE_OPTION_VALUE_RE.test(cfg.leadSourceChannel)
+        ) {
+          throw new Error(
+            "leadSourceChannel must be UPPER_SNAKE (A-Z, 0-9, _, letter-led) matching a provisioned opportunity.sourceChannel option, or empty to disable",
+          );
+        }
         // Adapt raw kv_export entries (if provided) and merge with any leads
         // passed pre-shaped. Unparseable entries are counted, never dropped silently.
         const fromKv: LeadRecord[] = [];
@@ -4255,6 +4647,183 @@ export const model = {
         }
       },
     },
+    ensureField: {
+      description:
+        "Idempotently provision ONE custom field on an object via POST /rest/metadata/fields — the generalized foundation ensureLeadFields is now a thin wrapper over. Supports TEXT / BOOLEAN / NUMBER / DATE_TIME / SELECT. Non-destructive: an absent field is created; a present scalar field is a no-op (a differing type is reported, never mutated); a present SELECT gets its options APPENDED (existing options preserved verbatim — never dropped, reordered, or recolored, reusing ensureStageOption's append-only + optimistic-concurrency discipline). SELECT requires an options array; option values are UPPER_SNAKE, colors palette-validated, labels defaulted to the title-cased token. confirm:true is required for a real run; dryRun:true validates + plans (planned-create / planned-append) and writes nothing. Snapshots a `fieldEnsured` resource.",
+      arguments: z.object({
+        objectNameSingular: z
+          .string()
+          .describe("Object owning the field, e.g. opportunity / person"),
+        name: z
+          .string()
+          .describe("Field name — a camelCase identifier, e.g. lineOfBusiness"),
+        label: z
+          .string()
+          .optional()
+          .describe("Display label; defaults to a title-cased name"),
+        type: z
+          .enum(["TEXT", "BOOLEAN", "NUMBER", "DATE_TIME", "SELECT"])
+          .describe("Field type"),
+        options: z
+          .array(
+            z.object({
+              value: z
+                .string()
+                .describe("UPPER_SNAKE option token, e.g. HOSTING"),
+              label: z.string().optional().describe("Display label"),
+              color: z
+                .string()
+                .optional()
+                .describe("Twenty palette color; defaults gray"),
+            }),
+          )
+          .default([])
+          .describe(
+            "SELECT options (required for SELECT; ignored otherwise). Append-only: existing options are preserved.",
+          ),
+        description: z
+          .string()
+          .optional()
+          .describe("Optional field description"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — mutates workspace metadata"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Preview the plan; write nothing"),
+      }),
+      execute: async (
+        args: {
+          objectNameSingular: string;
+          name: string;
+          label?: string;
+          type: EnsureFieldType;
+          options: RequestedOption[];
+          description?: string;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to ensure a field without confirm:true (mutates workspace metadata). Use dryRun:true to preview.",
+            );
+          }
+          const planOnly = args.dryRun || !args.confirm;
+          const spec: FieldSpec = {
+            objectNameSingular: args.objectNameSingular,
+            name: args.name,
+            label: args.label ?? "",
+            type: args.type,
+            options: args.type === "SELECT" ? args.options : undefined,
+            description: args.description,
+          };
+          const outcome = await ensureFieldOnce(cfg, spec, planOnly);
+          context.logger.info(
+            "ensureField {object}.{name} ({type}): {action}",
+            {
+              object: outcome.object,
+              name: outcome.name,
+              type: outcome.type,
+              action: outcome.action,
+            },
+          );
+          const handle = await context.writeResource(
+            "fieldEnsured",
+            `field-${outcome.object}-${outcome.name}`,
+            {
+              baseUrl: cfg.baseUrl,
+              object: outcome.object,
+              name: outcome.name,
+              type: outcome.type,
+              action: outcome.action,
+              dryRun: planOnly,
+              optionsAdded: outcome.optionsAdded,
+              optionsPresent: outcome.optionsPresent,
+              mismatchNotes: outcome.mismatchNotes,
+              ...(outcome.typeMismatch
+                ? { typeMismatch: outcome.typeMismatch }
+                : {}),
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    ensureOpportunitySegmentation: {
+      description:
+        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Braintrust / Ramp / Canopy / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op; a field that exists with extra options keeps them (append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
+      arguments: z.object({
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — mutates workspace metadata"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Preview the plan for both fields; write nothing"),
+      }),
+      execute: async (
+        args: { confirm: boolean; dryRun: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to provision segmentation fields without confirm:true (mutates workspace metadata). Use dryRun:true to preview.",
+            );
+          }
+          const planOnly = args.dryRun || !args.confirm;
+          // One metadata read shared across both fields (presence detection); the
+          // SELECT-append path still re-reads fresh per field for its drift check.
+          const objs = await fetchObjectsMeta(cfg);
+          const handles: Array<{ name: string }> = [];
+          for (const spec of OPPORTUNITY_SEGMENTATION_FIELDS) {
+            const outcome = await ensureFieldOnce(cfg, spec, planOnly, objs);
+            context.logger.info(
+              "ensureOpportunitySegmentation {object}.{name}: {action}",
+              {
+                object: outcome.object,
+                name: outcome.name,
+                action: outcome.action,
+              },
+            );
+            const handle = await context.writeResource(
+              "fieldEnsured",
+              `field-${outcome.object}-${outcome.name}`,
+              {
+                baseUrl: cfg.baseUrl,
+                object: outcome.object,
+                name: outcome.name,
+                type: outcome.type,
+                action: outcome.action,
+                dryRun: planOnly,
+                optionsAdded: outcome.optionsAdded,
+                optionsPresent: outcome.optionsPresent,
+                mismatchNotes: outcome.mismatchNotes,
+                ...(outcome.typeMismatch
+                  ? { typeMismatch: outcome.typeMismatch }
+                  : {}),
+                retrievedAt: new Date().toISOString(),
+              },
+            );
+            handles.push(handle);
+          }
+          return { dataHandles: handles };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
   },
   checks: {
     "reachable": {
@@ -4267,6 +4836,8 @@ export const model = {
         "upsertOpportunity",
         "ensureStageOption",
         "upsertPerson",
+        "ensureField",
+        "ensureOpportunitySegmentation",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },

@@ -11,6 +11,7 @@ import {
   assertAlmostEquals,
   assertEquals,
   assertRejects,
+  assertThrows,
 } from "jsr:@std/assert@1";
 import {
   amountFromMicros,
@@ -33,7 +34,10 @@ import {
   normalizeCloseDate,
   normalizeDomainHost,
   normalizePhone,
+  normalizeRequestedOption,
+  OPPORTUNITY_SEGMENTATION_FIELDS,
   planLead,
+  planSelectOptions,
   redactError,
   sanitizeText,
   selectBatch,
@@ -2675,4 +2679,248 @@ Deno.test("redactError scrubs the bearer token and an exact literal token (SR-2/
   assert(!s.includes(tok), s);
   assert(s.includes("Bearer [redacted]"), s);
   assert(s.includes("[redacted]"), s);
+});
+
+// --- ensureField: normalizeRequestedOption (pure) ---------------------------
+
+Deno.test("normalizeRequestedOption defaults label + color and keeps position", () => {
+  assertEquals(normalizeRequestedOption({ value: "CLOSED_WON" }, 3), {
+    value: "CLOSED_WON",
+    label: "Closed Won",
+    color: "gray",
+    position: 3,
+  });
+});
+
+Deno.test("normalizeRequestedOption honors an explicit label + color", () => {
+  assertEquals(
+    normalizeRequestedOption(
+      { value: "HOSTING", label: "Hosting", color: "green" },
+      0,
+    ),
+    { value: "HOSTING", label: "Hosting", color: "green", position: 0 },
+  );
+});
+
+Deno.test("normalizeRequestedOption rejects a non-UPPER_SNAKE value", () => {
+  for (const bad of ["hosting", "Has Space", "1LEADING", "kebab-case", ""]) {
+    assertThrows(
+      () => normalizeRequestedOption({ value: bad }, 0),
+      Error,
+      "option value",
+    );
+  }
+});
+
+Deno.test("normalizeRequestedOption rejects an off-palette color", () => {
+  assertThrows(
+    () =>
+      normalizeRequestedOption({ value: "HOSTING", color: "chartreuse" }, 0),
+    Error,
+    "color",
+  );
+});
+
+// --- ensureField: planSelectOptions (pure, append-only) ---------------------
+
+const existingOpts = [
+  {
+    id: "id-a",
+    value: "CONSULTING",
+    label: "Consulting",
+    color: "blue",
+    position: 0,
+  },
+  {
+    id: "id-b",
+    value: "HOSTING",
+    label: "Hosting",
+    color: "green",
+    position: 1,
+  },
+];
+
+Deno.test("planSelectOptions appends only new options, preserving existing verbatim", () => {
+  const plan = planSelectOptions(existingOpts, [
+    { value: "HOSTING", label: "Hosting", color: "green" },
+    { value: "GAMES", label: "Games", color: "purple" },
+  ]);
+  // Existing entries untouched (id/label/color/position all preserved).
+  assertEquals(plan.merged.slice(0, 2), existingOpts);
+  assertEquals(plan.present, ["HOSTING"]);
+  assertEquals(plan.added.length, 1);
+  assertEquals(plan.added[0], {
+    value: "GAMES",
+    label: "Games",
+    color: "purple",
+    position: 2,
+  });
+  // The appended option carries no id (the impure caller mints one).
+  assertEquals((plan.merged[2] as { id?: string }).id, undefined);
+});
+
+Deno.test("planSelectOptions is a no-op when every requested option is present", () => {
+  const plan = planSelectOptions(existingOpts, [
+    { value: "CONSULTING", label: "Consulting", color: "blue" },
+    { value: "HOSTING", label: "Hosting", color: "green" },
+  ]);
+  assertEquals(plan.added, []);
+  assertEquals(plan.merged, existingOpts);
+  assertEquals(plan.mismatches, []);
+});
+
+Deno.test("planSelectOptions reports a label/color mismatch but never mutates it", () => {
+  const plan = planSelectOptions(existingOpts, [
+    { value: "HOSTING", label: "Hosting Plans", color: "red" },
+  ]);
+  assertEquals(plan.added, []);
+  assertEquals(plan.merged, existingOpts); // unchanged
+  assertEquals(plan.mismatches.length, 1);
+  assert(plan.mismatches[0].includes("HOSTING"));
+});
+
+Deno.test("planSelectOptions creates all options from an empty field, positions 0..n", () => {
+  const plan = planSelectOptions([], [
+    { value: "DIRECT" },
+    { value: "REFERRAL" },
+  ]);
+  assertEquals(plan.added.map((o) => [o.value, o.position]), [
+    ["DIRECT", 0],
+    ["REFERRAL", 1],
+  ]);
+  assertEquals(plan.present, []);
+});
+
+Deno.test("planSelectOptions collapses duplicate requested values", () => {
+  const plan = planSelectOptions([], [
+    { value: "DIRECT" },
+    { value: "DIRECT", label: "Direct Again" },
+  ]);
+  assertEquals(plan.added.length, 1);
+  assertEquals(plan.added[0].value, "DIRECT");
+});
+
+Deno.test("planSelectOptions appends after the current max position (not array length)", () => {
+  const sparse = [
+    { id: "x", value: "A", label: "A", color: "gray", position: 5 },
+  ];
+  const plan = planSelectOptions(sparse, [{ value: "B" }]);
+  assertEquals(plan.added[0].position, 6);
+});
+
+Deno.test("planSelectOptions throws on an invalid requested option (no partial plan)", () => {
+  assertThrows(
+    () => planSelectOptions(existingOpts, [{ value: "bad lower" }]),
+    Error,
+    "option value",
+  );
+});
+
+// --- Opportunity segmentation field specs (TWENTY-OPP-SEGMENTATION) ----------
+
+Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the two Opportunity SELECTs", () => {
+  assertEquals(OPPORTUNITY_SEGMENTATION_FIELDS.length, 2);
+  const byName = new Map(
+    OPPORTUNITY_SEGMENTATION_FIELDS.map((f) => [f.name, f]),
+  );
+  const lob = byName.get("lineOfBusiness");
+  const src = byName.get("sourceChannel");
+  assert(lob && src);
+  for (const f of OPPORTUNITY_SEGMENTATION_FIELDS) {
+    assertEquals(f.objectNameSingular, "opportunity");
+    assertEquals(f.type, "SELECT");
+  }
+  assertEquals(
+    lob!.options!.map((o) => o.value),
+    ["CONSULTING", "HOSTING", "GAMES"],
+  );
+  assertEquals(
+    src!.options!.map((o) => o.value),
+    [
+      "DIRECT",
+      "REFERRAL",
+      "BRAINTRUST",
+      "RAMP",
+      "CANOPY",
+      "CONSULTING_HANDOFF",
+    ],
+  );
+});
+
+Deno.test("segmentation field specs are all valid per normalizeRequestedOption", () => {
+  // Every declared option must pass the same validation the writer enforces.
+  for (const f of OPPORTUNITY_SEGMENTATION_FIELDS) {
+    const plan = planSelectOptions([], f.options ?? []);
+    assertEquals(plan.added.length, (f.options ?? []).length);
+  }
+});
+
+// --- ensureField / ensureOpportunitySegmentation confirm-gates ---------------
+
+const gateCtx = {
+  globalArgs: {
+    baseUrl: "https://crm.example.com",
+    apiToken: "tok",
+    opportunityStage: "NEW",
+    emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+    emergencyRestrictedRole: "",
+    leadSourceChannel: "",
+  },
+  logger: { debug() {}, info() {}, warning() {}, error() {} },
+  writeResource: () => Promise.resolve({ name: "n" }),
+};
+
+Deno.test("ensureField refuses a real run without confirm:true", async () => {
+  await assertRejects(
+    () =>
+      model.methods.ensureField.execute(
+        {
+          objectNameSingular: "opportunity",
+          name: "lineOfBusiness",
+          type: "SELECT",
+          options: [{ value: "HOSTING" }],
+          confirm: false,
+          dryRun: false,
+        },
+        gateCtx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("ensureOpportunitySegmentation refuses a real run without confirm:true", async () => {
+  await assertRejects(
+    () =>
+      model.methods.ensureOpportunitySegmentation.execute(
+        { confirm: false, dryRun: false },
+        gateCtx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("push_leads fails fast on a non-UPPER_SNAKE leadSourceChannel (before any I/O)", async () => {
+  const badCtx = {
+    ...gateCtx,
+    globalArgs: { ...gateCtx.globalArgs, leadSourceChannel: "direct channel" },
+  };
+  // dryRun:true clears the confirm-gate, so the throw we catch is the config
+  // validation — which runs before any network call.
+  await assertRejects(
+    () =>
+      model.methods.push_leads.execute(
+        {
+          leads: [],
+          kvEntries: [],
+          confirm: false,
+          dryRun: true,
+          maxBatch: 200,
+        },
+        badCtx as never,
+      ),
+    Error,
+    "leadSourceChannel must be UPPER_SNAKE",
+  );
 });

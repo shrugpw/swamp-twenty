@@ -2,6 +2,57 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.10.1
+
+### Added
+
+- **`ensureField`** — the generalized, idempotent field-provisioning foundation
+  (`POST /rest/metadata/fields`) for `TEXT` / `BOOLEAN` / `NUMBER` / `DATE_TIME` /
+  `SELECT`. Non-destructive: an absent field is created; a present scalar field
+  is a no-op (a differing type is **reported**, never mutated); a present `SELECT`
+  gets its options **appended** — existing options preserved verbatim (never
+  dropped, reordered, or recolored), reusing `ensureStageOption`'s append-only +
+  optimistic-concurrency (re-read + drift-abort) discipline. The `SELECT` option
+  planner (`planSelectOptions`) and per-option normalizer
+  (`normalizeRequestedOption`) are pure and unit-tested: values UPPER_SNAKE,
+  colors palette-validated, labels defaulted to the title-cased token, duplicate
+  requested values collapsed, new options positioned after the current max. Field
+  names are camelCase-validated before any write. `confirm`-gated with a no-write
+  `dryRun` (`planned-create` / `planned-append`); wrapped in `redactError`;
+  guarded by the `reachable` live pre-flight. Snapshots a `fieldEnsured` resource.
+- **`ensureOpportunitySegmentation`** — a single fan-out (repo rule 6) that
+  provisions the two Opportunity segmentation `SELECT` fields in one execution
+  (one metadata GET, one lock): **Line of Business** (Consulting / Hosting /
+  Games) and **Source Channel** (Direct / Referral / Braintrust / Ramp / Canopy /
+  Consulting hand-off). Analytics only — NOT a pipeline gate. Append-only, so a
+  re-run is a clean no-op. `confirm`-gated + `dryRun`. Snapshots one
+  `fieldEnsured` per field.
+- **`fieldEnsured` resource** — the per-field outcome (action taken, `SELECT`
+  options added/present, non-mutating drift notes, any type mismatch).
+
+### Changed
+
+- **`ensureLeadFields` is now a thin wrapper over the shared `ensureFieldOnce`
+  core** — same `leadId`/`isEmergency` provisioning, same
+  `created`/`alreadyPresent`/`failed` report shape and per-field resilience, now
+  routed through the one non-destructive path so `ensureField` and
+  `ensureLeadFields` cannot diverge.
+- **`push_leads` stamps `sourceChannel`** on Opportunities it **creates**, from
+  the new `leadSourceChannel` global. Contact-form leads are inbound-direct, so
+  the value is `DIRECT` once the field is provisioned. The global defaults to `""`
+  (do not set), so until the `opportunity.sourceChannel` `SELECT` exists the
+  create body is byte-identical to before — no risk of writing an unprovisioned
+  field. Set only on create (never on an idempotent skip/update).
+
+### Notes
+
+- `globalArguments` gains one **optional** field, `leadSourceChannel` (default
+  `""`), so existing pinned instances upgrade lazily with no behavior change (the
+  `2026.09.10.1` upgrade is a no-op attribute migration).
+- Live PATCH/POST body shape for new `SELECT` options mirrors `ensureStageOption`
+  (each new option carries a client-generated `id`); reconfirm against a live
+  instance before the first `confirm:true` run.
+
 ## 2026.09.08.1
 
 ### Added
