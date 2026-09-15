@@ -420,6 +420,12 @@ const LeadRecordSchema = z.object({
   geo: z.string().default("").describe(
     "Coarse geo string, appended to the Note",
   ),
+  details: z
+    .array(z.object({ label: z.string(), value: z.string() }))
+    .optional()
+    .describe(
+      "Structured label/value extras (Needs/Reason/Timing/Via) rendered as their own labeled lines in the Note. Kept OUT of the free-text message so they are not markdown-escaped into a run-on. Optional on input; the KV adapter populates it.",
+    ),
 }).passthrough();
 type LeadRecord = z.infer<typeof LeadRecordSchema>;
 
@@ -477,15 +483,19 @@ export function leadFromKvRecord(raw: Record<string, unknown>): LeadRecord {
   const needs = Array.isArray(raw.needs)
     ? (raw.needs as unknown[]).map(str).map((x) => x.trim()).filter(Boolean)
     : [];
-  const extras: string[] = [];
-  if (needs.length) extras.push(`Needs: ${needs.join(", ")}`);
-  if (str(raw.reason).trim()) extras.push(`Reason: ${str(raw.reason).trim()}`);
-  if (str(raw.timing).trim()) extras.push(`Timing: ${str(raw.timing).trim()}`);
-  if (source) extras.push(`Via: ${source}`);
-  const baseMsg = str(raw.message).trim();
-  const message = extras.length
-    ? (baseMsg ? `${baseMsg}\n\n— ${extras.join(" · ")}` : extras.join(" · "))
-    : baseMsg;
+  // Structured extras stay as label/value pairs (NOT folded into message) so the
+  // note builder can render them as bold-labeled lines instead of an escaped
+  // run-on. Values are user text — sanitized in planLead, escaped at render.
+  const details: { label: string; value: string }[] = [];
+  if (needs.length) details.push({ label: "Needs", value: needs.join(", ") });
+  if (str(raw.reason).trim()) {
+    details.push({ label: "Reason", value: str(raw.reason).trim() });
+  }
+  if (str(raw.timing).trim()) {
+    details.push({ label: "Timing", value: str(raw.timing).trim() });
+  }
+  if (source) details.push({ label: "Via", value: source });
+  const message = str(raw.message).trim();
 
   return {
     id: str(raw.id),
@@ -498,6 +508,7 @@ export function leadFromKvRecord(raw: Record<string, unknown>): LeadRecord {
     received_at: str(raw.received_at),
     status: str(raw.status) || "new",
     geo,
+    details,
   };
 }
 
@@ -535,6 +546,8 @@ export interface PlannedLeadValid {
   phone: string;
   message: string;
   geo: string;
+  /** Bold-labeled Note lines (Needs/Reason/Timing/Via); values sanitized. */
+  details: { label: string; value: string }[];
   contactType: "individual" | "business" | "emergency";
   emergency: boolean;
   /** Company name to use IF a company is created (business + real domain only). */
@@ -544,6 +557,32 @@ export interface PlannedLeadValid {
 }
 
 export type PlannedLead = PlannedLeadValid | PlannedLeadInvalid;
+
+/**
+ * Build the markdown Note body for a lead: the escaped free-text message, then
+ * each structured field (Needs/Reason/Timing/Via, plus Geo) as its own
+ * bold-labeled line. Labels are trusted/static so they carry the markdown; only
+ * user-supplied values are markdown-escaped (values arrive already sanitized).
+ * Pure so the exact rendering is unit-testable. Returns "" when there's nothing
+ * to say — the caller substitutes an `Inbound lead <id>` placeholder.
+ */
+export function buildLeadNoteBody(
+  p: {
+    message: string;
+    geo: string;
+    details: { label: string; value: string }[];
+  },
+): string {
+  const lines = [...p.details];
+  if (p.geo) lines.push({ label: "Geo", value: p.geo });
+  const block = lines
+    .map((d) => `**${d.label}:** ${escapeMarkdown(d.value)}`)
+    .join("\n\n");
+  return [escapeMarkdown(p.message), block]
+    .filter((s) => s.trim() !== "")
+    .join("\n\n")
+    .trim();
+}
 
 /**
  * Validate + sanitize ONE lead with no I/O. This is step (1) of the push_leads
@@ -584,6 +623,9 @@ export function planLead(
     phone: normalizePhone(lead.phone),
     message: sanitizeText(lead.message, 5000),
     geo: sanitizeText(lead.geo, 200),
+    details: (lead.details ?? [])
+      .map((d) => ({ label: d.label, value: sanitizeText(d.value, 500) }))
+      .filter((d) => d.value !== ""),
     contactType,
     emergency,
     companyName,
@@ -2845,11 +2887,9 @@ async function syncPlannedLead(
   // image/link into the CRM note (tracking-pixel / phishing) once rendered.
   let noteEnsured = false;
   if (!dryRun) {
-    const bodyParts = [escapeMarkdown(p.message)];
-    if (p.geo) bodyParts.push(`\n\n_Geo: ${escapeMarkdown(p.geo)}_`);
     const note = await ensureNoteForLead(cfg, {
       leadId: p.leadId,
-      body: bodyParts.join("").trim() || `Inbound lead ${p.leadId}`,
+      body: buildLeadNoteBody(p) || `Inbound lead ${p.leadId}`,
       personId,
       opportunityId,
     });

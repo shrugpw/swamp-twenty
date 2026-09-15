@@ -17,6 +17,7 @@ import {
   amountFromMicros,
   buildFilterPath,
   canonicalJson,
+  buildLeadNoteBody,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
@@ -353,7 +354,7 @@ Deno.test("leadFromKvRecord adapts a shrugpw record: geo object -> string, null 
   assertEquals(l.message, "Potato engineering"); // no extras to fold
 });
 
-Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, folds needs/reason/timing/source", () => {
+Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, keeps needs/reason/timing/source as structured details", () => {
   const l = leadFromKvRecord({
     id: "sh-1",
     received_at: "2026-09-06T12:00:00.000Z",
@@ -371,14 +372,17 @@ Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, folds
   });
   assertEquals(l.company, "Bob's Roofing"); // org -> company
   assertEquals(l.contact_type, "business"); // inferred from source
-  // Everything lands in the message (=> the Note), nothing dropped.
-  assertEquals(
-    l.message,
-    "Needs: web, files · Reason: broken · Timing: contract's up in March · Via: shrug.host-contact",
-  );
+  // Message stays clean (empty here); extras become labeled Note lines, nothing dropped.
+  assertEquals(l.message, "");
+  assertEquals(l.details, [
+    { label: "Needs", value: "web, files" },
+    { label: "Reason", value: "broken" },
+    { label: "Timing", value: "contract's up in March" },
+    { label: "Via", value: "shrug.host-contact" },
+  ]);
 });
 
-Deno.test("leadFromKvRecord appends extras after a present message and prefers explicit company/contact_type", () => {
+Deno.test("leadFromKvRecord keeps the message verbatim and extras as details; prefers explicit company/contact_type", () => {
   const l = leadFromKvRecord({
     id: "sh-2",
     name: "Dana Fields",
@@ -392,10 +396,52 @@ Deno.test("leadFromKvRecord appends extras after a present message and prefers e
   });
   assertEquals(l.company, "Bob's Roofing LLC");
   assertEquals(l.contact_type, "individual");
+  assertEquals(l.message, "Need to move our email."); // no extras folded in
+  assertEquals(l.details, [
+    { label: "Needs", value: "email" },
+    { label: "Via", value: "shrug.host-contact" },
+  ]);
+});
+
+Deno.test("buildLeadNoteBody: message first, then each field as its own bold-labeled line (Geo included)", () => {
+  const body = buildLeadNoteBody({
+    message: "Need to move our email.",
+    geo: "medford, MA, US",
+    details: [
+      { label: "Needs", value: "web, files" },
+      { label: "Reason", value: "moving" },
+      { label: "Via", value: "shrug.host-contact" },
+    ],
+  });
   assertEquals(
-    l.message,
-    "Need to move our email.\n\n— Needs: email · Via: shrug.host-contact",
+    body,
+    "Need to move our email.\n\n" +
+      "**Needs:** web, files\n\n" +
+      "**Reason:** moving\n\n" +
+      "**Via:** shrug.host-contact\n\n" +
+      "**Geo:** medford, MA, US",
   );
+});
+
+Deno.test("buildLeadNoteBody: empty message + no details/geo yields '' (caller placeholders it)", () => {
+  assertEquals(buildLeadNoteBody({ message: "", geo: "", details: [] }), "");
+});
+
+Deno.test("buildLeadNoteBody: only geo, no message/details", () => {
+  assertEquals(
+    buildLeadNoteBody({ message: "", geo: "boston, MA, US", details: [] }),
+    "**Geo:** boston, MA, US",
+  );
+});
+
+Deno.test("buildLeadNoteBody: a detail value carrying markdown is escaped; the label is not", () => {
+  const body = buildLeadNoteBody({
+    message: "",
+    geo: "",
+    details: [{ label: "Reason", value: "see ![](http://x/p.png) now" }],
+  });
+  assert(body.startsWith("**Reason:** "));
+  assert(!body.includes("]("), body); // link/image syntax neutralized
 });
 
 Deno.test("leadFromKvEntry parses a JSON value; null on non-JSON / empty", () => {
