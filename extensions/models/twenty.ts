@@ -1487,10 +1487,7 @@ async function fetchOpportunityMeta(
   lineOfBusiness: string[];
   sourceChannel: string[];
 }> {
-  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-  const objs = ((json as { data?: unknown }).data ?? []) as Array<
-    Record<string, unknown>
-  >;
+  const objs = await fetchObjectsMeta(cfg);
   const opp = objs.find((o) => String(o.nameSingular ?? "") === "opportunity");
   const fields = (opp?.fields ?? []) as Array<Record<string, unknown>>;
   const list = Array.isArray(fields) ? fields : [];
@@ -1604,10 +1601,7 @@ async function fetchSelectField(
   objectNameSingular: string,
   fieldName: string,
 ): Promise<SelectFieldMeta> {
-  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-  const objs = ((json as { data?: unknown }).data ?? []) as Array<
-    Record<string, unknown>
-  >;
+  const objs = await fetchObjectsMeta(cfg);
   const obj = objs.find((o) =>
     String(o.nameSingular ?? "") === objectNameSingular
   );
@@ -1859,15 +1853,60 @@ function paletteOf(
   }));
 }
 
-/** GET /rest/metadata/objects → the raw object metadata array. */
-async function fetchObjectsMeta(
+/**
+ * GET /rest/metadata/objects → the FULL object metadata array, paginated.
+ *
+ * The metadata endpoint is a cursor connection like the record lists: it returns
+ * at most one page (default first `PAGE_SIZE`) with a top-level
+ * `pageInfo { hasNextPage, endCursor }`. A workspace with more objects than one
+ * page would otherwise be silently truncated — so page through with
+ * `starting_after` until `hasNextPage` is false, accumulating every page's
+ * `.data` array (deduped by id). Guards mirror {@link listFiltered}: stop on a
+ * missing/repeated cursor (untrustworthy) and a page-count backstop, and an
+ * instance that reports no `pageInfo` simply runs one page — identical to the
+ * prior single-GET behavior, so this is a strict superset (no regression).
+ */
+export async function fetchObjectsMeta(
   cfg: TwentyCfg,
 ): Promise<Array<Record<string, unknown>>> {
-  const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-  const objs = ((json as { data?: unknown }).data ?? []) as Array<
-    Record<string, unknown>
-  >;
-  return Array.isArray(objs) ? objs : [];
+  const seen = new Set<string>();
+  const objs: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  // Standard Twenty exposes ~20 objects; a generous backstop guards a
+  // never-terminating cursor without capping any realistic workspace.
+  const maxPages = 50;
+  for (let page = 0; page < maxPages; page++) {
+    const pageCursor = cursor;
+    const path = "/rest/metadata/objects?" +
+      `limit=${PAGE_SIZE}` +
+      (pageCursor ? `&starting_after=${encodeURIComponent(pageCursor)}` : "");
+    const json = await twentyRequest(cfg, "GET", path);
+    const batch = ((json as { data?: unknown }).data ?? []) as Array<
+      Record<string, unknown>
+    >;
+    let newInPage = 0;
+    for (const rec of Array.isArray(batch) ? batch : []) {
+      const id = String(rec.id ?? "");
+      // Metadata rows always carry an id; fall back to nameSingular so a rare
+      // id-less row is still not dropped.
+      const key = id || `name:${String(rec.nameSingular ?? "")}`;
+      if (seen.has(key)) continue;
+      newInPage++;
+      seen.add(key);
+      objs.push(rec);
+    }
+    const pageInfo = (json as {
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    }).pageInfo;
+    // No more pages (or an instance that doesn't paginate metadata) → done.
+    if (!pageInfo?.hasNextPage) break;
+    const endCursor = pageInfo.endCursor;
+    // hasNextPage but an untrustworthy cursor (absent / repeated / no progress):
+    // stop rather than loop forever — return what we have.
+    if (!endCursor || endCursor === pageCursor || newInPage === 0) break;
+    cursor = endCursor;
+  }
+  return objs;
 }
 
 /**
@@ -3202,10 +3241,7 @@ export const model = {
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
-        const json = await twentyRequest(cfg, "GET", "/rest/metadata/objects");
-        const objs = ((json as { data?: unknown }).data ?? []) as Array<
-          Record<string, unknown>
-        >;
+        const objs = await fetchObjectsMeta(cfg);
         const byName = new Map<string, Record<string, unknown>>();
         for (const o of objs) byName.set(String(o.nameSingular ?? ""), o);
 

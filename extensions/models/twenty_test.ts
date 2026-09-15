@@ -22,6 +22,7 @@ import {
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
   escapeMarkdown,
+  fetchObjectsMeta,
   isBlockedDomain,
   isFilterSafe,
   leadFromKvEntry,
@@ -2556,6 +2557,104 @@ Deno.test("listFiltered cap-reached => whole page, truncated + hasMore + boundar
     assertEquals(p.stopReason, "cap-reached");
     // Continuation is available => NOT incomplete (CR-A-3).
     assertEquals(p.incomplete, false);
+  } finally {
+    restore();
+  }
+});
+
+// Serve scripted metadata pages: /rest/metadata/objects returns `data` as a
+// FLAT object array (not `{[plural]: items}` like record lists) plus a top-level
+// pageInfo. page 0 has no cursor; starting_after=<endCursor of page n> => page n+1.
+// `omitPageInfo` models an instance that does not paginate metadata at all.
+function serveMetaPages(
+  pages: Array<
+    {
+      objects: Array<Record<string, unknown>>;
+      endCursor?: string;
+      hasNextPage: boolean;
+    }
+  >,
+  omitPageInfo = false,
+) {
+  return stubFetchStatus((_method, path) => {
+    const m = path.match(/starting_after=([^&]+)/);
+    let idx = 0;
+    if (m) {
+      const cur = decodeURIComponent(m[1]);
+      idx = pages.findIndex((p) => p.endCursor === cur) + 1;
+    }
+    const pg = pages[idx] ?? { objects: [], hasNextPage: false };
+    const body: Record<string, unknown> = { data: pg.objects };
+    if (!omitPageInfo) {
+      body.pageInfo = { hasNextPage: pg.hasNextPage, endCursor: pg.endCursor };
+    }
+    return { body };
+  });
+}
+
+Deno.test("fetchObjectsMeta assembles ALL metadata pages, deduped by id", async () => {
+  const { calls, restore } = serveMetaPages([
+    {
+      objects: [{ id: "o1", nameSingular: "person" }, {
+        id: "o2",
+        nameSingular: "company",
+      }],
+      endCursor: "m0",
+      hasNextPage: true,
+    },
+    // 'o2' repeats across the boundary — must be deduped, not double-counted.
+    {
+      objects: [{ id: "o2", nameSingular: "company" }, {
+        id: "o3",
+        nameSingular: "opportunity",
+      }],
+      endCursor: "m1",
+      hasNextPage: false,
+    },
+  ]);
+  try {
+    const objs = await fetchObjectsMeta(LF_CFG);
+    assertEquals(objs.map((o) => o.nameSingular), [
+      "person",
+      "company",
+      "opportunity",
+    ]);
+    // Two pages fetched (page 0 + the continuation).
+    assertEquals(calls.length, 2);
+    // The continuation carried the first page's endCursor.
+    assert(calls[1].path.includes("starting_after=m0"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("fetchObjectsMeta single page (no pageInfo) => one GET, no regression", async () => {
+  const { calls, restore } = serveMetaPages(
+    [{
+      objects: [{ id: "o1", nameSingular: "person" }],
+      hasNextPage: false,
+    }],
+    true, // omit pageInfo entirely — the pre-pagination server shape
+  );
+  try {
+    const objs = await fetchObjectsMeta(LF_CFG);
+    assertEquals(objs.map((o) => o.nameSingular), ["person"]);
+    assertEquals(calls.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("fetchObjectsMeta stops on a repeated cursor (no infinite loop)", async () => {
+  const { calls, restore } = serveMetaPages([
+    { objects: [{ id: "o1" }], endCursor: "same", hasNextPage: true },
+    { objects: [{ id: "o2" }], endCursor: "same", hasNextPage: true },
+  ]);
+  try {
+    const objs = await fetchObjectsMeta(LF_CFG);
+    // page 0 consumed; page 1 fetched but its repeated cursor halts advance.
+    assertEquals(objs.map((o) => o.id), ["o1", "o2"]);
+    assertEquals(calls.length, 2);
   } finally {
     restore();
   }
