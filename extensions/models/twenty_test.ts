@@ -3382,6 +3382,62 @@ Deno.test("ensureObject confirm create: POSTs the object body, records created +
   }
 });
 
+Deno.test("ensureObject confirm create: POST response lacks id => objectId resolved via post-create re-GET", async () => {
+  // Regression for the v2.38.x envelope: the create POST returns a shape whose
+  // id our best-effort extraction MISSES, so objectId must come from the
+  // authoritative objects-list re-GET (matched by nameSingular). The GET is
+  // stateful: the idempotency read (1st) does NOT contain the object (so we take
+  // the create path); the post-create read-back (2nd) DOES, carrying its id.
+  let getCount = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      getCount += 1;
+      if (getCount === 1) {
+        return {
+          body: objectsMeta([{ nameSingular: "opportunity", id: "o1" }]),
+        };
+      }
+      return {
+        body: objectsMeta([
+          { nameSingular: "opportunity", id: "o1" },
+          {
+            nameSingular: "invoice",
+            namePlural: "invoices",
+            id: "obj-readback",
+          },
+        ]),
+      };
+    }
+    if (method === "POST" && path === "/rest/metadata/objects") {
+      // Envelope our data.id / createOneObject.id / createObject.id guesses miss.
+      return { body: { data: { object: { id: "unread-nested" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureObject.execute(
+      {
+        nameSingular: "invoice",
+        namePlural: "invoices",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    // objectId comes from the re-GET-by-name, NOT the (unrecognized) envelope.
+    assertEquals(writes[0].data.objectId, "obj-readback");
+    assert(
+      calls.some((c) => c.method === "POST"),
+      "expected a POST to create the object",
+    );
+    assertEquals(getCount, 2, "expected a post-create read-back GET");
+  } finally {
+    restore();
+  }
+});
+
 Deno.test("ensureObject rejects a non-camelCase nameSingular before any I/O", async () => {
   const { calls, restore } = stubFetchStatus(() => ({}));
   const { ctx } = readCtx();

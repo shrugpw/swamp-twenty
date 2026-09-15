@@ -2894,7 +2894,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.15.1",
+  version: "2026.09.15.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -2959,6 +2959,14 @@ export const model = {
       toVersion: "2026.09.15.1",
       description:
         "Add the schema-provisioning methods ensureObject (idempotent create/ensure of a custom object, dryRun/confirm-gated) and ensureRelation (idempotent create/ensure of a RELATION field between two objects, single call provisions both sides), plus the computeMetadataNameFromLabel helper for reverse-name collision pre-check. Additive methods and resources only; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.15.2",
+      description:
+        "Fix ensureObject recording objectId:null after a live create: the create POST response envelope (Twenty v2.38.x) does not match the best-effort id extraction, so objectId is now resolved deterministically by re-reading the authoritative objects list and matching nameSingular/namePlural (mirrors ensureRelation's created-path read-back). Behavior-only fix; no method/argument/resource shape changes, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -5441,15 +5449,30 @@ export const model = {
             "/rest/metadata/objects",
             payload,
           );
-          // Twenty's metadata create response shape varies; read the new id
-          // defensively (never fatal if absent — the create already succeeded).
+          // Twenty's metadata create response shape varies; try the envelope as
+          // a best-effort first pass (never fatal if absent — the create already
+          // succeeded).
           const created = ((resp as { data?: unknown }).data ?? {}) as Record<
             string,
             unknown
           >;
           const nested = (created.createOneObject ?? created.createObject ??
             {}) as Record<string, unknown>;
-          const newId = String(created.id ?? nested.id ?? "");
+          let newId = String(created.id ?? nested.id ?? "");
+          // Envelope guesses miss the real v2.38.x response shape, so don't trust
+          // them: re-read the authoritative objects list and resolve the new id
+          // by matching nameSingular/namePlural (mirrors ensureRelation's
+          // created-path read-back). This makes objectId deterministic
+          // regardless of the POST response envelope.
+          if (!newId) {
+            const objs2 = await fetchObjectsMeta(cfg);
+            const createdObj = objs2.find(
+              (o) =>
+                String(o.nameSingular ?? "") === nameSingular ||
+                String(o.namePlural ?? "") === namePlural,
+            );
+            if (createdObj) newId = String(createdObj.id ?? "");
+          }
           snapshot.action = "created";
           if (newId) snapshot.objectId = newId;
           context.logger.info(
