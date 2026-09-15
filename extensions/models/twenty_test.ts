@@ -941,15 +941,32 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     closeDate: "2026-12-31T00:00:00.000Z",
     companyId: "co1",
     pointOfContactId: "poc1",
+    lineOfBusiness: "HOSTING",
+    sourceChannel: "UPWORK",
+    isEmergency: false,
   });
   assertEquals(v.id, "opp1");
   assertEquals(v.stage, "PROPOSAL");
   assertAlmostEquals(v.amount!, 43478.26, 1e-6);
   assertEquals(v.currencyCode, "USD");
-  // A record with no amount composite omits amount/currencyCode.
-  const bare = mapOppView({ id: "opp2", name: "x", stage: "NEW" });
+  // Custom/segmentation SELECTs surfaced from flat scalars; isEmergency even when false.
+  assertEquals(v.lineOfBusiness, "HOSTING");
+  assertEquals(v.sourceChannel, "UPWORK");
+  assertEquals(v.isEmergency, false);
+  // A record with no amount composite omits amount/currencyCode; unset
+  // segmentation SELECTs are omitted; absent isEmergency stays undefined.
+  const bare = mapOppView({
+    id: "opp2",
+    name: "x",
+    stage: "NEW",
+    lineOfBusiness: "",
+    sourceChannel: null,
+  });
   assertEquals("amount" in bare, false);
   assertEquals("currencyCode" in bare, false);
+  assertEquals("lineOfBusiness" in bare, false);
+  assertEquals("sourceChannel" in bare, false);
+  assertEquals("isEmergency" in bare, false);
 });
 
 Deno.test("titleCaseToken title-cases an option token", () => {
@@ -1624,6 +1641,64 @@ Deno.test("ensureStageOption present-with-mismatch: reports note, no mutation", 
     assertEquals(writes[0].data.action, "present");
     assert(String(writes[0].data.mismatchNote ?? "").includes("Done"));
     assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureStageOption reconcile: updates a drifted option in place, others preserved", async () => {
+  const withClosed = [...STAGE_OPTS, {
+    id: "o6",
+    value: "CLOSED",
+    label: "Done",
+    color: "red",
+    position: 5,
+  }];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: stageMeta(withClosed) };
+    }
+    if (method === "PATCH" && path === "/rest/metadata/fields/fld1") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureStageOption.execute(
+      {
+        ...STAGE_ARGS,
+        value: "CLOSED",
+        label: "Closed",
+        color: "gray",
+        confirm: true,
+        reconcile: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "updated");
+    assertEquals("mismatchNote" in writes[0].data, false);
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals(Object.keys(body), ["options"]); // options-only PATCH
+    const opts = body.options as Array<
+      { id?: string; value: string; label: string; color: string }
+    >;
+    assertEquals(opts.length, 6); // no add
+    // The 5 originals survive verbatim.
+    for (const orig of STAGE_OPTS) {
+      const kept = opts.find((o) => o.value === orig.value);
+      assert(kept, `dropped ${orig.value}`);
+      assertEquals(kept!.id, orig.id);
+      assertEquals(kept!.label, orig.label);
+      assertEquals(kept!.color, orig.color);
+    }
+    // CLOSED reconciled in place: same id, new label+color.
+    const closed = opts.find((o) => o.value === "CLOSED");
+    assertEquals(closed!.id, "o6");
+    assertEquals(closed!.label, "Closed");
+    assertEquals(closed!.color, "gray");
   } finally {
     restore();
   }
@@ -2973,14 +3048,56 @@ Deno.test("planSelectOptions is a no-op when every requested option is present",
   assertEquals(plan.mismatches, []);
 });
 
-Deno.test("planSelectOptions reports a label/color mismatch but never mutates it", () => {
+Deno.test("planSelectOptions reconciles a drifted option in place by default (id/position preserved)", () => {
   const plan = planSelectOptions(existingOpts, [
     { value: "HOSTING", label: "Hosting Plans", color: "red" },
   ]);
   assertEquals(plan.added, []);
+  assertEquals(plan.mismatches, []); // reconciled, not reported
+  assertEquals(plan.updated.length, 1);
+  assertEquals(plan.updated[0], {
+    id: "id-b", // id preserved
+    value: "HOSTING",
+    label: "Hosting Plans", // new label
+    color: "red", // new color
+    position: 1, // position preserved
+  });
+  // merged reflects the reconciled option in place, CONSULTING untouched.
+  assertEquals(plan.merged[0], existingOpts[0]);
+  assertEquals(plan.merged[1], {
+    id: "id-b",
+    value: "HOSTING",
+    label: "Hosting Plans",
+    color: "red",
+    position: 1,
+  });
+  assertEquals(plan.merged.length, 2); // no append
+});
+
+Deno.test("planSelectOptions reconcile:false reports a label/color mismatch but never mutates it", () => {
+  const plan = planSelectOptions(existingOpts, [
+    { value: "HOSTING", label: "Hosting Plans", color: "red" },
+  ], { reconcile: false });
+  assertEquals(plan.added, []);
+  assertEquals(plan.updated, []);
   assertEquals(plan.merged, existingOpts); // unchanged
   assertEquals(plan.mismatches.length, 1);
   assert(plan.mismatches[0].includes("HOSTING"));
+});
+
+Deno.test("planSelectOptions reconciles a drift AND appends a new option together", () => {
+  const plan = planSelectOptions(existingOpts, [
+    { value: "HOSTING", label: "Hosting", color: "red" }, // color drift
+    { value: "GAMES", label: "Games", color: "purple" }, // new
+  ]);
+  assertEquals(plan.updated.map((o) => o.value), ["HOSTING"]);
+  assertEquals(plan.added.map((o) => o.value), ["GAMES"]);
+  assertEquals(plan.added[0].position, 2); // appended after max
+  assertEquals(plan.mismatches, []);
+  // merged: existing (HOSTING recolored) + appended GAMES (id-less).
+  assertEquals(plan.merged.length, 3);
+  assertEquals((plan.merged[1] as { color: string }).color, "red");
+  assertEquals((plan.merged[2] as { id?: string }).id, undefined);
 });
 
 Deno.test("planSelectOptions creates all options from an empty field, positions 0..n", () => {
@@ -3046,8 +3163,18 @@ Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the two Opportunity SELECTs"
       "BRAINTRUST",
       "RAMP",
       "CANOPY",
+      "UPWORK",
       "CONSULTING_HANDOFF",
     ],
+  );
+  // UPWORK/CONSULTING_HANDOFF carry deliberate (non-default) colors.
+  assertEquals(
+    src!.options!.find((o) => o.value === "UPWORK")!.color,
+    "green",
+  );
+  assertEquals(
+    src!.options!.find((o) => o.value === "CONSULTING_HANDOFF")!.color,
+    "purple",
   );
 });
 
@@ -3085,6 +3212,7 @@ Deno.test("ensureField refuses a real run without confirm:true", async () => {
           options: [{ value: "HOSTING" }],
           confirm: false,
           dryRun: false,
+          reconcile: true,
         },
         gateCtx as never,
       ),
@@ -3097,7 +3225,7 @@ Deno.test("ensureOpportunitySegmentation refuses a real run without confirm:true
   await assertRejects(
     () =>
       model.methods.ensureOpportunitySegmentation.execute(
-        { confirm: false, dryRun: false },
+        { confirm: false, dryRun: false, reconcile: true },
         gateCtx as never,
       ),
     Error,

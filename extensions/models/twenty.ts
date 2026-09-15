@@ -1056,6 +1056,12 @@ export interface OppView {
   currencyCode?: string;
   closeDate?: string;
   companyId?: string;
+  // Custom/segmentation SELECT fields (flat option-value scalars in Twenty REST)
+  // + the emergency marker — surfaced so a reconcile can read back what a write
+  // set without dropping to the Twenty UI.
+  lineOfBusiness?: string;
+  sourceChannel?: string;
+  isEmergency?: boolean;
 }
 
 /** Map a raw Opportunity REST record to the compact {@link OppView}. */
@@ -1071,6 +1077,16 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   if (currencyCode) v.currencyCode = currencyCode;
   if (rec.closeDate) v.closeDate = String(rec.closeDate);
   if (rec.companyId) v.companyId = String(rec.companyId);
+  // Segmentation SELECTs are flat option-value strings; empty/unset => omit.
+  if (rec.lineOfBusiness != null && rec.lineOfBusiness !== "") {
+    v.lineOfBusiness = String(rec.lineOfBusiness);
+  }
+  if (rec.sourceChannel != null && rec.sourceChannel !== "") {
+    v.sourceChannel = String(rec.sourceChannel);
+  }
+  // Surface isEmergency even when false (mirrors mapPersonView) so consumers can
+  // reason about the flag without a second read.
+  if (rec.isEmergency != null) v.isEmergency = Boolean(rec.isEmergency);
   return v;
 }
 
@@ -1642,11 +1658,23 @@ interface FieldEnsureOutcome {
     | "present"
     | "planned-create"
     | "options-appended"
-    | "planned-append";
+    | "planned-append"
+    | "options-reconciled"
+    | "planned-reconcile";
   optionsAdded: string[];
+  optionsUpdated: string[];
   optionsPresent: string[];
   mismatchNotes: string[];
   typeMismatch?: string;
+  // For a SELECT: the resulting (or, on dryRun, planned) full option set WITH
+  // colors — so a recolor/append is verifiable straight from this snapshot
+  // without a second read or the Twenty UI. Undefined for non-SELECT fields.
+  options?: Array<{
+    value: string;
+    label: string;
+    color: string;
+    position: number;
+  }>;
 }
 
 /**
@@ -1681,28 +1709,35 @@ export function normalizeRequestedOption(
 }
 
 /**
- * PURE append-only SELECT-option planner — the shared discipline ensureField
- * relies on, matching ensureStageOption's guarantee: existing options are kept
- * VERBATIM (never dropped, reordered, or recolored) and only genuinely-new
- * options are appended after the current max position. A requested option whose
- * value already exists is a no-op; a differing label/color is REPORTED
- * (mismatches) and left unchanged. New options carry no id (the impure caller
- * mints one before the write). Duplicate requested values are collapsed. Throws
- * (via normalizeRequestedOption) on any invalid requested option, so a
- * partially-built plan never reaches a write.
+ * PURE SELECT-option planner — the shared discipline ensureField relies on.
+ * Genuinely-new options are appended after the current max position. A requested
+ * option whose value already exists but differs in label/color is, by default
+ * (`reconcile`), RECONCILED IN PLACE: its id and position are preserved and the
+ * new label+color are applied — swamp is the source of truth for these
+ * model-owned options, so a drift is corrected, not merely reported. (The old
+ * append-only "never recolor" guard only mattered when a human might hand-edit
+ * options in the Twenty UI; pass `reconcile:false` to restore it — the drift is
+ * then REPORTED via `mismatches` and left unchanged.) An exact match is always a
+ * no-op. New options carry no id (the impure caller mints one before the write).
+ * Duplicate requested values are collapsed. Throws (via normalizeRequestedOption)
+ * on any invalid requested option, so a partially-built plan never reaches a write.
  */
 export function planSelectOptions(
   existing: SelectOption[],
   requested: RequestedOption[],
+  opts: { reconcile?: boolean } = {},
 ): {
   merged: SelectOption[];
   added: PlannedOption[];
+  updated: SelectOption[];
   present: string[];
   mismatches: string[];
 } {
+  const reconcile = opts.reconcile ?? true;
   const byValue = new Map(existing.map((o) => [o.value, o]));
   let maxPos = existing.reduce((m, o) => Math.max(m, o.position), -1);
   const added: PlannedOption[] = [];
+  const updated: SelectOption[] = [];
   const present: string[] = [];
   const mismatches: string[] = [];
   const seen = new Set<string>();
@@ -1714,18 +1749,45 @@ export function planSelectOptions(
     if (hit) {
       present.push(norm.value);
       if (hit.label !== norm.label || hit.color !== norm.color) {
-        mismatches.push(
-          `Option '${norm.value}' exists with label='${hit.label}' color='${hit.color}'; ` +
-            `requested label='${norm.label}' color='${norm.color}' — left unchanged (no mutation).`,
-        );
+        if (reconcile) {
+          updated.push({ ...hit, label: norm.label, color: norm.color });
+        } else {
+          mismatches.push(
+            `Option '${norm.value}' exists with label='${hit.label}' color='${hit.color}'; ` +
+              `requested label='${norm.label}' color='${norm.color}' — left unchanged (no mutation).`,
+          );
+        }
       }
       continue;
     }
     maxPos += 1;
     added.push({ ...norm, position: maxPos });
   }
-  const merged: SelectOption[] = [...existing, ...added.map((o) => ({ ...o }))];
-  return { merged, added, present, mismatches };
+  const updatedByValue = new Map(updated.map((o) => [o.value, o]));
+  const merged: SelectOption[] = [
+    ...existing.map((o) => updatedByValue.get(o.value) ?? o),
+    ...added.map((o) => ({ ...o })),
+  ];
+  return { merged, added, updated, present, mismatches };
+}
+
+/**
+ * Project a SELECT option set down to the palette shape
+ * (value/label/color/position), dropping any id — used to record the verifiable
+ * resulting-options snapshot so a recolor/append can be confirmed without a
+ * second read or the Twenty UI.
+ */
+function paletteOf(
+  opts: ReadonlyArray<
+    { value: string; label: string; color: string; position: number }
+  >,
+): Array<{ value: string; label: string; color: string; position: number }> {
+  return opts.map(({ value, label, color, position }) => ({
+    value,
+    label,
+    color,
+    position,
+  }));
 }
 
 /** GET /rest/metadata/objects → the raw object metadata array. */
@@ -1760,6 +1822,7 @@ async function ensureFieldOnce(
   spec: FieldSpec,
   dryRun: boolean,
   objectsSnapshot?: Array<Record<string, unknown>>,
+  reconcile = true,
 ): Promise<FieldEnsureOutcome> {
   const name = String(spec.name ?? "").trim();
   if (!FIELD_NAME_RE.test(name)) {
@@ -1811,6 +1874,7 @@ async function ensureFieldOnce(
     type: spec.type,
     action: "present",
     optionsAdded: [],
+    optionsUpdated: [],
     optionsPresent: [],
     mismatchNotes: [],
   };
@@ -1839,6 +1903,7 @@ async function ensureFieldOnce(
       }));
       out.optionsAdded = withIds.map((o) => o.value);
       body.options = withIds;
+      out.options = paletteOf(withIds);
     }
     if (dryRun) {
       out.action = "planned-create";
@@ -1861,18 +1926,28 @@ async function ensureFieldOnce(
     return out;
   }
 
-  // PRESENT SELECT — append-only, reusing ensureStageOption's read/plan/PATCH.
+  // PRESENT SELECT — append new options + (by default) reconcile drifted ones,
+  // reusing ensureStageOption's read/plan/PATCH discipline.
   const field = await fetchSelectField(cfg, spec.objectNameSingular, name);
-  const plan = planSelectOptions(field.options, requested);
+  const plan = planSelectOptions(field.options, requested, { reconcile });
   out.optionsPresent = plan.present;
+  out.optionsUpdated = plan.updated.map((o) => o.value);
   out.mismatchNotes = plan.mismatches;
-  if (plan.added.length === 0) {
+  // The resulting palette (with colors) either way: unchanged live set on a
+  // no-op, or the reconciled/appended plan.merged when there's a write.
+  out.options = paletteOf(
+    plan.added.length === 0 && plan.updated.length === 0
+      ? field.options
+      : plan.merged,
+  );
+  if (plan.added.length === 0 && plan.updated.length === 0) {
     out.action = "present";
     return out;
   }
   out.optionsAdded = plan.added.map((o) => o.value);
+  const appending = plan.added.length > 0;
   if (dryRun) {
-    out.action = "planned-append";
+    out.action = appending ? "planned-append" : "planned-reconcile";
     return out;
   }
   // Optimistic concurrency: re-read immediately before the write and abort if the
@@ -1883,16 +1958,17 @@ async function ensureFieldOnce(
       `Options for '${spec.objectNameSingular}.${name}' changed between read and write (concurrent edit); aborting to avoid a lossy overwrite. Re-run.`,
     );
   }
-  const merged: SelectOption[] = [
-    ...field.options,
-    ...plan.added.map((o) => ({ id: crypto.randomUUID(), ...o })),
-  ];
+  // plan.merged = existing options (ids + positions preserved, label/color
+  // reconciled in place) followed by appended options (id-less — mint here).
+  const merged: SelectOption[] = plan.merged.map((o) =>
+    (o as { id?: string }).id ? o : { id: crypto.randomUUID(), ...o }
+  );
   // options-only PATCH — Twenty's metadata field PATCH is a partial update, so
   // sibling attributes (name/label/type/isNullable) survive. We send ONLY options.
   await twentyRequest(cfg, "PATCH", `/rest/metadata/fields/${field.fieldId}`, {
     options: merged,
   });
-  out.action = "options-appended";
+  out.action = appending ? "options-appended" : "options-reconciled";
   return out;
 }
 
@@ -1925,10 +2001,11 @@ export const OPPORTUNITY_SEGMENTATION_FIELDS: ReadonlyArray<FieldSpec> = [
       { value: "BRAINTRUST", label: "Braintrust", color: "orange" },
       { value: "RAMP", label: "Ramp", color: "yellow" },
       { value: "CANOPY", label: "Canopy", color: "pink" },
+      { value: "UPWORK", label: "Upwork", color: "green" },
       {
         value: "CONSULTING_HANDOFF",
         label: "Consulting hand-off",
-        color: "gray",
+        color: "purple",
       },
     ],
   },
@@ -2223,6 +2300,9 @@ const OpportunityRefSchema = z.object({
   closeDate: z.string().optional(),
   companyId: z.string().optional(),
   pointOfContactId: z.string().optional(),
+  lineOfBusiness: z.string().optional(),
+  sourceChannel: z.string().optional(),
+  isEmergency: z.boolean().optional(),
   retrievedAt: z.iso.datetime(),
 });
 
@@ -2235,6 +2315,9 @@ const OppViewSchema = z.object({
   currencyCode: z.string().optional(),
   closeDate: z.string().optional(),
   companyId: z.string().optional(),
+  lineOfBusiness: z.string().optional(),
+  sourceChannel: z.string().optional(),
+  isEmergency: z.boolean().optional(),
 });
 
 const OpportunityListSchema = z.object({
@@ -2368,12 +2451,18 @@ const StageOptionSchema = z.object({
   value: z.string(),
   label: z.string(),
   color: z.string(),
-  action: z.enum(["present", "created", "planned-create"]),
+  action: z.enum([
+    "present",
+    "created",
+    "planned-create",
+    "updated",
+    "planned-update",
+  ]),
   mismatchNote: z
     .string()
     .optional()
     .describe(
-      "Set when the value already exists with a different label/color (left unchanged)",
+      "Set when the value already exists with a different label/color AND reconcile:false (left unchanged)",
     ),
   options: z
     .array(
@@ -2401,18 +2490,38 @@ const FieldEnsuredSchema = z.object({
     "planned-create",
     "options-appended",
     "planned-append",
+    "options-reconciled",
+    "planned-reconcile",
   ]),
   dryRun: z.boolean(),
   optionsAdded: z
     .array(z.string())
     .describe("SELECT option values created/appended this run (or planned)"),
+  optionsUpdated: z
+    .array(z.string())
+    .describe(
+      "Existing SELECT option values reconciled in place (label/color updated) this run (or planned)",
+    ),
   optionsPresent: z
     .array(z.string())
     .describe("SELECT option values that already existed"),
   mismatchNotes: z
     .array(z.string())
     .describe(
-      "Non-mutating notes: an existing option whose label/color differed from the request",
+      "Non-mutating notes (reconcile:false only): an existing option whose label/color differed from the request",
+    ),
+  options: z
+    .array(
+      z.object({
+        value: z.string(),
+        label: z.string(),
+        color: z.string(),
+        position: z.number(),
+      }),
+    )
+    .optional()
+    .describe(
+      "SELECT only: the resulting (or planned, on dryRun) full option set WITH colors — lets a recolor/append be verified from this snapshot",
     ),
   typeMismatch: z
     .string()
@@ -2976,7 +3085,7 @@ export const model = {
     },
     ensureStageOption: {
       description:
-        "Idempotently ensure a SELECT option exists on an allowlisted picklist field (default opportunity.stage), so an Opportunity can be set to a stage the workspace didn't ship with (e.g. CLOSED). Reads the field's FULL option set and appends the new option, preserving every existing option (id/label/color/position) verbatim — never a drop, reorder, or recolor. If the value already exists it is a no-op (action:present; a differing label/color is reported, never mutated). Confirm-gated (mutates workspace metadata); dryRun previews the planned option array without writing. SELECT-only; MULTI_SELECT and unknown targets are rejected. Snapshots a `stageOption` resource.",
+        "Idempotently ensure a SELECT option exists on an allowlisted picklist field (default opportunity.stage), so an Opportunity can be set to a stage the workspace didn't ship with (e.g. CLOSED). Reads the field's FULL option set and appends the new option, preserving every OTHER existing option (id/label/color/position) verbatim — never a drop or reorder. If the value already exists with a differing label/color it is, by default (reconcile), updated IN PLACE (id/position preserved) since swamp owns the option; pass reconcile:false for strict append-only (the drift is reported, never applied). An exact match is a no-op. Confirm-gated (mutates workspace metadata); dryRun previews the planned option array without writing. SELECT-only; MULTI_SELECT and unknown targets are rejected. Snapshots a `stageOption` resource.",
       arguments: z.object({
         objectNameSingular: z
           .string()
@@ -3012,6 +3121,12 @@ export const model = {
           .boolean()
           .default(false)
           .describe("Preview the planned option array; write nothing"),
+        reconcile: z
+          .boolean()
+          .default(true)
+          .describe(
+            "When the option already exists with a different label/color, update it in place (swamp is the source of truth). Set false for strict append-only (drift reported, never applied).",
+          ),
       }),
       execute: async (
         args: {
@@ -3023,6 +3138,7 @@ export const model = {
           position?: number;
           confirm: boolean;
           dryRun: boolean;
+          reconcile: boolean;
         },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
@@ -3069,17 +3185,52 @@ export const model = {
           );
           const existing = field.options.find((o) => o.value === value);
 
-          let action: "present" | "created" | "planned-create";
+          let action:
+            | "present"
+            | "created"
+            | "planned-create"
+            | "updated"
+            | "planned-update";
           let mismatchNote: string | undefined;
           let resultOptions: SelectOption[];
 
           if (existing) {
-            action = "present";
-            resultOptions = field.options;
-            if (existing.label !== label || existing.color !== color) {
-              mismatchNote =
-                `Option '${value}' already exists with label='${existing.label}' color='${existing.color}'; ` +
-                `requested label='${label}' color='${color}' — left unchanged (no mutation).`;
+            const drift = existing.label !== label || existing.color !== color;
+            if (drift && args.reconcile) {
+              // Reconcile in place: preserve id/position, apply requested
+              // label+color. swamp is the source of truth for this option.
+              resultOptions = field.options.map((o) =>
+                o.value === value ? { ...o, label, color } : o
+              );
+              if (args.dryRun) {
+                action = "planned-update";
+              } else {
+                const fresh = await fetchSelectField(
+                  cfg,
+                  args.objectNameSingular,
+                  args.fieldName,
+                );
+                if (!optionsEquivalent(fresh.options, field.options)) {
+                  throw new Error(
+                    `Options for '${target}' changed between read and write (concurrent edit); aborting to avoid a lossy overwrite. Re-run.`,
+                  );
+                }
+                await twentyRequest(
+                  cfg,
+                  "PATCH",
+                  `/rest/metadata/fields/${field.fieldId}`,
+                  { options: resultOptions },
+                );
+                action = "updated";
+              }
+            } else {
+              action = "present";
+              resultOptions = field.options;
+              if (drift) {
+                mismatchNote =
+                  `Option '${value}' already exists with label='${existing.label}' color='${existing.color}'; ` +
+                  `requested label='${label}' color='${color}' — left unchanged (no mutation).`;
+              }
             }
           } else {
             const maxPos = field.options.reduce(
@@ -3426,7 +3577,7 @@ export const model = {
     },
     getOpportunity: {
       description:
-        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId); found:false + no fields on a miss. No writes.",
+        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId) plus the segmentation SELECTs (lineOfBusiness, sourceChannel) and isEmergency when set — so a written custom-field value is read-back verifiable; found:false + no fields on a miss. No writes.",
       arguments: z
         .object({
           leadId: z.string().optional().describe(
@@ -3479,6 +3630,11 @@ export const model = {
             if (opp.pointOfContactId) {
               snap.pointOfContactId = String(opp.pointOfContactId);
             }
+            if (view.lineOfBusiness) snap.lineOfBusiness = view.lineOfBusiness;
+            if (view.sourceChannel) snap.sourceChannel = view.sourceChannel;
+            if (view.isEmergency !== undefined) {
+              snap.isEmergency = view.isEmergency;
+            }
             name = `opportunity-${id}`;
           } else {
             if (byLeadId) snap.leadId = byLeadId;
@@ -3499,7 +3655,7 @@ export const model = {
     },
     listOpportunities: {
       description:
-        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views + a `truncated` flag. No writes, no per-id loop.",
+        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views (id/leadId/name/stage/amount/currency/closeDate/companyId + segmentation lineOfBusiness/sourceChannel + isEmergency when set) + a `truncated` flag. No writes, no per-id loop.",
       arguments: z.object({
         companyId: z.string().optional().describe("Filter: company UUID"),
         stage: z.string().optional().describe(
@@ -4150,7 +4306,7 @@ export const model = {
           .string()
           .optional()
           .describe(
-            "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, BRAINTRUST, RAMP, CANOPY, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
+            "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, BRAINTRUST, RAMP, CANOPY, UPWORK, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
           ),
         closeDate: z
           .string()
@@ -4741,7 +4897,7 @@ export const model = {
     },
     ensureField: {
       description:
-        "Idempotently provision ONE custom field on an object via POST /rest/metadata/fields — the generalized foundation ensureLeadFields is now a thin wrapper over. Supports TEXT / BOOLEAN / NUMBER / DATE_TIME / SELECT. Non-destructive: an absent field is created; a present scalar field is a no-op (a differing type is reported, never mutated); a present SELECT gets its options APPENDED (existing options preserved verbatim — never dropped, reordered, or recolored, reusing ensureStageOption's append-only + optimistic-concurrency discipline). SELECT requires an options array; option values are UPPER_SNAKE, colors palette-validated, labels defaulted to the title-cased token. confirm:true is required for a real run; dryRun:true validates + plans (planned-create / planned-append) and writes nothing. Snapshots a `fieldEnsured` resource.",
+        "Idempotently provision ONE custom field on an object via POST /rest/metadata/fields — the generalized foundation ensureLeadFields is now a thin wrapper over. Supports TEXT / BOOLEAN / NUMBER / DATE_TIME / SELECT. Non-destructive to structure: an absent field is created; a present scalar field is a no-op (a differing type is reported, never mutated); a present SELECT gets NEW options APPENDED and, by default (reconcile), existing options whose label/color drifted RECONCILED in place (id/position preserved) — options are never dropped or reordered, reusing ensureStageOption's optimistic-concurrency discipline. Pass reconcile:false for strict append-only (drift reported, never applied). SELECT requires an options array; option values are UPPER_SNAKE, colors palette-validated, labels defaulted to the title-cased token. confirm:true is required for a real run; dryRun:true validates + plans (planned-create / planned-append / planned-reconcile) and writes nothing. Snapshots a `fieldEnsured` resource.",
       arguments: z.object({
         objectNameSingular: z
           .string()
@@ -4785,6 +4941,12 @@ export const model = {
           .boolean()
           .default(false)
           .describe("Preview the plan; write nothing"),
+        reconcile: z
+          .boolean()
+          .default(true)
+          .describe(
+            "For a present SELECT, when an existing option's label/color differs from requested, update it in place (swamp is the source of truth). Set false for strict append-only (drift reported, never applied).",
+          ),
       }),
       execute: async (
         args: {
@@ -4796,6 +4958,7 @@ export const model = {
           description?: string;
           confirm: boolean;
           dryRun: boolean;
+          reconcile: boolean;
         },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
@@ -4815,7 +4978,13 @@ export const model = {
             options: args.type === "SELECT" ? args.options : undefined,
             description: args.description,
           };
-          const outcome = await ensureFieldOnce(cfg, spec, planOnly);
+          const outcome = await ensureFieldOnce(
+            cfg,
+            spec,
+            planOnly,
+            undefined,
+            args.reconcile,
+          );
           context.logger.info(
             "ensureField {object}.{name} ({type}): {action}",
             {
@@ -4836,8 +5005,10 @@ export const model = {
               action: outcome.action,
               dryRun: planOnly,
               optionsAdded: outcome.optionsAdded,
+              optionsUpdated: outcome.optionsUpdated,
               optionsPresent: outcome.optionsPresent,
               mismatchNotes: outcome.mismatchNotes,
+              ...(outcome.options ? { options: outcome.options } : {}),
               ...(outcome.typeMismatch
                 ? { typeMismatch: outcome.typeMismatch }
                 : {}),
@@ -4852,7 +5023,7 @@ export const model = {
     },
     ensureOpportunitySegmentation: {
       description:
-        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Braintrust / Ramp / Canopy / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op; a field that exists with extra options keeps them (append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
+        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Braintrust / Ramp / Canopy / Upwork / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op when the live options already match the spec; a field that exists with extra options keeps them, and by default (reconcile) an option whose label/color drifted from the spec is corrected in place (pass reconcile:false for strict append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
       arguments: z.object({
         confirm: z
           .boolean()
@@ -4862,9 +5033,15 @@ export const model = {
           .boolean()
           .default(false)
           .describe("Preview the plan for both fields; write nothing"),
+        reconcile: z
+          .boolean()
+          .default(true)
+          .describe(
+            "When an existing option's label/color differs from the spec, update it in place (the spec is the source of truth). Set false for strict append-only (drift reported, never applied).",
+          ),
       }),
       execute: async (
-        args: { confirm: boolean; dryRun: boolean },
+        args: { confirm: boolean; dryRun: boolean; reconcile: boolean },
         context: ExecuteContext,
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
@@ -4880,7 +5057,13 @@ export const model = {
           const objs = await fetchObjectsMeta(cfg);
           const handles: Array<{ name: string }> = [];
           for (const spec of OPPORTUNITY_SEGMENTATION_FIELDS) {
-            const outcome = await ensureFieldOnce(cfg, spec, planOnly, objs);
+            const outcome = await ensureFieldOnce(
+              cfg,
+              spec,
+              planOnly,
+              objs,
+              args.reconcile,
+            );
             context.logger.info(
               "ensureOpportunitySegmentation {object}.{name}: {action}",
               {
@@ -4900,8 +5083,10 @@ export const model = {
                 action: outcome.action,
                 dryRun: planOnly,
                 optionsAdded: outcome.optionsAdded,
+                optionsUpdated: outcome.optionsUpdated,
                 optionsPresent: outcome.optionsPresent,
                 mismatchNotes: outcome.mismatchNotes,
+                ...(outcome.options ? { options: outcome.options } : {}),
                 ...(outcome.typeMismatch
                   ? { typeMismatch: outcome.typeMismatch }
                   : {}),
