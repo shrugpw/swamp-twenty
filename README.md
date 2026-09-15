@@ -96,7 +96,7 @@ swamp model method run crm push_leads --input confirm=true --input "leads=$(cat 
   "company": "Example Corp",      // used only for business leads on a corporate domain
   "received_at": "2026-09-01T09:00:00Z", // FIFO ordering key (oldest first)
   "status": "new",                // only 'new' leads are processed
-  "geo": "Bedford, MA"            // coarse geo, appended to the Note
+  "geo": "Springfield, IL"        // coarse geo, appended to the Note
 }
 ```
 

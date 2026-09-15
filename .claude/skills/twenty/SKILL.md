@@ -81,7 +81,7 @@ swamp model method run <name> push_leads --input confirm=true --input-file leads
 `id` (the `leadId` marker), `name`, `email`, `phone`, `message`, `contact_type`
 (`individual` | `business` | `emergency`), `company`, `received_at` (ISO, FIFO
 key), `status`, `geo`. `geo` is a **string** — if your upstream stores it as an
-object, stringify it (e.g. `"Bedford, MA, US"`) before passing.
+object, stringify it (e.g. `"Springfield, IL, US"`) before passing.
 
 ### The contract push_leads guarantees
 

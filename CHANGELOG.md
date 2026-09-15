@@ -8,8 +8,8 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
 
 - **`upsertOpportunity` can now write the two Opportunity segmentation `SELECT`
   fields.** Two optional arguments — `lineOfBusiness` (CONSULTING / HOSTING /
-  GAMES) and `sourceChannel` (DIRECT / REFERRAL / BRAINTRUST / RAMP / CANOPY /
-  CONSULTING_HANDOFF) — let existing opportunities be flagged declaratively.
+  GAMES) and `sourceChannel` (DIRECT / REFERRAL / CONSULTING_HANDOFF) — let
+  existing opportunities be flagged declaratively.
   Each token is validated against the live field's enum options (via the same
   `fetchOpportunityMeta` read that already validates `stage`), so an invalid
   token fails fast with the valid set rather than a blind Twenty 4xx; validation
@@ -41,8 +41,8 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
 - **`ensureOpportunitySegmentation`** — a single fan-out (repo rule 6) that
   provisions the two Opportunity segmentation `SELECT` fields in one execution
   (one metadata GET, one lock): **Line of Business** (Consulting / Hosting /
-  Games) and **Source Channel** (Direct / Referral / Braintrust / Ramp / Canopy /
-  Consulting hand-off). Analytics only — NOT a pipeline gate. Append-only, so a
+  Games) and **Source Channel** (Direct / Referral / Consulting hand-off).
+  Analytics only — NOT a pipeline gate. Append-only, so a
   re-run is a clean no-op. `confirm`-gated + `dryRun`. Snapshots one
   `fieldEnsured` per field.
 - **`fieldEnsured` resource** — the per-field outcome (action taken, `SELECT`

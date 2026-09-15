@@ -17,6 +17,7 @@ import {
   amountFromMicros,
   buildFilterPath,
   canonicalJson,
+  computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
   escapeMarkdown,
@@ -228,7 +229,7 @@ const baseLead = {
   company: "Example Corp",
   received_at: "2026-09-01T00:00:00.000Z",
   status: "new",
-  geo: "Bedford, MA",
+  geo: "Springfield, IL",
 };
 
 Deno.test("planLead validates a good business lead and keeps the corporate domain", () => {
@@ -366,7 +367,7 @@ Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, folds
     timing: "contract's up in March",
     message: "", // shrug.host allows an empty message
     source: "shrug.host-contact",
-    geo: { city: "Bedford", region: "MA", country: "US" },
+    geo: { city: "Springfield", region: "IL", country: "US" },
   });
   assertEquals(l.company, "Bob's Roofing"); // org -> company
   assertEquals(l.contact_type, "business"); // inferred from source
@@ -481,7 +482,7 @@ Deno.test("normalizeCloseDate anchors a bare date and passes through ISO", () =>
 });
 
 Deno.test("isFilterSafe rejects Twenty filter metacharacters", () => {
-  assert(isFilterSafe("Jackson Family Enterprises"));
+  assert(isFilterSafe("Acme Corp"));
   assert(isFilterSafe("Acme & Co - West"));
   for (const bad of ["", "a[eq]:b", "a,b", "a(b)", "a;b", "a:b"]) {
     assertEquals(isFilterSafe(bad), false);
@@ -504,7 +505,7 @@ Deno.test("upsertOpportunity refuses a real run without confirm:true", async () 
     () =>
       model.methods.upsertOpportunity.execute(
         {
-          leadId: "jfw-aap-2.7-2026",
+          leadId: "acme-q1-renewal-2026",
           name: "Test",
           currencyCode: "USD",
           closeDate: "",
@@ -617,7 +618,7 @@ const OPP_META = {
       {
         name: "sourceChannel",
         options: [{ value: "DIRECT" }, { value: "REFERRAL" }, {
-          value: "BRAINTRUST",
+          value: "CONSULTING_HANDOFF",
         }],
       },
       { name: "closeDate", type: "DATE_TIME" },
@@ -647,8 +648,8 @@ Deno.test("upsertOpportunity does NOT clobber stage/currency on an amount-only u
   try {
     await model.methods.upsertOpportunity.execute(
       {
-        leadId: "jfw-aap-2.7-2026",
-        name: "JFW",
+        leadId: "acme-q1-renewal-2026",
+        name: "Acme",
         amount: 999, // no stage, no currencyCode supplied
         closeDate: "",
         companyName: "",
@@ -926,7 +927,7 @@ Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
 
 Deno.test("amountFromMicros is the inverse of toCurrency", () => {
   assertEquals(amountFromMicros(50_000_000_000), 50000);
-  assertAlmostEquals(amountFromMicros(43_478_260_000), 43478.26, 1e-6);
+  assertAlmostEquals(amountFromMicros(42_000_000_000), 42000.00, 1e-6);
   // Round-trip.
   assertEquals(amountFromMicros(toCurrency(19.99, "USD").amountMicros), 19.99);
 });
@@ -935,23 +936,23 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   const v = mapOppView({
     id: "opp1",
     leadId: "L1",
-    name: "AAP 2.7",
+    name: "Acme Renewal",
     stage: "PROPOSAL",
-    amount: { amountMicros: 43_478_260_000, currencyCode: "USD" },
+    amount: { amountMicros: 42_000_000_000, currencyCode: "USD" },
     closeDate: "2026-12-31T00:00:00.000Z",
     companyId: "co1",
     pointOfContactId: "poc1",
     lineOfBusiness: "HOSTING",
-    sourceChannel: "UPWORK",
+    sourceChannel: "REFERRAL",
     isEmergency: false,
   });
   assertEquals(v.id, "opp1");
   assertEquals(v.stage, "PROPOSAL");
-  assertAlmostEquals(v.amount!, 43478.26, 1e-6);
+  assertAlmostEquals(v.amount!, 42000.00, 1e-6);
   assertEquals(v.currencyCode, "USD");
   // Custom/segmentation SELECTs surfaced from flat scalars; isEmergency even when false.
   assertEquals(v.lineOfBusiness, "HOSTING");
-  assertEquals(v.sourceChannel, "UPWORK");
+  assertEquals(v.sourceChannel, "REFERRAL");
   assertEquals(v.isEmergency, false);
   // A record with no amount composite omits amount/currencyCode; unset
   // segmentation SELECTs are omitted; absent isEmergency stays undefined.
@@ -1185,8 +1186,8 @@ Deno.test("findCompany by domain: hit carries id/name/domain", async () => {
           data: {
             companies: [{
               id: "co1",
-              name: "Jackson Family Enterprises",
-              domainName: { primaryLinkUrl: "jacksonfamilywines.com" },
+              name: "Acme Corp",
+              domainName: { primaryLinkUrl: "acme.com" },
             }],
           },
         },
@@ -1197,13 +1198,13 @@ Deno.test("findCompany by domain: hit carries id/name/domain", async () => {
   const { writes, ctx } = readCtx();
   try {
     await model.methods.findCompany.execute(
-      { domain: "jacksonfamilywines.com" } as never,
+      { domain: "acme.com" } as never,
       ctx as never,
     );
     assertEquals(writes[0].data.found, true);
     assertEquals(writes[0].data.id, "co1");
-    assertEquals(writes[0].data.name, "Jackson Family Enterprises");
-    assertEquals(writes[0].data.domain, "jacksonfamilywines.com");
+    assertEquals(writes[0].data.name, "Acme Corp");
+    assertEquals(writes[0].data.domain, "acme.com");
   } finally {
     restore();
   }
@@ -1221,7 +1222,7 @@ Deno.test("findCompany by name: not filterable => found:false gracefully", async
   const { writes, ctx } = readCtx();
   try {
     await model.methods.findCompany.execute(
-      { name: "Jackson Family Enterprises" } as never,
+      { name: "Acme Corp" } as never,
       ctx as never,
     );
     assertEquals(writes[0].data.found, false);
@@ -1230,34 +1231,34 @@ Deno.test("findCompany by name: not filterable => found:false gracefully", async
   }
 });
 
-const JFW_OPP = {
+const ACME_OPP = {
   id: "opp-aap",
-  leadId: "jfw-aap-2.7-2026",
-  name: "AAP 2.7",
+  leadId: "acme-q1-renewal-2026",
+  name: "Acme Renewal",
   stage: "PROPOSAL",
-  amount: { amountMicros: 43_478_260_000, currencyCode: "USD" },
+  amount: { amountMicros: 42_000_000_000, currencyCode: "USD" },
   closeDate: "2026-12-31T00:00:00.000Z",
   companyId: "co1",
   pointOfContactId: "poc1",
 };
 
-Deno.test("getOpportunity by leadId: PROPOSAL + amount 43478.26", async () => {
+Deno.test("getOpportunity by leadId: PROPOSAL + amount 42000.00", async () => {
   const { restore } = stubFetchStatus((method, path) => {
     if (method === "GET" && path.startsWith("/rest/opportunities")) {
-      return { body: { data: { opportunities: [JFW_OPP] } } };
+      return { body: { data: { opportunities: [ACME_OPP] } } };
     }
     return {};
   });
   const { writes, ctx } = readCtx();
   try {
     await model.methods.getOpportunity.execute(
-      { leadId: "jfw-aap-2.7-2026" } as never,
+      { leadId: "acme-q1-renewal-2026" } as never,
       ctx as never,
     );
     const d = writes[0].data;
     assertEquals(d.found, true);
     assertEquals(d.stage, "PROPOSAL");
-    assertAlmostEquals(d.amount as number, 43478.26, 1e-6);
+    assertAlmostEquals(d.amount as number, 42000.00, 1e-6);
     assertEquals(d.currencyCode, "USD");
     assertEquals(d.pointOfContactId, "poc1");
   } finally {
@@ -1270,7 +1271,7 @@ Deno.test("getOpportunity by id: equivalent snapshot; 404 => found:false", async
   {
     const { restore } = stubFetchStatus((method, path) => {
       if (method === "GET" && path === `/rest/opportunities/${uuid}`) {
-        return { body: { data: { opportunity: JFW_OPP } } };
+        return { body: { data: { opportunity: ACME_OPP } } };
       }
       return {};
     });
@@ -1304,7 +1305,7 @@ Deno.test("getOpportunity by id: equivalent snapshot; 404 => found:false", async
   }
 });
 
-Deno.test("listOpportunities: AND-composes filters and returns both JFW opps", async () => {
+Deno.test("listOpportunities: AND-composes filters and returns both Acme opps", async () => {
   const cid = "33333333-3333-3333-3333-333333333333";
   const { calls, restore } = stubFetchStatus((method, path) => {
     if (method === "GET" && path.startsWith("/rest/opportunities")) {
@@ -1312,8 +1313,8 @@ Deno.test("listOpportunities: AND-composes filters and returns both JFW opps", a
         body: {
           data: {
             opportunities: [
-              JFW_OPP,
-              { id: "opp-sow", name: "SOW#26", stage: "CUSTOMER" },
+              ACME_OPP,
+              { id: "opp-sow", name: "SOW-001", stage: "CUSTOMER" },
             ],
           },
           pageInfo: { hasNextPage: false },
@@ -3160,18 +3161,10 @@ Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the two Opportunity SELECTs"
     [
       "DIRECT",
       "REFERRAL",
-      "BRAINTRUST",
-      "RAMP",
-      "CANOPY",
-      "UPWORK",
       "CONSULTING_HANDOFF",
     ],
   );
-  // UPWORK/CONSULTING_HANDOFF carry deliberate (non-default) colors.
-  assertEquals(
-    src!.options!.find((o) => o.value === "UPWORK")!.color,
-    "green",
-  );
+  // CONSULTING_HANDOFF carries a deliberate (non-default) color.
   assertEquals(
     src!.options!.find((o) => o.value === "CONSULTING_HANDOFF")!.color,
     "purple",
@@ -3231,6 +3224,558 @@ Deno.test("ensureOpportunitySegmentation refuses a real run without confirm:true
     Error,
     "confirm:true",
   );
+});
+
+// --- ensureObject (TWENTY-ENSURE-OBJECT) ------------------------------------
+
+// GET /rest/metadata/objects fixture: the workspace objects (name/id only).
+function objectsMeta(objs: Array<Record<string, unknown>> = []) {
+  return { data: objs };
+}
+
+const ENSURE_OBJECT_ARGS = {
+  nameSingular: "invoice",
+  namePlural: "invoices",
+  confirm: false,
+  dryRun: true,
+};
+
+Deno.test("ensureObject refuses a real run without confirm:true", async () => {
+  await assertRejects(
+    () =>
+      model.methods.ensureObject.execute(
+        { ...ENSURE_OBJECT_ARGS, confirm: false, dryRun: false },
+        gateCtx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("ensureObject dryRun MISSING: planned-create, no write, payload preview", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: objectsMeta([{ nameSingular: "opportunity", id: "o1" }]) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureObject.execute(
+      { ...ENSURE_OBJECT_ARGS, dryRun: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].type, "objectEnsured");
+    assertEquals(writes[0].data.action, "planned-create");
+    assertEquals(writes[0].data.dryRun, true);
+    // Labels default via titleCaseToken (same helper ensureField uses): a
+    // single lowercase camelCase token passes through unchanged.
+    assertEquals(writes[0].data.labelSingular, "invoice");
+    assertEquals(writes[0].data.labelPlural, "invoices");
+    // No objectId on a planned create; the payload previews what WOULD POST.
+    assertEquals("objectId" in writes[0].data, false);
+    const payload = writes[0].data.payload as Record<string, unknown>;
+    assertEquals(payload.nameSingular, "invoice");
+    assertEquals(payload.namePlural, "invoices");
+    assertEquals(payload.labelSingular, "invoice");
+    assertEquals(payload.labelPlural, "invoices");
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "must not write on dryRun",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureObject already-exists (by nameSingular): present, no POST", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        body: objectsMeta([
+          { nameSingular: "invoice", namePlural: "invoices", id: "obj-inv" },
+        ]),
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureObject.execute(
+      { ...ENSURE_OBJECT_ARGS, confirm: true, dryRun: false } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assertEquals(writes[0].data.objectId, "obj-inv");
+    // Present is a no-op: no create payload, no write.
+    assertEquals("payload" in writes[0].data, false);
+    assert(!calls.some((c) => c.method === "POST"), "present must not POST");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureObject already-exists (by namePlural collision): present, no POST", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      // Different singular, but the plural collides with an existing object.
+      return {
+        body: objectsMeta([
+          { nameSingular: "bill", namePlural: "invoices", id: "obj-bill" },
+        ]),
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureObject.execute(
+      { ...ENSURE_OBJECT_ARGS, confirm: true, dryRun: false } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assertEquals(writes[0].data.objectId, "obj-bill");
+    assert(!calls.some((c) => c.method === "POST"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureObject confirm create: POSTs the object body, records created + new id", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: objectsMeta([{ nameSingular: "opportunity", id: "o1" }]) };
+    }
+    if (method === "POST" && path === "/rest/metadata/objects") {
+      return { body: { data: { id: "obj-new" } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureObject.execute(
+      {
+        nameSingular: "invoice",
+        namePlural: "invoices",
+        labelSingular: "Invoice",
+        labelPlural: "Invoices",
+        description: "Customer invoices",
+        icon: "IconFileInvoice",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    assertEquals(writes[0].data.objectId, "obj-new");
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the object");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.nameSingular, "invoice");
+    assertEquals(body.namePlural, "invoices");
+    assertEquals(body.labelSingular, "Invoice");
+    assertEquals(body.labelPlural, "Invoices");
+    assertEquals(body.description, "Customer invoices");
+    assertEquals(body.icon, "IconFileInvoice");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureObject rejects a non-camelCase nameSingular before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureObject.execute(
+          { ...ENSURE_OBJECT_ARGS, nameSingular: "Invoice_Line" } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid nameSingular",
+    );
+    assertEquals(calls.length, 0, "must reject before any request");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureObject rejects identical singular/plural before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureObject.execute(
+          { ...ENSURE_OBJECT_ARGS, namePlural: "invoice" } as never,
+          ctx as never,
+        ),
+      Error,
+      "must differ",
+    );
+    assertEquals(calls.length, 0, "must reject before any request");
+  } finally {
+    restore();
+  }
+});
+
+// --- ensureRelation (TWENTY-ENSURE-RELATION) --------------------------------
+
+Deno.test("computeMetadataNameFromLabel derives camelCase like Twenty", () => {
+  assertEquals(computeMetadataNameFromLabel("Opportunities"), "opportunities");
+  assertEquals(computeMetadataNameFromLabel("Line Items"), "lineItems");
+  assertEquals(
+    computeMetadataNameFromLabel("Purchase Orders"),
+    "purchaseOrders",
+  );
+  assertEquals(
+    computeMetadataNameFromLabel("  Purchase Orders 2  "),
+    "purchaseOrders2",
+  );
+  // Punctuation and diacritics are dropped/normalized.
+  assertEquals(computeMetadataNameFromLabel("Réunions"), "reunions");
+  assertEquals(
+    computeMetadataNameFromLabel("Customer / Vendor"),
+    "customerVendor",
+  );
+  assertEquals(computeMetadataNameFromLabel("invoice"), "invoice");
+  assertEquals(computeMetadataNameFromLabel(""), "");
+});
+
+// Two objects present, no relevant fields. `oppFields`/`invFields` override.
+function relMeta(
+  oppFields: unknown[] = [],
+  invFields: unknown[] = [],
+) {
+  return objectsMeta([
+    { nameSingular: "opportunity", id: "obj-opp", fields: oppFields },
+    { nameSingular: "invoice", id: "obj-inv", fields: invFields },
+  ]);
+}
+
+const ENSURE_RELATION_ARGS = {
+  fromObjectNameSingular: "opportunity",
+  toObjectNameSingular: "invoice",
+  relationType: "MANY_TO_ONE",
+  fromFieldName: "invoice",
+  targetFieldLabel: "Opportunities",
+  targetFieldIcon: "IconListOpportunity",
+  confirm: false,
+  dryRun: true,
+};
+
+Deno.test("ensureRelation refuses a real run without confirm:true", async () => {
+  await assertRejects(
+    () =>
+      model.methods.ensureRelation.execute(
+        { ...ENSURE_RELATION_ARGS, confirm: false, dryRun: false } as never,
+        gateCtx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("ensureRelation dryRun MISSING: planned-create, no write, relationCreationPayload preview", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: relMeta() };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureRelation.execute(
+      { ...ENSURE_RELATION_ARGS, dryRun: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].type, "relationEnsured");
+    assertEquals(writes[0].data.action, "planned-create");
+    assertEquals(writes[0].data.dryRun, true);
+    assertEquals(writes[0].data.objectMetadataId, "obj-opp");
+    assertEquals(writes[0].data.targetObjectMetadataId, "obj-inv");
+    // fromFieldName is the instance-name key component the sibling workflow
+    // asserts on (instance = relation-<fromObject>-<fromFieldName>).
+    assertEquals(writes[0].data.name, "invoice");
+    assertEquals(writes[0].data.fromFieldName, "invoice");
+    // Reverse field name derived from targetFieldLabel.
+    assertEquals(writes[0].data.reverseFieldName, "opportunities");
+    // Source label defaults via titleCaseToken (single lowercase token unchanged).
+    assertEquals(writes[0].data.label, "invoice");
+    const payload = writes[0].data.payload as Record<string, unknown>;
+    assertEquals(payload.name, "invoice");
+    assertEquals(payload.label, "invoice");
+    assertEquals(payload.type, "RELATION");
+    assertEquals(payload.objectMetadataId, "obj-opp");
+    const rcp = payload.relationCreationPayload as Record<string, unknown>;
+    assertEquals(rcp.type, "MANY_TO_ONE");
+    assertEquals(rcp.targetObjectMetadataId, "obj-inv");
+    assertEquals(rcp.targetFieldLabel, "Opportunities");
+    assertEquals(rcp.targetFieldIcon, "IconListOpportunity");
+    assert(!calls.some((c) => c.method === "POST"), "must not write on dryRun");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation already-exists (source RELATION): present, no POST, read-back", async () => {
+  const oppField = {
+    name: "invoice",
+    type: "RELATION",
+    id: "f1",
+    settings: {
+      relationType: "MANY_TO_ONE",
+      onDelete: "SET_NULL",
+      joinColumnName: "invoiceId",
+    },
+    relation: {
+      targetObjectMetadata: { id: "obj-inv", nameSingular: "invoice" },
+      sourceFieldMetadata: { id: "f1", name: "invoice" },
+      targetFieldMetadata: { id: "f2", name: "opportunities" },
+    },
+  };
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: relMeta([oppField]) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureRelation.execute(
+      { ...ENSURE_RELATION_ARGS, confirm: true, dryRun: false } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assertEquals(writes[0].data.fieldId, "f1");
+    assertEquals(writes[0].data.relationType, "MANY_TO_ONE");
+    assertEquals(writes[0].data.joinColumnName, "invoiceId");
+    const rel = writes[0].data.relation as Record<string, unknown>;
+    const tgt = rel.targetObjectMetadata as Record<string, unknown>;
+    assertEquals(tgt.id, "obj-inv");
+    // Matches intent -> no drift note, no create body.
+    assertEquals("targetMismatch" in writes[0].data, false);
+    assertEquals("payload" in writes[0].data, false);
+    assert(!calls.some((c) => c.method === "POST"), "present must not POST");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation present-but-points-elsewhere: reports targetMismatch, no mutation", async () => {
+  const oppField = {
+    name: "invoice",
+    type: "RELATION",
+    id: "f1",
+    settings: { relationType: "MANY_TO_ONE" },
+    relation: {
+      targetObjectMetadata: { id: "obj-OTHER", nameSingular: "receipt" },
+      sourceFieldMetadata: { id: "f1", name: "invoice" },
+    },
+  };
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: relMeta([oppField]) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureRelation.execute(
+      { ...ENSURE_RELATION_ARGS, confirm: true, dryRun: false } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "present");
+    assert(String(writes[0].data.targetMismatch ?? "").includes("obj-OTHER"));
+    assert(!calls.some((c) => c.method === "POST"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation type-mismatch (source field is TEXT): reported, no POST", async () => {
+  const oppField = { name: "invoice", type: "TEXT", id: "f9" };
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: relMeta([oppField]) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureRelation.execute(
+      { ...ENSURE_RELATION_ARGS, confirm: true, dryRun: false } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "type-mismatch");
+    assertEquals(writes[0].data.type, "TEXT");
+    assert(String(writes[0].data.typeMismatch ?? "").includes("TEXT"));
+    assert(!calls.some((c) => c.method === "POST"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation reverse-name collision on target: hard-fails before POST", async () => {
+  const invField = { name: "opportunities", type: "RELATION", id: "x1" };
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: relMeta([], [invField]) };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureRelation.execute(
+          { ...ENSURE_RELATION_ARGS, confirm: true, dryRun: false } as never,
+          ctx as never,
+        ),
+      Error,
+      "already exists on target",
+    );
+    assert(!calls.some((c) => c.method === "POST"), "collision must not POST");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation rejects MANY_TO_MANY before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureRelation.execute(
+          { ...ENSURE_RELATION_ARGS, relationType: "MANY_TO_MANY" } as never,
+          ctx as never,
+        ),
+      Error,
+      "Unsupported relationType",
+    );
+    assertEquals(calls.length, 0, "must reject before any request");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation rejects a non-camelCase fromFieldName before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureRelation.execute(
+          { ...ENSURE_RELATION_ARGS, fromFieldName: "Invoice_Bad" } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid fromFieldName",
+    );
+    assertEquals(calls.length, 0, "must reject before any request");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation confirm create: POSTs RELATION field body, records created + read-back", async () => {
+  let created = false;
+  const relField = {
+    name: "invoice",
+    type: "RELATION",
+    id: "f1",
+    settings: {
+      relationType: "MANY_TO_ONE",
+      onDelete: "SET_NULL",
+      joinColumnName: "invoiceId",
+    },
+    relation: {
+      targetObjectMetadata: { id: "obj-inv", nameSingular: "invoice" },
+      sourceFieldMetadata: { id: "f1", name: "invoice" },
+      targetFieldMetadata: { id: "f2", name: "opportunities" },
+    },
+  };
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "POST" && path === "/rest/metadata/fields") {
+      created = true;
+      return { body: {} };
+    }
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        body: created
+          ? relMeta([relField], [{ name: "opportunities", type: "RELATION" }])
+          : relMeta(),
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.ensureRelation.execute(
+      {
+        ...ENSURE_RELATION_ARGS,
+        fromLabel: "Invoice",
+        fromIcon: "IconFileInvoice",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "created");
+    // fromFieldName present on the created path too (workflow assert key).
+    assertEquals(writes[0].data.name, "invoice");
+    assertEquals(writes[0].data.fromFieldName, "invoice");
+    // Read-back from the re-GET, not the (empty) create response.
+    assertEquals(writes[0].data.fieldId, "f1");
+    assertEquals(writes[0].data.relationType, "MANY_TO_ONE");
+    assertEquals(writes[0].data.onDelete, "SET_NULL");
+    assertEquals(writes[0].data.joinColumnName, "invoiceId");
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the relation field");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.name, "invoice");
+    assertEquals(body.label, "Invoice");
+    assertEquals(body.type, "RELATION");
+    assertEquals(body.objectMetadataId, "obj-opp");
+    assertEquals(body.icon, "IconFileInvoice");
+    const rcp = body.relationCreationPayload as Record<string, unknown>;
+    assertEquals(rcp.type, "MANY_TO_ONE");
+    assertEquals(rcp.targetObjectMetadataId, "obj-inv");
+    assertEquals(rcp.targetFieldLabel, "Opportunities");
+    assertEquals(rcp.targetFieldIcon, "IconListOpportunity");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("ensureRelation hard-stops when the target object is absent", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        body: objectsMeta([
+          { nameSingular: "opportunity", id: "obj-opp", fields: [] },
+        ]),
+      };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.ensureRelation.execute(
+          { ...ENSURE_RELATION_ARGS, dryRun: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "Object 'invoice' not found",
+    );
+    assert(!calls.some((c) => c.method === "POST"));
+  } finally {
+    restore();
+  }
 });
 
 Deno.test("push_leads fails fast on a non-UPPER_SNAKE leadSourceChannel (before any I/O)", async () => {

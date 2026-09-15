@@ -264,7 +264,7 @@ export function isBlockedDomain(
  * Normalize a phone toward E.164 (`+<countrycode><number>`), which is what
  * Twenty's phone field accepts. Strips to `+`/digits, keeps a single leading
  * `+`, and defaults the North American country code: a bare 10-digit number
- * becomes `+1XXXXXXXXXX` and `1XXXXXXXXXX` becomes `+1XXXXXXXXXX` (Bedford, MA
+ * becomes `+1XXXXXXXXXX` and `1XXXXXXXXXX` becomes `+1XXXXXXXXXX` (Springfield, IL
  * is US-facing). Anything else gets a best-effort `+` prefix — if that is still
  * not dialable, {@link createPerson} drops the phone rather than the lead.
  * Empty string if nothing usable.
@@ -1502,6 +1502,33 @@ export function titleCaseToken(value: string): string {
     .join(" ");
 }
 
+/**
+ * Derive a Twenty metadata `name` (camelCase identifier) from a human label the
+ * SAME way Twenty's server-side `computeMetadataNameFromLabel` does: strip
+ * diacritics, tokenize on non-alphanumerics AND camelCase/upper-run/digit
+ * boundaries (lodash `camelCase` semantics), lowercase the first token and
+ * upper-case-lead the rest. This mirrors the reverse-field name Twenty auto-mints
+ * from `targetFieldLabel` when it creates a RELATION, so ensureRelation can
+ * pre-check the target object for a name collision BEFORE the POST (the server
+ * otherwise 400s FIELD_METADATA_RELATION_MALFORMED / name-taken). Examples:
+ * "Opportunities" -> "opportunities", "Line Items" -> "lineItems",
+ * "Purchase Orders 2" -> "purchaseOrders2".
+ */
+export function computeMetadataNameFromLabel(label: string): string {
+  const stripped = String(label ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // drop combining diacritics
+  const words = stripped.match(
+    /[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+/g,
+  ) ?? [];
+  if (words.length === 0) return "";
+  return words
+    .map((w, i) =>
+      i === 0 ? w.toLowerCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()
+    )
+    .join("");
+}
+
 interface SelectOption {
   id?: string;
   value: string;
@@ -1998,10 +2025,6 @@ export const OPPORTUNITY_SEGMENTATION_FIELDS: ReadonlyArray<FieldSpec> = [
     options: [
       { value: "DIRECT", label: "Direct", color: "sky" },
       { value: "REFERRAL", label: "Referral", color: "turquoise" },
-      { value: "BRAINTRUST", label: "Braintrust", color: "orange" },
-      { value: "RAMP", label: "Ramp", color: "yellow" },
-      { value: "CANOPY", label: "Canopy", color: "pink" },
-      { value: "UPWORK", label: "Upwork", color: "green" },
       {
         value: "CONSULTING_HANDOFF",
         label: "Consulting hand-off",
@@ -2532,6 +2555,135 @@ const FieldEnsuredSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Custom-object provisioning snapshot (TWENTY-ENSURE-OBJECT) -------------
+// The outcome of ensureObject: whether the custom OBJECT was created, already
+// existed, or (on dryRun) would be created — plus its identity and the exact
+// create payload, so a planned-create is verifiable straight from the snapshot
+// without a second read or the Twenty UI. No PII (object metadata only).
+
+const ObjectEnsuredSchema = z.object({
+  baseUrl: z.string(),
+  nameSingular: z.string(),
+  namePlural: z.string(),
+  labelSingular: z.string(),
+  labelPlural: z.string(),
+  action: z.enum(["created", "present", "planned-create"]),
+  dryRun: z.boolean(),
+  objectId: z
+    .string()
+    .optional()
+    .describe(
+      "The object's metadata id: the existing id when already present, or the newly minted id when created (absent on planned-create)",
+    ),
+  description: z.string().optional(),
+  icon: z.string().optional().describe(
+    "Twenty icon name, e.g. IconFileInvoice",
+  ),
+  payload: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "The create body sent (or, on planned-create, that WOULD be sent) to POST /rest/metadata/objects — absent when the object already existed",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Custom-relation provisioning snapshot (TWENTY-ENSURE-RELATION) ---------
+// The outcome of ensureRelation: whether the RELATION field (created as a field
+// via POST /rest/metadata/fields with a relationCreationPayload block) was
+// created, already existed, or (on dryRun) would be created — plus both objects'
+// identities, the derived reverse-field name Twenty auto-mints on the target,
+// the server-read-back settings/relation detail, and the exact create payload.
+// No PII (object/field metadata only).
+
+const RelationEnsuredSchema = z.object({
+  baseUrl: z.string(),
+  action: z.enum(["created", "present", "planned-create", "type-mismatch"]),
+  dryRun: z.boolean(),
+  fromObjectNameSingular: z.string().describe("Source object (owns the field)"),
+  toObjectNameSingular: z.string().describe(
+    "Target object (relation points to)",
+  ),
+  name: z.string().describe("Source-side relation field name (camelCase)"),
+  fromFieldName: z.string().describe(
+    "Source-side relation field name (= instance-name key component)",
+  ),
+  label: z.string().describe("Source-side field label"),
+  type: z
+    .string()
+    .describe("RELATION — or, on a type-mismatch, the existing field's type"),
+  relationType: z
+    .string()
+    .describe("MANY_TO_ONE | ONE_TO_MANY (the source side)"),
+  reverseFieldName: z
+    .string()
+    .describe(
+      "Derived reverse-field name Twenty auto-mints on the target = computeMetadataNameFromLabel(targetFieldLabel)",
+    ),
+  targetFieldLabel: z.string(),
+  targetFieldIcon: z.string().describe(
+    "Tabler icon name for the reverse field",
+  ),
+  objectMetadataId: z
+    .string()
+    .optional()
+    .describe("Source object metadata id"),
+  targetObjectMetadataId: z
+    .string()
+    .optional()
+    .describe("Target object metadata id (must pre-exist)"),
+  fieldId: z
+    .string()
+    .optional()
+    .describe("Source relation field id (read back after a create)"),
+  onDelete: z
+    .string()
+    .optional()
+    .describe(
+      "Server-defaulted FK behavior (SET_NULL on the MANY_TO_ONE side)",
+    ),
+  joinColumnName: z
+    .string()
+    .optional()
+    .describe("FK join column on the many side, e.g. `${name}Id`"),
+  relation: z
+    .object({
+      targetObjectMetadata: z
+        .object({
+          id: z.string().optional(),
+          nameSingular: z.string().optional(),
+        })
+        .optional(),
+      sourceFieldMetadata: z
+        .object({ id: z.string().optional(), name: z.string().optional() })
+        .optional(),
+      targetFieldMetadata: z
+        .object({ id: z.string().optional(), name: z.string().optional() })
+        .optional(),
+    })
+    .optional()
+    .describe("Read-back relation detail from the field DTO after a create"),
+  payload: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "The create body sent (or, on planned-create, that WOULD be sent) to POST /rest/metadata/fields including relationCreationPayload — absent when the relation already existed",
+    ),
+  typeMismatch: z
+    .string()
+    .optional()
+    .describe(
+      "Set when a field with this name exists as a DIFFERENT type (left unchanged)",
+    ),
+  targetMismatch: z
+    .string()
+    .optional()
+    .describe(
+      "Set when the field exists as a RELATION but points at a different target/relationType than requested (left unchanged)",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Curated contact snapshot (TWENTY-PERSON-UPSERT) ------------------------
 // Carries NO raw PII (no email/name/phone) — only the id, which fields were
 // set, and the company link — matching opportunityUpsert's posture.
@@ -2742,7 +2894,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.10.2",
+  version: "2026.09.15.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -2799,6 +2951,14 @@ export const model = {
       toVersion: "2026.09.10.2",
       description:
         "Teach upsertOpportunity to write the two Opportunity segmentation SELECT fields: optional lineOfBusiness and sourceChannel tokens, validated against the live opportunity.lineOfBusiness/sourceChannel enums exactly like stage, written on both the create and update paths and omitted (never nulled) when unset. Additive method arguments + two optional opportunityUpsert snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.15.1",
+      description:
+        "Add the schema-provisioning methods ensureObject (idempotent create/ensure of a custom object, dryRun/confirm-gated) and ensureRelation (idempotent create/ensure of a RELATION field between two objects, single call provisions both sides), plus the computeMetadataNameFromLabel helper for reverse-name collision pre-check. Additive methods and resources only; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -2914,6 +3074,20 @@ export const model = {
       description:
         "Result of an upsertPerson run: the action taken, which fields were set, and the company link (no raw PII)",
       schema: PersonUpsertSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "objectEnsured": {
+      description:
+        "Result of an ensureObject run: the custom object's identity, the action taken (created/present/planned-create), and the create payload",
+      schema: ObjectEnsuredSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "relationEnsured": {
+      description:
+        "Result of an ensureRelation run: both objects' identities, the source/reverse field names, the relation settings/relation read-back, the action taken (created/present/planned-create/type-mismatch), and the create payload",
+      schema: RelationEnsuredSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -4274,7 +4448,7 @@ export const model = {
         leadId: z
           .string()
           .describe(
-            "Stable idempotency key for this opportunity (upsert marker, e.g. 'jfw-aap-2.7-2026')",
+            "Stable idempotency key for this opportunity (upsert marker, e.g. 'acme-q1-renewal-2026')",
           ),
         name: z.string().describe("Opportunity name"),
         amount: z
@@ -4306,7 +4480,7 @@ export const model = {
           .string()
           .optional()
           .describe(
-            "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, BRAINTRUST, RAMP, CANOPY, UPWORK, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
+            "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
           ),
         closeDate: z
           .string()
@@ -5023,7 +5197,7 @@ export const model = {
     },
     ensureOpportunitySegmentation: {
       description:
-        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Braintrust / Ramp / Canopy / Upwork / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op when the live options already match the spec; a field that exists with extra options keeps them, and by default (reconcile) an option whose label/color drifted from the spec is corrected in place (pass reconcile:false for strict append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
+        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op when the live options already match the spec; a field that exists with extra options keeps them, and by default (reconcile) an option whose label/color drifted from the spec is corrected in place (pass reconcile:false for strict append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
       arguments: z.object({
         confirm: z
           .boolean()
@@ -5101,6 +5275,558 @@ export const model = {
         }
       },
     },
+    ensureObject: {
+      description:
+        "Idempotently provision ONE custom OBJECT (object metadata type) via POST /rest/metadata/objects — the schema-provisioning foundation relation/field work builds on. Non-destructive: an object whose nameSingular/namePlural already exists is a no-op (reported as `present`, never mutated); a missing object is created. nameSingular/namePlural are camelCase identifiers and must differ; labels default to the title-cased names. dryRun:true (the DEFAULT) validates + plans (planned-create) and writes nothing, returning the exact create payload it WOULD POST; a real create requires confirm:true AND dryRun:false. Snapshots an `objectEnsured` resource.",
+      arguments: z.object({
+        nameSingular: z
+          .string()
+          .describe(
+            "Singular object name — a camelCase identifier, e.g. invoice / projectTask",
+          ),
+        namePlural: z
+          .string()
+          .describe(
+            "Plural object name — a camelCase identifier, e.g. invoices / projectTasks (must differ from nameSingular)",
+          ),
+        labelSingular: z
+          .string()
+          .optional()
+          .describe("Singular display label; defaults to a title-cased name"),
+        labelPlural: z
+          .string()
+          .optional()
+          .describe("Plural display label; defaults to a title-cased name"),
+        description: z
+          .string()
+          .optional()
+          .describe("Optional object description"),
+        icon: z
+          .string()
+          .optional()
+          .describe("Optional Twenty icon name, e.g. IconFileInvoice"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — mutates workspace metadata"),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Preview the plan; write nothing. Defaults true — a real create requires confirm:true AND dryRun:false.",
+          ),
+      }),
+      execute: async (
+        args: {
+          nameSingular: string;
+          namePlural: string;
+          labelSingular?: string;
+          labelPlural?: string;
+          description?: string;
+          icon?: string;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to ensure an object without confirm:true (mutates workspace metadata). Use dryRun:true to preview.",
+            );
+          }
+          const planOnly = args.dryRun || !args.confirm;
+
+          // Validate the names as camelCase identifiers before any I/O — a typo or
+          // CEL slip can never POST a garbage object name (mirrors ensureField).
+          const nameSingular = String(args.nameSingular ?? "").trim();
+          const namePlural = String(args.namePlural ?? "").trim();
+          if (!FIELD_NAME_RE.test(nameSingular)) {
+            throw new Error(
+              `Invalid nameSingular '${nameSingular}': must be a camelCase identifier (letter-led, alphanumeric)`,
+            );
+          }
+          if (!FIELD_NAME_RE.test(namePlural)) {
+            throw new Error(
+              `Invalid namePlural '${namePlural}': must be a camelCase identifier (letter-led, alphanumeric)`,
+            );
+          }
+          if (nameSingular === namePlural) {
+            throw new Error(
+              `nameSingular and namePlural must differ (both '${nameSingular}')`,
+            );
+          }
+          const labelSingular =
+            args.labelSingular != null && String(args.labelSingular).trim()
+              ? sanitizeText(args.labelSingular, 120)
+              : titleCaseToken(nameSingular);
+          const labelPlural =
+            args.labelPlural != null && String(args.labelPlural).trim()
+              ? sanitizeText(args.labelPlural, 120)
+              : titleCaseToken(namePlural);
+          const icon = args.icon != null && String(args.icon).trim()
+            ? String(args.icon).trim()
+            : undefined;
+
+          // Read live objects; treat a match on EITHER name as already-present.
+          const objs = await fetchObjectsMeta(cfg);
+          const existing = objs.find(
+            (o) =>
+              String(o.nameSingular ?? "") === nameSingular ||
+              String(o.namePlural ?? "") === namePlural,
+          );
+
+          const snapshot: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            nameSingular,
+            namePlural,
+            labelSingular,
+            labelPlural,
+            dryRun: planOnly,
+            ...(args.description
+              ? { description: sanitizeText(args.description, 500) }
+              : {}),
+            ...(icon ? { icon } : {}),
+            retrievedAt: new Date().toISOString(),
+          };
+
+          if (existing) {
+            // Already present — no-op create, never mutate the live object.
+            const objectId = String(existing.id ?? "");
+            snapshot.action = "present";
+            if (objectId) snapshot.objectId = objectId;
+            context.logger.info(
+              "ensureObject {nameSingular}: present (no-op)",
+              { nameSingular },
+            );
+            const handle = await context.writeResource(
+              "objectEnsured",
+              `object-${nameSingular}`,
+              snapshot,
+            );
+            return { dataHandles: [handle] };
+          }
+
+          // CREATE path — build the metadata create body.
+          const payload: Record<string, unknown> = {
+            nameSingular,
+            namePlural,
+            labelSingular,
+            labelPlural,
+            ...(snapshot.description
+              ? { description: snapshot.description }
+              : {}),
+            ...(icon ? { icon } : {}),
+          };
+          snapshot.payload = payload;
+
+          if (planOnly) {
+            snapshot.action = "planned-create";
+            context.logger.info(
+              "ensureObject {nameSingular}: planned-create (dryRun)",
+              { nameSingular },
+            );
+            const handle = await context.writeResource(
+              "objectEnsured",
+              `object-${nameSingular}`,
+              snapshot,
+            );
+            return { dataHandles: [handle] };
+          }
+
+          const resp = await twentyRequest(
+            cfg,
+            "POST",
+            "/rest/metadata/objects",
+            payload,
+          );
+          // Twenty's metadata create response shape varies; read the new id
+          // defensively (never fatal if absent — the create already succeeded).
+          const created = ((resp as { data?: unknown }).data ?? {}) as Record<
+            string,
+            unknown
+          >;
+          const nested = (created.createOneObject ?? created.createObject ??
+            {}) as Record<string, unknown>;
+          const newId = String(created.id ?? nested.id ?? "");
+          snapshot.action = "created";
+          if (newId) snapshot.objectId = newId;
+          context.logger.info(
+            "ensureObject {nameSingular}: created",
+            { nameSingular },
+          );
+          const handle = await context.writeResource(
+            "objectEnsured",
+            `object-${nameSingular}`,
+            snapshot,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    ensureRelation: {
+      description:
+        "Idempotently provision ONE custom RELATION between two existing objects. In Twenty a relation IS a field: this POSTs to /rest/metadata/fields with type RELATION plus a relationCreationPayload block, and the ONE call auto-creates BOTH sides (the reverse field on the target is server-minted from targetFieldLabel — never posted here). relationType is MANY_TO_ONE or ONE_TO_MANY only (no first-class MANY_TO_MANY). Non-destructive: a source field whose name already exists as a RELATION is a no-op (`present`; a target/relationType drift is reported, never mutated); a name that exists as a DIFFERENT type is reported (`type-mismatch`), never mutated; a create hard-fails (pre-checked here) if the derived reverse-field name already exists on the target. Both object ids are resolved by nameSingular from one metadata read. dryRun:true (the DEFAULT) validates + plans (planned-create) and writes nothing, returning the exact create payload; a real create requires confirm:true AND dryRun:false. Snapshots a `relationEnsured` resource (re-read from the server after a create).",
+      arguments: z.object({
+        fromObjectNameSingular: z
+          .string()
+          .describe(
+            "Source object owning the field (nameSingular, must already exist), e.g. opportunity",
+          ),
+        toObjectNameSingular: z
+          .string()
+          .describe(
+            "Target object the relation points at (nameSingular, must already exist), e.g. invoice",
+          ),
+        relationType: z
+          .enum(["MANY_TO_ONE", "ONE_TO_MANY"])
+          .describe(
+            "Source-side cardinality. Only MANY_TO_ONE / ONE_TO_MANY exist in Twenty v2.38.1 (MANY_TO_MANY is a separate MORPH/junction concern, out of scope).",
+          ),
+        fromFieldName: z
+          .string()
+          .describe(
+            "Source-side field name — a camelCase identifier, e.g. invoice / opportunities",
+          ),
+        fromLabel: z
+          .string()
+          .optional()
+          .describe(
+            "Source-side display label; defaults to a title-cased name",
+          ),
+        targetFieldLabel: z
+          .string()
+          .describe(
+            "Label of the auto-created REVERSE field on the target object (REQUIRED). Its camelCase name is derived via computeMetadataNameFromLabel and must not already exist on the target.",
+          ),
+        targetFieldIcon: z
+          .string()
+          .describe(
+            "Tabler icon name for the reverse field (REQUIRED), e.g. IconListOpportunity",
+          ),
+        fromIcon: z
+          .string()
+          .optional()
+          .describe("Optional Tabler icon name for the source-side field"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to apply — mutates workspace metadata"),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Preview the plan; write nothing. Defaults true — a real create requires confirm:true AND dryRun:false.",
+          ),
+      }),
+      execute: async (
+        args: {
+          fromObjectNameSingular: string;
+          toObjectNameSingular: string;
+          relationType: "MANY_TO_ONE" | "ONE_TO_MANY";
+          fromFieldName: string;
+          fromLabel?: string;
+          targetFieldLabel: string;
+          targetFieldIcon: string;
+          fromIcon?: string;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to ensure a relation without confirm:true (mutates workspace metadata). Use dryRun:true to preview.",
+            );
+          }
+          const planOnly = args.dryRun || !args.confirm;
+
+          // Validate names/labels before any I/O (a typo can never POST garbage).
+          const fromObject = String(args.fromObjectNameSingular ?? "").trim();
+          const toObject = String(args.toObjectNameSingular ?? "").trim();
+          const fromFieldName = String(args.fromFieldName ?? "").trim();
+          if (!FIELD_NAME_RE.test(fromFieldName)) {
+            throw new Error(
+              `Invalid fromFieldName '${fromFieldName}': must be a camelCase identifier (letter-led, alphanumeric)`,
+            );
+          }
+          if (
+            args.relationType !== "MANY_TO_ONE" &&
+            args.relationType !== "ONE_TO_MANY"
+          ) {
+            throw new Error(
+              `Unsupported relationType '${args.relationType}' (allowed: MANY_TO_ONE, ONE_TO_MANY)`,
+            );
+          }
+          const targetFieldLabel = String(args.targetFieldLabel ?? "").trim();
+          if (!targetFieldLabel) {
+            throw new Error(
+              "targetFieldLabel is required (drives the reverse field name)",
+            );
+          }
+          const targetFieldIcon = String(args.targetFieldIcon ?? "").trim();
+          if (!targetFieldIcon) {
+            throw new Error("targetFieldIcon is required");
+          }
+          const reverseFieldName = computeMetadataNameFromLabel(
+            targetFieldLabel,
+          );
+          if (!reverseFieldName) {
+            throw new Error(
+              `targetFieldLabel '${targetFieldLabel}' yields an empty reverse field name`,
+            );
+          }
+          const fromLabel =
+            args.fromLabel != null && String(args.fromLabel).trim()
+              ? sanitizeText(args.fromLabel, 120)
+              : titleCaseToken(fromFieldName);
+          const fromIcon = args.fromIcon != null && String(args.fromIcon).trim()
+            ? String(args.fromIcon).trim()
+            : undefined;
+
+          // Resolve BOTH object ids from one metadata read.
+          const objs = await fetchObjectsMeta(cfg);
+          const sourceObj = objs.find(
+            (o) => String(o.nameSingular ?? "") === fromObject,
+          );
+          if (!sourceObj) {
+            throw new Error(
+              `Object '${fromObject}' not found in workspace metadata`,
+            );
+          }
+          const targetObj = objs.find(
+            (o) => String(o.nameSingular ?? "") === toObject,
+          );
+          if (!targetObj) {
+            throw new Error(
+              `Object '${toObject}' not found in workspace metadata`,
+            );
+          }
+          const objectMetadataId = String(sourceObj.id ?? "");
+          const targetObjectMetadataId = String(targetObj.id ?? "");
+          if (!objectMetadataId || !targetObjectMetadataId) {
+            throw new Error(
+              "Source/target object is missing its metadata id; cannot create the relation",
+            );
+          }
+
+          // Read-back shaper for a RELATION field DTO -> snapshot detail.
+          const readback = (
+            f: Record<string, unknown>,
+          ): Record<string, unknown> => {
+            const settings = (f.settings ?? {}) as Record<string, unknown>;
+            const rel = (f.relation ?? {}) as Record<string, unknown>;
+            const tgtObj = (rel.targetObjectMetadata ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const srcF = (rel.sourceFieldMetadata ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const tgtF = (rel.targetFieldMetadata ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const out: Record<string, unknown> = {};
+            if (f.id) out.fieldId = String(f.id);
+            if (settings.relationType) {
+              out.relationType = String(settings.relationType);
+            }
+            if (settings.onDelete) out.onDelete = String(settings.onDelete);
+            if (settings.joinColumnName) {
+              out.joinColumnName = String(settings.joinColumnName);
+            }
+            const relDetail: Record<string, unknown> = {};
+            if (tgtObj.id || tgtObj.nameSingular) {
+              relDetail.targetObjectMetadata = {
+                ...(tgtObj.id ? { id: String(tgtObj.id) } : {}),
+                ...(tgtObj.nameSingular
+                  ? { nameSingular: String(tgtObj.nameSingular) }
+                  : {}),
+              };
+            }
+            if (srcF.id || srcF.name) {
+              relDetail.sourceFieldMetadata = {
+                ...(srcF.id ? { id: String(srcF.id) } : {}),
+                ...(srcF.name ? { name: String(srcF.name) } : {}),
+              };
+            }
+            if (tgtF.id || tgtF.name) {
+              relDetail.targetFieldMetadata = {
+                ...(tgtF.id ? { id: String(tgtF.id) } : {}),
+                ...(tgtF.name ? { name: String(tgtF.name) } : {}),
+              };
+            }
+            if (Object.keys(relDetail).length > 0) out.relation = relDetail;
+            return out;
+          };
+
+          const snapshot: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            dryRun: planOnly,
+            fromObjectNameSingular: fromObject,
+            toObjectNameSingular: toObject,
+            name: fromFieldName,
+            fromFieldName: fromFieldName,
+            label: fromLabel,
+            type: "RELATION",
+            relationType: args.relationType,
+            reverseFieldName,
+            targetFieldLabel,
+            targetFieldIcon,
+            objectMetadataId,
+            targetObjectMetadataId,
+            retrievedAt: new Date().toISOString(),
+          };
+
+          // Idempotency (source side): does fromFieldName already exist?
+          const sourceFields = (sourceObj.fields ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const existingSource =
+            (Array.isArray(sourceFields) ? sourceFields : [])
+              .find((f) => String(f.name ?? "") === fromFieldName);
+          if (existingSource) {
+            const existingType = String(existingSource.type ?? "");
+            if (existingType !== "RELATION") {
+              // Present as a DIFFERENT type — reported, never mutated.
+              snapshot.action = "type-mismatch";
+              snapshot.type = existingType;
+              snapshot.typeMismatch =
+                `Field '${fromObject}.${fromFieldName}' exists as type '${existingType}', ` +
+                `requested 'RELATION' — left unchanged (no mutation).`;
+              context.logger.info(
+                "ensureRelation {from}.{name}: type-mismatch ({existing})",
+                {
+                  from: fromObject,
+                  name: fromFieldName,
+                  existing: existingType,
+                },
+              );
+              const handle = await context.writeResource(
+                "relationEnsured",
+                `relation-${fromObject}-${fromFieldName}`,
+                snapshot,
+              );
+              return { dataHandles: [handle] };
+            }
+            // Present as a RELATION — no-op. Note a target/relationType drift.
+            snapshot.action = "present";
+            const rb = readback(existingSource);
+            Object.assign(snapshot, rb);
+            const rbRel = (rb.relation ?? {}) as Record<string, unknown>;
+            const rbTgt = (rbRel.targetObjectMetadata ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const pointsElsewhere = rbTgt.id != null &&
+              String(rbTgt.id) !== targetObjectMetadataId;
+            const cardinalityDrift = rb.relationType != null &&
+              String(rb.relationType) !== args.relationType;
+            if (pointsElsewhere || cardinalityDrift) {
+              snapshot.targetMismatch =
+                `Relation '${fromObject}.${fromFieldName}' exists as ` +
+                `${rb.relationType ?? "?"} -> target ${
+                  rbTgt.id ?? "?"
+                }; requested ` +
+                `${args.relationType} -> target ${targetObjectMetadataId} — left unchanged (no mutation).`;
+            }
+            context.logger.info(
+              "ensureRelation {from}.{name}: present (no-op)",
+              { from: fromObject, name: fromFieldName },
+            );
+            const handle = await context.writeResource(
+              "relationEnsured",
+              `relation-${fromObject}-${fromFieldName}`,
+              snapshot,
+            );
+            return { dataHandles: [handle] };
+          }
+
+          // Reverse-name collision pre-check on the TARGET (create would 400).
+          const targetFields = (targetObj.fields ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const reverseCollision =
+            (Array.isArray(targetFields) ? targetFields : [])
+              .some((f) => String(f.name ?? "") === reverseFieldName);
+          if (reverseCollision) {
+            throw new Error(
+              `Reverse field name '${reverseFieldName}' (from targetFieldLabel '${targetFieldLabel}') ` +
+                `already exists on target object '${toObject}' — a relation create would fail. ` +
+                `Choose a different targetFieldLabel.`,
+            );
+          }
+
+          // CREATE path — build the metadata field body + relationCreationPayload.
+          const payload: Record<string, unknown> = {
+            name: fromFieldName,
+            label: fromLabel,
+            type: "RELATION",
+            objectMetadataId,
+            ...(fromIcon ? { icon: fromIcon } : {}),
+            relationCreationPayload: {
+              type: args.relationType,
+              targetObjectMetadataId,
+              targetFieldLabel,
+              targetFieldIcon,
+            },
+          };
+          snapshot.payload = payload;
+
+          if (planOnly) {
+            snapshot.action = "planned-create";
+            context.logger.info(
+              "ensureRelation {from}.{name}: planned-create (dryRun)",
+              { from: fromObject, name: fromFieldName },
+            );
+            const handle = await context.writeResource(
+              "relationEnsured",
+              `relation-${fromObject}-${fromFieldName}`,
+              snapshot,
+            );
+            return { dataHandles: [handle] };
+          }
+
+          await twentyRequest(cfg, "POST", "/rest/metadata/fields", payload);
+          // Don't trust the create response alone — re-read and locate the field.
+          const objs2 = await fetchObjectsMeta(cfg);
+          const sourceObj2 = objs2.find(
+            (o) => String(o.nameSingular ?? "") === fromObject,
+          );
+          const sourceFields2 = (sourceObj2?.fields ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const created = (Array.isArray(sourceFields2) ? sourceFields2 : [])
+            .find((f) => String(f.name ?? "") === fromFieldName);
+          snapshot.action = "created";
+          if (created) Object.assign(snapshot, readback(created));
+          context.logger.info(
+            "ensureRelation {from}.{name} -> {to}: created ({relType})",
+            {
+              from: fromObject,
+              name: fromFieldName,
+              to: toObject,
+              relType: args.relationType,
+            },
+          );
+          const handle = await context.writeResource(
+            "relationEnsured",
+            `relation-${fromObject}-${fromFieldName}`,
+            snapshot,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
   },
   checks: {
     "reachable": {
@@ -5115,6 +5841,8 @@ export const model = {
         "upsertPerson",
         "ensureField",
         "ensureOpportunitySegmentation",
+        "ensureObject",
+        "ensureRelation",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },
