@@ -16,8 +16,8 @@ import {
 import {
   amountFromMicros,
   buildFilterPath,
-  canonicalJson,
   buildLeadNoteBody,
+  canonicalJson,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
@@ -502,6 +502,102 @@ Deno.test("push_leads refuses a real run without confirm:true", async () => {
     Error,
     "confirm:true",
   );
+});
+
+// --- deleteNote -------------------------------------------------------------
+
+function fakeDeleteCtx() {
+  const written: Record<string, unknown>[] = [];
+  return {
+    globalArgs: {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      opportunityStage: "NEW",
+      emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+      emergencyRestrictedRole: "",
+    },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    written,
+    writeResource: (
+      _spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      written.push(data);
+      return Promise.resolve({ name });
+    },
+  };
+}
+
+Deno.test("deleteNote requires leadId or noteId (throws before any I/O)", async () => {
+  const ctx = fakeDeleteCtx();
+  await assertRejects(
+    () =>
+      model.methods.deleteNote.execute(
+        { dryRun: false, confirm: false },
+        ctx as never,
+      ),
+    Error,
+    "requires leadId or noteId",
+  );
+});
+
+Deno.test("deleteNote dryRun with an explicit noteId plans, no DELETE", async () => {
+  const ctx = fakeDeleteCtx();
+  const orig = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = (() => {
+    called = true;
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as never;
+  try {
+    await model.methods.deleteNote.execute(
+      { noteId: "n-1", dryRun: true, confirm: false },
+      ctx as never,
+    );
+    const rec = ctx.written.at(-1)!;
+    assertEquals(rec.found, true);
+    assertEquals(rec.deleted, false);
+    assertEquals(rec.resolvedVia, "noteId");
+    assert(!called, "dryRun must not call the API");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+Deno.test("deleteNote with a noteId refuses a real delete without confirm:true", async () => {
+  const ctx = fakeDeleteCtx();
+  await assertRejects(
+    () =>
+      model.methods.deleteNote.execute(
+        { noteId: "n-1", dryRun: false, confirm: false },
+        ctx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("deleteNote confirm: DELETEs /rest/notes/{id} and records deleted:true", async () => {
+  const ctx = fakeDeleteCtx();
+  const orig = globalThis.fetch;
+  const calls: { method?: string; url: string }[] = [];
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => {
+    calls.push({ method: init?.method, url: String(url) });
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as never;
+  try {
+    await model.methods.deleteNote.execute(
+      { noteId: "n-9", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    assertEquals(calls.length, 1);
+    assertEquals(calls[0].method, "DELETE");
+    assert(calls[0].url.includes("/rest/notes/n-9"), calls[0].url);
+    assertEquals(ctx.written.at(-1)!.deleted, true);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
 
 // --- upsertOpportunity helpers ----------------------------------------------

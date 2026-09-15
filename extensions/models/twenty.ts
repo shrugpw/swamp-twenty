@@ -2507,6 +2507,17 @@ const NoteListSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+const NoteDeleteSchema = z.object({
+  baseUrl: z.string(),
+  leadId: z.string().nullable(),
+  noteId: z.string().nullable(),
+  resolvedVia: z.enum(["noteId", "leadId"]),
+  found: z.boolean().describe("Whether a matching Note existed to act on"),
+  dryRun: z.boolean(),
+  deleted: z.boolean().describe("True only on a confirmed, non-dry delete"),
+  at: z.iso.datetime(),
+});
+
 // --- SELECT-option snapshot (TWENTY-STAGE-OPTION) ---------------------------
 
 const StageOptionSchema = z.object({
@@ -3103,6 +3114,13 @@ export const model = {
       schema: NoteListSchema,
       lifetime: "3d",
       garbageCollection: 5,
+    },
+    "noteDelete": {
+      description:
+        "Result of a deleteNote run: the resolved target and whether it was deleted",
+      schema: NoteDeleteSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
     },
     "stageOption": {
       description:
@@ -4326,6 +4344,89 @@ export const model = {
             "noteList",
             instanceName,
             snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    deleteNote: {
+      description:
+        "Delete the Note carrying a given leadId (resolved via the leadId filter), or an explicit noteId. Confirm-gated; dryRun resolves the target and plans without deleting. Idempotent — a missing Note is reported (found:false), not an error. Primary use: regenerate a lead Note after a format change (delete, then re-run push_leads, which recreates it). Records a noteDelete resource.",
+      arguments: z.object({
+        leadId: z
+          .string()
+          .optional()
+          .describe("Lead marker whose Note to delete (resolved by leadId)."),
+        noteId: z
+          .string()
+          .optional()
+          .describe("Explicit Note id to delete; skips the leadId lookup."),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Resolve the target and plan without deleting."),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true for a real delete."),
+      }),
+      execute: async (
+        args: {
+          leadId?: string;
+          noteId?: string;
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const explicitId = args.noteId ? String(args.noteId).trim() : "";
+          const lead = args.leadId ? String(args.leadId).trim() : "";
+          if (!explicitId && !lead) {
+            throw new Error("deleteNote requires leadId or noteId");
+          }
+          const resolvedVia: "noteId" | "leadId" = explicitId
+            ? "noteId"
+            : "leadId";
+          let noteId = explicitId;
+          if (!noteId) {
+            if (!isFilterSafe(lead)) {
+              throw new Error("deleteNote: unsupported leadId filter value");
+            }
+            const existing = await findNoteByLeadId(cfg, lead);
+            noteId = existing ? String(existing.id ?? "") : "";
+          }
+          const found = Boolean(noteId);
+          let deleted = false;
+          if (found && !args.dryRun) {
+            if (!args.confirm) {
+              throw new Error(
+                "Refusing to deleteNote without confirm:true (deletes a CRM note)",
+              );
+            }
+            await twentyRequest(
+              cfg,
+              "DELETE",
+              `/rest/notes/${encodeURIComponent(noteId)}`,
+            );
+            deleted = true;
+          }
+          const handle = await context.writeResource(
+            "noteDelete",
+            noteId || `lead-${lead || "none"}`,
+            {
+              baseUrl: cfg.baseUrl,
+              leadId: lead || null,
+              noteId: noteId || null,
+              resolvedVia,
+              found,
+              dryRun: args.dryRun,
+              deleted,
+              at: new Date().toISOString(),
+            },
           );
           return { dataHandles: [handle] };
         } catch (e) {
