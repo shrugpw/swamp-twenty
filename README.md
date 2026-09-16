@@ -178,7 +178,7 @@ the live workspace metadata, exactly like `stage`):
 | ---------------- | ------ | ---------------------------------------------------------------------------------------------- |
 | `lineOfBusiness` | SELECT | Segmentation (`CONSULTING` / `HOSTING` / `GAMES`). Validated against the live enum.             |
 | `sourceChannel`  | SELECT | Segmentation (`DIRECT` / `REFERRAL` / `CONSULTING_HANDOFF`). Validated against the live enum.   |
-| `asn`            | TEXT   | Autonomous System Number. Guarded to `^AS<digits>$` (case-insensitive input, uppercased on store); a non-empty value that doesn't match is rejected. |
+| `asn`            | TEXT   | Autonomous System Number. Guarded to `^AS\d{1,10}$` (AS + 1–10 digits — a 32-bit ASN maxes at 4294967295; case-insensitive input, uppercased on store); a non-empty value that doesn't match is rejected. |
 | `qualStatus`     | SELECT | Technical-qualification state. Validated against the live `opportunity.qualStatus` enum.        |
 
 An empty string for any of these means **leave unchanged** (not "clear").

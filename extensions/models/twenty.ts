@@ -930,7 +930,7 @@ interface OpportunityWriteFields {
 }
 
 /** Assemble a REST body from only the fields that are set (partial-update safe). */
-function buildOpportunityBody(
+export function buildOpportunityBody(
   f: OpportunityWriteFields,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {};
@@ -946,7 +946,17 @@ function buildOpportunityBody(
   if (f.asn !== undefined) body.asn = f.asn;
   if (f.qualStatus !== undefined) body.qualStatus = f.qualStatus;
   if (f.customFields) {
-    for (const [k, v] of Object.entries(f.customFields)) body[k] = v;
+    // Defense-in-depth: never let a customFields key emit a RESERVED field into
+    // the body on ANY path, even though execute() already rejects reserved keys
+    // pre-write. createOpportunityFull re-pins the real leadId over the body on
+    // create; this guard is the equivalent belt-and-suspenders for the UPDATE
+    // (PATCH) path — which sends buildOpportunityBody directly — so the
+    // immutable leadId marker (and every typed-arg field) can never be
+    // overwritten via the escape hatch, matching upsertRecord's matchField strip.
+    for (const [k, v] of Object.entries(f.customFields)) {
+      if (OPP_CUSTOMFIELDS_RESERVED.has(k)) continue;
+      body[k] = v;
+    }
   }
   return body;
 }
@@ -2498,7 +2508,7 @@ const PushRunSchema = z.object({
   }),
 });
 
-const OpportunityUpsertSchema = z.object({
+export const OpportunityUpsertSchema = z.object({
   baseUrl: z.string(),
   action: z.enum(["created", "updated", "planned-create", "planned-update"]),
   dryRun: z.boolean(),
@@ -2605,7 +2615,7 @@ const CompanyRefSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
-const OpportunityRefSchema = z.object({
+export const OpportunityRefSchema = z.object({
   baseUrl: z.string(),
   found: z.boolean(),
   id: z.string().optional(),
@@ -2625,7 +2635,7 @@ const OpportunityRefSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
-const OppViewSchema = z.object({
+export const OppViewSchema = z.object({
   id: z.string(),
   leadId: z.string().optional(),
   name: z.string(),
@@ -5089,8 +5099,14 @@ export const model = {
           // qualStatus SELECT (technical-qualification): same best-effort enum
           // validation posture as the segmentation SELECTs — empty => unset
           // (leave unchanged), invalid token fails fast, skipped when the
-          // field's options are unreadable.
-          const qualStatus = args.qualStatus || undefined;
+          // field's options are unreadable. sanitizeText is applied first so
+          // that even in the metadata-unreadable skip-window a control-char /
+          // oversized token can never reach the REST body or the snapshot (a
+          // valid UPPER_SNAKE token is unaffected). (Pre-existing sibling
+          // SELECTs lineOfBusiness/sourceChannel share the same gap — a
+          // follow-up outside this work item's scope.)
+          const qualStatus = sanitizeText(args.qualStatus ?? "", 120) ||
+            undefined;
           if (
             qualStatus !== undefined && oppMeta.qualStatus.length &&
             !oppMeta.qualStatus.includes(qualStatus)
@@ -5103,18 +5119,21 @@ export const model = {
           }
 
           // asn TEXT (F5): sanitize + length-cap, then a positive format guard
-          // ^AS<digits>$ (case-insensitive input, uppercased on store). A
-          // non-empty value that does not match is rejected pre-write; empty =>
-          // unset (omit, never nulled). asn is a write value, never a filter
-          // operand, so no filter-safety framing.
+          // ^AS\d{1,10}$ (case-insensitive input, uppercased on store). The
+          // digit bound is both correct (a 32-bit ASN maxes at 4294967295 = 10
+          // digits) and closes a truncate-before-guard false match — an
+          // all-digit value longer than the cap would otherwise be truncated
+          // and then pass ^AS\d+$; the {1,10} bound rejects it. A non-empty
+          // value that does not match is rejected pre-write; empty => unset
+          // (omit, never nulled). asn is a write value, never a filter operand.
           let asn: string | undefined;
           {
             const rawAsn = sanitizeText(args.asn ?? "", 64);
             if (rawAsn) {
               const up = rawAsn.toUpperCase();
-              if (!/^AS\d+$/.test(up)) {
+              if (!/^AS\d{1,10}$/.test(up)) {
                 throw new Error(
-                  `Invalid asn '${rawAsn}': expected AS followed by digits (e.g. AS64249), or empty to leave unchanged`,
+                  `Invalid asn '${rawAsn}': expected AS followed by 1-10 digits (e.g. AS64249), or empty to leave unchanged`,
                 );
               }
               asn = up;
@@ -5146,25 +5165,30 @@ export const model = {
                   }': must be a camelCase identifier (letter-led, alphanumeric)`,
                 );
               }
+              // `key` has passed FIELD_NAME_RE (ASCII, letter-led) so it carries
+              // no control chars/HTML/path separators, but it is length-unbounded
+              // — cap it in every surfaced message (matching the "Invalid key"
+              // branch above) so a huge key can't bloat a durable error report.
+              const safeKey = sanitizeText(key, 80);
               if (OPP_CUSTOMFIELDS_RESERVED.has(key)) {
                 throw new Error(
-                  `customFields key '${key}' is reserved — set it via its typed argument, not customFields`,
+                  `customFields key '${safeKey}' is reserved — set it via its typed argument, not customFields`,
                 );
               }
               if (v === null) {
                 throw new Error(
-                  `customFields key '${key}' is null; null is not permitted (omit the key to leave the field unchanged)`,
+                  `customFields key '${safeKey}' is null; null is not permitted (omit the key to leave the field unchanged)`,
                 );
               }
               const fMeta = oppMeta.fields.get(key);
               if (!fMeta) {
                 throw new Error(
-                  `Unknown customFields key '${key}' on opportunity (fail-closed; refusing to write an unrecognized field)`,
+                  `Unknown customFields key '${safeKey}' on opportunity (fail-closed; refusing to write an unrecognized field)`,
                 );
               }
               if (!UPSERT_SCALAR_TYPES.has(fMeta.type)) {
                 throw new Error(
-                  `customFields key '${key}' has non-scalar type '${fMeta.type}' (allowed: ${
+                  `customFields key '${safeKey}' has non-scalar type '${fMeta.type}' (allowed: ${
                     [...UPSERT_SCALAR_TYPES].join(", ")
                   }); composite fields are not supported`,
                 );
@@ -5179,7 +5203,7 @@ export const model = {
                 const token = String(out);
                 if (fMeta.options.length && !fMeta.options.includes(token)) {
                   throw new Error(
-                    `Invalid value '${token}' for SELECT customFields key '${key}'. Valid options: ${
+                    `Invalid value '${token}' for SELECT customFields key '${safeKey}'. Valid options: ${
                       fMeta.options.join(", ")
                     }`,
                   );
@@ -5370,7 +5394,11 @@ export const model = {
           );
           return { dataHandles: [handle] };
         } catch (e) {
-          throw new Error(redactError(e));
+          // Pass the vaulted bearer token for exact scrubbing (mirrors
+          // upsertRecord): this commit grows the set of caller-controlled values
+          // (asn/qualStatus/customFields) that could be echoed in a Twenty 4xx
+          // and land in a durable method-summary report; the token must never.
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },

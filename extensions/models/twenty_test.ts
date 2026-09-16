@@ -17,6 +17,7 @@ import {
   amountFromMicros,
   buildFilterPath,
   buildLeadNoteBody,
+  buildOpportunityBody,
   canonicalJson,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
@@ -39,6 +40,9 @@ import {
   normalizePhone,
   normalizeRequestedOption,
   OPPORTUNITY_SEGMENTATION_FIELDS,
+  OpportunityRefSchema,
+  OpportunityUpsertSchema,
+  OppViewSchema,
   planLead,
   planSelectOptions,
   redactError,
@@ -1153,8 +1157,17 @@ Deno.test("upsertOpportunity rejects a malformed asn (^AS<digits>$ guard)", asyn
     return {};
   });
   try {
-    // Bare digits (no AS prefix) and junk both fail the positive guard.
-    for (const bad of ["64249", "AS64249; DROP", "ASN-64249"]) {
+    // Bare digits (no AS prefix), junk, AS-with-no-digits, and >10 digits (over
+    // the 32-bit ASN bound — also the truncate-before-guard guard) all fail.
+    for (
+      const bad of [
+        "64249",
+        "AS64249; DROP",
+        "ASN-64249",
+        "AS",
+        "AS12345678901",
+      ]
+    ) {
       await assertRejects(
         () =>
           model.methods.upsertOpportunity.execute(
@@ -1423,6 +1436,149 @@ Deno.test("upsertOpportunity customFields: fail-closed when opportunity metadata
   } finally {
     restore();
   }
+});
+
+// --- upsertOpportunity code-review-rework (cycle 2) hardening ----------------
+
+Deno.test("OpportunityUpsertSchema round-trips asn/qualStatus/customFields (F6 no-strip)", () => {
+  const parsed = OpportunityUpsertSchema.parse({
+    baseUrl: "https://crm.example.com",
+    action: "created",
+    dryRun: false,
+    leadId: "L1",
+    name: "X",
+    stage: "NEW",
+    asn: "AS64249",
+    qualStatus: "FUTURE",
+    customFields: { region: "us-east", tier: "PRIORITY" },
+    companyLinked: false,
+    noteEnsured: false,
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  // If a field had been omitted from the schema, zod would strip it here and
+  // read-back verification would silently pass on a value that never persisted.
+  assertEquals(parsed.asn, "AS64249");
+  assertEquals(parsed.qualStatus, "FUTURE");
+  assertEquals(parsed.customFields, { region: "us-east", tier: "PRIORITY" });
+});
+
+Deno.test("OppViewSchema + OpportunityRefSchema round-trip asn/qualStatus (F6 no-strip)", () => {
+  const v = OppViewSchema.parse({
+    id: "o1",
+    name: "X",
+    stage: "NEW",
+    asn: "AS1",
+    qualStatus: "RESEARCH",
+  });
+  assertEquals(v.asn, "AS1");
+  assertEquals(v.qualStatus, "RESEARCH");
+  const r = OpportunityRefSchema.parse({
+    baseUrl: "b",
+    found: true,
+    asn: "AS2",
+    qualStatus: "FUTURE",
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  assertEquals(r.asn, "AS2");
+  assertEquals(r.qualStatus, "FUTURE");
+});
+
+Deno.test("upsertOpportunity opportunityUpsert snapshot carries asn/qualStatus/customFields (F10 content)", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "snap-2026",
+        name: "Snap",
+        asn: "AS64249",
+        qualStatus: "FUTURE",
+        customFields: { region: "us-east" },
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "opportunityUpsert");
+    assert(snap, "expected an opportunityUpsert snapshot write");
+    assertEquals(snap!.data.asn, "AS64249");
+    assertEquals(snap!.data.qualStatus, "FUTURE");
+    assertEquals(snap!.data.customFields, { region: "us-east" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on the UPDATE (PATCH) path", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "asn-update-2026",
+        name: "Upd",
+        asn: "as64249",
+        qualStatus: "CONTACT_IDENTIFIED",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals(body.asn, "AS64249");
+    assertEquals(body.qualStatus, "CONTACT_IDENTIFIED");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("buildOpportunityBody drops a reserved customFields key (defense-in-depth, both paths)", () => {
+  // Even if a reserved key somehow reached buildOpportunityBody (execute rejects
+  // it upstream), the body-assembly layer must never emit it — so the immutable
+  // leadId marker cannot be overwritten via the escape hatch on the PATCH path.
+  const body = buildOpportunityBody({
+    name: "X",
+    customFields: {
+      leadId: "hijack",
+      lineOfBusiness: "HOSTING",
+      region: "us-east",
+    } as Record<string, string | number | boolean>,
+  });
+  assertEquals("leadId" in body, false);
+  assertEquals("lineOfBusiness" in body, false);
+  assertEquals(body.region, "us-east");
+  assertEquals(body.name, "X");
 });
 
 // --- Read surface (TWENTY-READ-SURFACE) -------------------------------------

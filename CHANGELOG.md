@@ -9,9 +9,10 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
 - **`upsertOpportunity` provider-pipeline fields** (`TWENTY-OPP-FIELDS`) — the
   method can now write the two Opportunity custom fields the SHRUG-NET provider
   pipeline needs, plus a generic scalar escape hatch:
-  - **`asn`** (TEXT) — Autonomous System Number, guarded to `^AS<digits>$`
-    (case-insensitive input, uppercased on store); a non-empty value that doesn't
-    match is rejected. Empty ⇒ left unchanged.
+  - **`asn`** (TEXT) — Autonomous System Number, guarded to `^AS\d{1,10}$`
+    (AS + 1–10 digits — a 32-bit ASN maxes at 4294967295; case-insensitive input,
+    uppercased on store); a non-empty value that doesn't match is rejected.
+    Empty ⇒ left unchanged.
   - **`qualStatus`** (SELECT) — technical-qualification state, validated against
     the live `opportunity.qualStatus` enum exactly like `stage`. Empty ⇒ left
     unchanged.
