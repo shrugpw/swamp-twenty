@@ -1509,6 +1509,96 @@ async function fetchOpportunityMeta(
   return { stages, closeDateType, lineOfBusiness, sourceChannel };
 }
 
+// --- Generic record upsert: strict controls (TWENTY-RECORD-UPSERT) ----------
+// v1 object allowlist. ONLY these CUSTOM objects may be written by the generic
+// upsertRecord; any other object (standard OR unlisted custom) is rejected
+// BEFORE any I/O. This in-code allowlist — NOT an isCustom metadata flag — is
+// the real safety control (see fetchUpsertObjectMeta for why isCustom is not
+// available on this API surface). Extend deliberately.
+const UPSERT_OBJECT_ALLOWLIST = new Set<string>([
+  "subscription",
+  "channelPartner",
+]);
+// Scalar field TYPEs upsertRecord may write. Composites (CURRENCY / EMAILS /
+// PHONES / FULL_NAME / LINKS / ADDRESS / RELATION / ACTOR / POSITION / …) are
+// rejected pre-write with a clear error rather than a blind Twenty 400 —
+// composite support is v2.
+const UPSERT_SCALAR_TYPES = new Set<string>([
+  "TEXT",
+  "NUMBER",
+  "BOOLEAN",
+  "DATE_TIME",
+  "SELECT",
+  "UUID",
+]);
+// Immutable/system fields no caller may set as matchField OR in `fields`.
+const UPSERT_RESERVED_FIELDS = new Set<string>([
+  "id",
+  "createdAt",
+  "updatedAt",
+  "deletedAt",
+  "position",
+]);
+const UPSERT_MATCH_VALUE_CAP = 200;
+const UPSERT_FIELD_TEXT_CAP = 500;
+
+/**
+ * Resolve the write-relevant metadata for ONE object by nameSingular: its REST
+ * plural (read from metadata, never guessed) and a name→{type, SELECT-option
+ * values} map for every field. upsertRecord uses this to resolve the plural,
+ * cross-check that matchField and every `fields` key exist and are scalar, and
+ * validate SELECT values against the LIVE enum before a write. Throws if the
+ * object is absent from workspace metadata.
+ *
+ * NOTE (isCustom — live-verified 2026-09-16 against crm.shrug.pw, Twenty
+ * v2.38.x): the `/rest/metadata/objects` rows carry NO `isCustom` flag. The row
+ * keys are id / universalIdentifier / applicationId / nameSingular / namePlural
+ * / label* / description / icon / isRemote / isActive / isSystem / isUI* /
+ * isSearchable / … / fields — and `isSystem` is `false` for BOTH standard
+ * (person, opportunity) AND custom (subscription, channelPartner) objects, so it
+ * cannot distinguish custom from standard. Per the approved spec's resolution #6
+ * the strict UPSERT_OBJECT_ALLOWLIST is the real control, so the isCustom
+ * defense-in-depth assert is intentionally DROPPED (the flag is unavailable on
+ * this API surface). Re-verify and reinstate a `== true` assert if a future
+ * Twenty version exposes a reliable custom flag here.
+ */
+async function fetchUpsertObjectMeta(
+  cfg: TwentyCfg,
+  objectNameSingular: string,
+): Promise<{
+  plural: string;
+  fields: Map<string, { type: string; options: string[] }>;
+}> {
+  const objs = await fetchObjectsMeta(cfg);
+  const obj = objs.find(
+    (o) => String(o.nameSingular ?? "") === objectNameSingular,
+  );
+  if (!obj) {
+    throw new Error(
+      `Object '${objectNameSingular}' not found in workspace metadata`,
+    );
+  }
+  const plural = String(obj.namePlural ?? "");
+  if (!plural) {
+    throw new Error(
+      `Object '${objectNameSingular}' has no namePlural in workspace metadata`,
+    );
+  }
+  const fieldList = (obj.fields ?? []) as Array<Record<string, unknown>>;
+  const fields = new Map<string, { type: string; options: string[] }>();
+  for (const f of Array.isArray(fieldList) ? fieldList : []) {
+    const name = String(f.name ?? "");
+    if (!name) continue;
+    const type = String(f.type ?? "");
+    const opts = (f.options ?? []) as Array<Record<string, unknown>>;
+    const options = Array.isArray(opts)
+      ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
+      : [];
+    fields.set(name, { type, options });
+  }
+  return { plural, fields };
+}
+
 // --- SELECT-option provisioning helpers (TWENTY-STAGE-OPTION) ----------------
 
 // SO-4: only these (object,field) pairs may be targeted, so a typo/CEL slip can
@@ -2368,6 +2458,38 @@ const OpportunityUpsertSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Generic record upsert snapshot (TWENTY-RECORD-UPSERT) ------------------
+// The outcome of an upsertRecord run: the action taken, the resolved object
+// identity + plural, the natural-key field, and the create/patch payload. The
+// matchValue is stored ONLY as a hash (matchValueHash) — never raw — so an
+// attacker-influenced natural key cannot leak into durable data; the raw
+// canonical value survives only inside creationPayload (the exact body a create
+// WOULD/DID POST), matching upsertOpportunity's posture of persisting submitted
+// (never Twenty-response) values. No raw Twenty response body is persisted.
+const RecordUpsertedSchema = z.object({
+  baseUrl: z.string(),
+  action: z.enum(["created", "updated", "planned-create", "planned-update"]),
+  dryRun: z.boolean(),
+  objectNameSingular: z.string(),
+  plural: z.string(),
+  matchField: z.string(),
+  matchValueHash: z
+    .string()
+    .describe("Hash of the canonical natural-key value (never the raw value)"),
+  recordId: z.string().optional(),
+  writtenFields: z
+    .record(z.string(), z.unknown())
+    .describe(
+      "Sanitized scalar fields sent in the create/patch (excludes matchField)",
+    ),
+  creationPayload: z
+    .record(z.string(), z.unknown())
+    .describe(
+      "The exact body a create did/would POST: writtenFields plus the canonical matchField value",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Read-surface snapshots (TWENTY-READ-SURFACE) ---------------------------
 // Existence-check snapshots for the reconcile audit. `found` distinguishes
 // "looked, not there" from "never looked". Deliberately carry NO bulk PII — only
@@ -3100,6 +3222,13 @@ export const model = {
       description:
         "Result of an upsertOpportunity run: the action taken and the resolved opportunity/company/contact ids",
       schema: OpportunityUpsertSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "recordUpserted": {
+      description:
+        "Result of an upsertRecord run: the action taken, the resolved custom object/plural, the natural-key field, the hashed match value, and the create/patch payload (no raw match value, no Twenty response body)",
+      schema: RecordUpsertedSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -4994,6 +5123,340 @@ export const model = {
           return { dataHandles: [handle] };
         } catch (e) {
           throw new Error(redactError(e));
+        }
+      },
+    },
+    upsertRecord: {
+      description:
+        "Generic, idempotent create-or-update for a single record of an eligible CUSTOM object, keyed on a caller-chosen natural-key field. Object-agnostic sibling of upsertOpportunity, fail-closed throughout: objectNameSingular MUST be in a strict in-code allowlist (v1: subscription, channelPartner) — any other object errors before any I/O; matchField must be a camelCase, non-reserved, scalar field that exists on the object; every `fields` key must exist and be a scalar TYPE (TEXT/NUMBER/BOOLEAN/DATE_TIME/SELECT/UUID) — unknown keys and composite types (CURRENCY/RELATION/…) are rejected pre-write, and SELECT values are validated against the live enum. Finds by natural key (limit=2 → 0 create, 1 update, ≥2 refuse-ambiguous), with a create→conflict→update race fallback. PATCH sends only the caller's fields (matchField excluded → natural key preserved); matchField is stripped from `fields` entirely so it can never rewrite the key. String values are sanitized; the same canonical match value is used for BOTH the find filter and the stored create body. Idempotency is best-effort (Twenty has no unique constraint) — de-dupe a pre-existing ≥2 manually, then re-run; single-operator serialized use. confirm:true required for a real run; dryRun:true resolves + plans (planned-create/planned-update) and writes nothing. Snapshots a `recordUpserted` resource (match value stored hashed, never raw).",
+      arguments: z.object({
+        objectNameSingular: z
+          .string()
+          .describe(
+            "Custom object to upsert (nameSingular). MUST be in the v1 allowlist: subscription, channelPartner.",
+          ),
+        matchField: z
+          .string()
+          .describe(
+            "camelCase natural-key field to match on (must exist on the object and be a scalar type; not a reserved field)",
+          ),
+        matchValue: z
+          .string()
+          .describe(
+            "Natural-key value. Canonicalized once (sanitized + filter-safety checked) and used identically for the find filter and the stored value.",
+          ),
+        fields: z
+          .record(
+            z.string(),
+            z.union([z.string(), z.number(), z.boolean(), z.null()]),
+          )
+          .describe(
+            "Scalar fields to write (create + update). Keys must exist on the object and be scalar; string values are sanitized; explicit null clears. matchField is stripped if present.",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true for a real run (writes to Twenty)"),
+        dryRun: z
+          .boolean()
+          .default(false)
+          .describe("Resolve + plan, but write nothing"),
+      }),
+      execute: async (
+        args: {
+          objectNameSingular: string;
+          matchField: string;
+          matchValue: string;
+          fields: Record<string, string | number | boolean | null>;
+          confirm: boolean;
+          dryRun: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        // (Safety gate) evaluated FIRST — nothing resolved, no I/O.
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to write without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        // (Allowlist) reject any non-allowlisted object BEFORE any I/O. This is
+        // the real control; there is no isCustom flag to lean on (see
+        // fetchUpsertObjectMeta).
+        const objectNameSingular = String(args.objectNameSingular ?? "").trim();
+        if (!UPSERT_OBJECT_ALLOWLIST.has(objectNameSingular)) {
+          throw new Error(
+            `Object '${objectNameSingular}' is not upsertable (allowed: ${
+              [...UPSERT_OBJECT_ALLOWLIST].join(", ")
+            })`,
+          );
+        }
+        // (matchField) camelCase + not reserved, BEFORE any I/O.
+        const matchField = String(args.matchField ?? "").trim();
+        if (!FIELD_NAME_RE.test(matchField)) {
+          throw new Error(
+            `Invalid matchField '${matchField}': must be a camelCase identifier (letter-led, alphanumeric)`,
+          );
+        }
+        if (UPSERT_RESERVED_FIELDS.has(matchField)) {
+          throw new Error(
+            `matchField '${matchField}' is reserved and cannot be a natural key`,
+          );
+        }
+        // (matchValue) canonicalize ONCE. The IDENTICAL bytes are used for both
+        // the GET filter and the stored create-body value, so a re-run finds
+        // exactly what it wrote (no asymmetry dupes).
+        const canonicalMatchValue = sanitizeText(
+          args.matchValue,
+          UPSERT_MATCH_VALUE_CAP,
+        );
+        if (!isFilterSafe(canonicalMatchValue)) {
+          throw new Error(
+            "matchValue is empty or contains filter-unsafe characters after sanitization",
+          );
+        }
+        // (fields) strip matchField ENTIRELY (never let it rewrite the natural
+        // key) + reject reserved/malformed keys, BEFORE any I/O. Existence,
+        // scalar-type, and SELECT-option checks need metadata and run below.
+        const rawFields = (args.fields ?? {}) as Record<
+          string,
+          string | number | boolean | null
+        >;
+        const cleaned: Record<string, string | number | boolean | null> = {};
+        for (const [k, v] of Object.entries(rawFields)) {
+          const key = String(k).trim();
+          if (key === matchField) continue; // strip the natural key from fields
+          if (!FIELD_NAME_RE.test(key)) {
+            throw new Error(
+              `Invalid field name '${key}': must be a camelCase identifier (letter-led, alphanumeric)`,
+            );
+          }
+          if (UPSERT_RESERVED_FIELDS.has(key)) {
+            throw new Error(`Field '${key}' is reserved and cannot be set`);
+          }
+          cleaned[key] = v;
+        }
+
+        // Extend redactError's scrub to the caller's OWN submitted values (the
+        // canonical match value + sanitized string field values), so a Twenty
+        // 4xx that echoes a submitted value can never leak it into a thrown
+        // error or durable data. We never persist a raw Twenty response body.
+        const submittedStrings: string[] = [canonicalMatchValue];
+        const scrubSubmitted = (msg: string): string => {
+          let s = msg;
+          for (const v of submittedStrings) {
+            if (typeof v === "string" && v.length >= 3) {
+              s = s.split(v).join("[redacted-value]");
+            }
+          }
+          return s;
+        };
+        // Envelope-independent id extraction from a mutation response
+        // (`{data:{create<Object>:{...}}}`): take the first record under `data`
+        // rather than guess the op key (mirrors the ensureObject fix).
+        const firstRecord = (json: unknown): Record<string, unknown> => {
+          const d = (json as { data?: Record<string, unknown> })?.data ?? {};
+          const v = Object.values(d)[0];
+          return (v && typeof v === "object" ? v : {}) as Record<
+            string,
+            unknown
+          >;
+        };
+
+        try {
+          // (1) metadata: resolve plural + field type/option map. Object
+          // presence is re-asserted here (belt-and-suspenders over the
+          // allowlist). isCustom assert intentionally dropped.
+          const meta = await fetchUpsertObjectMeta(cfg, objectNameSingular);
+          const plural = meta.plural;
+
+          // (matchField) must exist on the object AND be scalar.
+          const mfMeta = meta.fields.get(matchField);
+          if (!mfMeta) {
+            throw new Error(
+              `matchField '${matchField}' does not exist on object '${objectNameSingular}'`,
+            );
+          }
+          if (!UPSERT_SCALAR_TYPES.has(mfMeta.type)) {
+            throw new Error(
+              `matchField '${matchField}' has non-scalar type '${mfMeta.type}' (allowed: ${
+                [...UPSERT_SCALAR_TYPES].join(", ")
+              })`,
+            );
+          }
+
+          // (fields) existence (fail-closed) + scalar type + SELECT option
+          // validation + string sanitization → the field set actually written.
+          const writtenFields: Record<
+            string,
+            string | number | boolean | null
+          > = {};
+          for (const [key, val] of Object.entries(cleaned)) {
+            const fMeta = meta.fields.get(key);
+            if (!fMeta) {
+              throw new Error(
+                `Unknown field '${key}' on object '${objectNameSingular}' (fail-closed; refusing to write an unrecognized field)`,
+              );
+            }
+            if (!UPSERT_SCALAR_TYPES.has(fMeta.type)) {
+              throw new Error(
+                `Field '${key}' has non-scalar type '${fMeta.type}' (allowed: ${
+                  [...UPSERT_SCALAR_TYPES].join(", ")
+                }); composite fields are not supported (v2)`,
+              );
+            }
+            let out: string | number | boolean | null = val;
+            if (typeof val === "string") {
+              out = sanitizeText(val, UPSERT_FIELD_TEXT_CAP);
+              submittedStrings.push(out);
+            }
+            if (fMeta.type === "SELECT" && out !== null) {
+              const token = String(out);
+              if (fMeta.options.length && !fMeta.options.includes(token)) {
+                throw new Error(
+                  `Invalid value '${token}' for SELECT field '${key}'. Valid options: ${
+                    fMeta.options.join(", ")
+                  }`,
+                );
+              }
+            }
+            writtenFields[key] = out;
+          }
+
+          // The full create body (used on the create path AND recorded as the
+          // canonical "would-create" payload). matchField carries the IDENTICAL
+          // canonical bytes used in the find filter.
+          const creationPayload: Record<string, unknown> = {
+            ...writtenFields,
+            [matchField]: canonicalMatchValue,
+          };
+
+          // (2) find by natural key; limit=2 detects ambiguity.
+          const findPath = `${
+            buildFilterPath(`/rest/${plural}`, matchField, canonicalMatchValue)
+          }&limit=2`;
+          const existingList = unwrapList(
+            await twentyRequest(cfg, "GET", findPath),
+            plural,
+          );
+          if (existingList.length >= 2) {
+            throw new Error(
+              `Ambiguous natural key on '${objectNameSingular}.${matchField}': ${existingList.length} matching ${plural} — refusing to guess (de-dupe manually, then re-run)`,
+            );
+          }
+          const existing = existingList[0] ?? null;
+          let recordId = existing ? String(existing.id ?? "") : "";
+          let action:
+            | "created"
+            | "updated"
+            | "planned-create"
+            | "planned-update";
+
+          if (args.dryRun) {
+            action = existing ? "planned-update" : "planned-create";
+          } else if (existing) {
+            // PATCH sends ONLY the caller's fields; matchField is EXCLUDED, so
+            // the natural key is preserved and a re-run is a value-identical
+            // no-op PATCH. An explicit null clears a field.
+            await twentyRequest(
+              cfg,
+              "PATCH",
+              `/rest/${plural}/${recordId}`,
+              writtenFields,
+            );
+            action = "updated";
+          } else {
+            // create, with a check-then-act race fallback (Twenty has no unique
+            // constraint on the natural key).
+            try {
+              const created = firstRecord(
+                await twentyRequest(
+                  cfg,
+                  "POST",
+                  `/rest/${plural}`,
+                  creationPayload,
+                ),
+              );
+              recordId = String(created.id ?? "");
+              action = "created";
+              if (!recordId) {
+                // Response envelope carried no id (version drift): resolve it
+                // authoritatively by re-reading the natural key.
+                const after = unwrapList(
+                  await twentyRequest(cfg, "GET", findPath),
+                  plural,
+                );
+                if (after.length === 1) recordId = String(after[0].id ?? "");
+              }
+            } catch (e) {
+              // A concurrent run may have created it between our find and POST.
+              const raced = unwrapList(
+                await twentyRequest(cfg, "GET", findPath),
+                plural,
+              );
+              if (raced.length === 1) {
+                recordId = String(raced[0].id ?? "");
+                await twentyRequest(
+                  cfg,
+                  "PATCH",
+                  `/rest/${plural}/${recordId}`,
+                  writtenFields,
+                );
+                action = "updated";
+              } else if (raced.length === 0) {
+                throw new Error(
+                  `Create failed and the record is still not found by its natural key — unconfirmable: ${
+                    scrubSubmitted(redactError(e, 300, cfg.apiToken))
+                  }`,
+                );
+              } else {
+                throw new Error(
+                  `Create failed and the natural key is now ambiguous (${raced.length} matches) — refusing to guess`,
+                );
+              }
+            }
+          }
+
+          // Snapshot instance name + the non-raw match-value key both derive
+          // from ONE listInstanceHash of {object, matchField, canonical value}
+          // (single object arg — resolution #3).
+          const matchValueHash = await listInstanceHash({
+            object: objectNameSingular,
+            matchField,
+            matchValue: canonicalMatchValue,
+          });
+
+          context.logger.info(
+            "upsertRecord {object}.{field}: {action} (id {id}){dry}",
+            {
+              object: objectNameSingular,
+              field: matchField,
+              action,
+              id: recordId || "-",
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+
+          const handle = await context.writeResource(
+            "recordUpserted",
+            `record-${objectNameSingular}-${matchValueHash}`,
+            {
+              baseUrl: cfg.baseUrl,
+              action,
+              dryRun: args.dryRun,
+              objectNameSingular,
+              plural,
+              matchField,
+              matchValueHash,
+              ...(recordId ? { recordId } : {}),
+              writtenFields,
+              creationPayload,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(scrubSubmitted(redactError(e, 300, cfg.apiToken)));
         }
       },
     },

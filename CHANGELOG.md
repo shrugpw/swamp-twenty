@@ -2,6 +2,42 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.15.5
+
+### Added
+
+- **`upsertRecord`** — a single generic, idempotent create-or-update for one
+  record of an eligible **custom** object, keyed on a caller-chosen natural-key
+  field. The object-agnostic sibling of `upsertOpportunity`, fail-closed
+  throughout:
+  - `objectNameSingular` MUST be in a strict in-code allowlist (v1:
+    `subscription`, `channelPartner`); any other object — standard or unlisted
+    custom — errors **before any I/O**. (The `/rest/metadata/objects` API carries
+    no `isCustom` flag to lean on, so the allowlist is the real control.)
+  - `matchField` must be a camelCase, non-reserved, **scalar** field that exists
+    on the object; `matchValue` is canonicalized once (sanitized + filter-safety
+    checked) and used **identically** for the find filter and the stored create
+    value (no asymmetry dupes).
+  - `fields` accepts scalar types only (`TEXT` / `NUMBER` / `BOOLEAN` /
+    `DATE_TIME` / `SELECT` / `UUID`); unknown keys are rejected fail-closed,
+    composite types (`CURRENCY` / `RELATION` / …) are rejected pre-write with a
+    clear error (never a blind Twenty 400), `SELECT` values are validated against
+    the live enum, string values are sanitized, and reserved fields
+    (`id` / `createdAt` / `updatedAt` / `deletedAt` / `position`) are refused.
+    `matchField` is stripped from `fields` entirely so it can never rewrite the
+    natural key.
+  - Find keyed on the natural key (`limit=2`): 0 → create, 1 → update, ≥2 → refuse
+    (ambiguous). The create path has a create→conflict→re-GET→update race
+    fallback. `PATCH` sends only the caller's fields (`matchField` excluded), so a
+    re-run is a value-identical no-op and the natural key is preserved. Best-effort
+    idempotency (Twenty has no unique constraint) — a pre-existing ≥2 hard-errors
+    by design; single-operator serialized use.
+  - `confirm:true` required for a real write; `dryRun:true` plans
+    (`planned-create` / `planned-update`) and writes nothing. Wrapped in
+    `redactError` plus a submitted-value scrub so a Twenty 4xx can never leak the
+    token or a submitted value. Snapshots a `recordUpserted` resource with the
+    match value stored **hashed**, never raw, and no Twenty response body.
+
 ## 2026.09.10.2
 
 ### Changed

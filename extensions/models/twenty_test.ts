@@ -4098,3 +4098,777 @@ Deno.test("push_leads fails fast on a non-UPPER_SNAKE leadSourceChannel (before 
     "leadSourceChannel must be UPPER_SNAKE",
   );
 });
+
+// --- upsertRecord (generic custom-object create-or-update) -------------------
+// All exercised via the injected-fetch harness (stubTwentyFetch / bespoke
+// stubs) — no live Twenty. Metadata mirrors the LIVE shape of the two
+// allowlisted objects (verified against crm.shrug.pw 2026-09-16): scalar
+// TEXT/NUMBER/SELECT fields + reserved id/createdAt/deletedAt/position + real
+// composite types (RELATION), plus a synthetic CURRENCY field for the
+// composite-rejection case.
+
+const REC_META = {
+  data: [{
+    nameSingular: "subscription",
+    namePlural: "subscriptions",
+    fields: [
+      { name: "id", type: "UUID" },
+      { name: "createdAt", type: "DATE_TIME" },
+      { name: "updatedAt", type: "DATE_TIME" },
+      { name: "deletedAt", type: "DATE_TIME" },
+      { name: "position", type: "POSITION" },
+      { name: "name", type: "TEXT" },
+      { name: "invoiceNinjaClientRef", type: "TEXT" },
+      { name: "mrr", type: "NUMBER" },
+      { name: "renewalDate", type: "DATE_TIME" },
+      {
+        name: "status",
+        type: "SELECT",
+        options: [{ value: "DRAFT" }, { value: "ACTIVE" }, {
+          value: "CHURNED",
+        }],
+      },
+      { name: "monthlyValue", type: "CURRENCY" }, // composite (rejection test)
+      { name: "company", type: "RELATION" }, // composite
+    ],
+  }],
+};
+
+// A capturing execute-context: records the last writeResource call so a test
+// can assert on the snapshot spec/name/attributes.
+function makeRecCtx() {
+  const captured: {
+    spec?: string;
+    name?: string;
+    data?: Record<string, unknown>;
+  } = {};
+  const ctx = {
+    globalArgs: {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      opportunityStage: "NEW",
+      emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+      emergencyRestrictedRole: "",
+    },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: (
+      spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      captured.spec = spec;
+      captured.name = name;
+      captured.data = data;
+      return Promise.resolve({ name });
+    },
+  };
+  return { ctx, captured };
+}
+
+// A fetch stub that returns a chosen non-2xx for a matched (method,path) and
+// 2xx otherwise — for the create-race and redaction paths.
+function stubTwentyFetchStatus(
+  handlers: (
+    method: string,
+    path: string,
+    body: unknown,
+  ) => { status?: number; payload?: unknown },
+): {
+  calls: Array<{ method: string; path: string; body: unknown }>;
+  restore: () => void;
+} {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => {
+    const path = String(url).replace("https://crm.example.com", "");
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    const { status = 200, payload = {} } = handlers(method, path, body) ?? {};
+    const ok = status >= 200 && status < 300;
+    const text = typeof payload === "string"
+      ? payload
+      : JSON.stringify(payload);
+    return Promise.resolve(
+      {
+        ok,
+        status,
+        statusText: ok ? "OK" : "Error",
+        text: () => Promise.resolve(text),
+      } as Response,
+    );
+  }) as typeof fetch;
+  return { calls, restore: () => (globalThis.fetch = orig) };
+}
+
+const REC_BASE = {
+  objectNameSingular: "subscription",
+  matchField: "invoiceNinjaClientRef",
+  matchValue: "client-abc-123",
+};
+
+// (T1) both dryRun+confirm omitted => throw, nothing resolved (no fetch calls).
+Deno.test("upsertRecord: no dryRun + no confirm throws before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          { ...REC_BASE, fields: {}, confirm: false, dryRun: false } as never,
+          ctx as never,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// (T2) dryRun, MISSING target => planned-create, no POST, payload has matchField.
+Deno.test("upsertRecord: dryRun on a missing target plans a create (no POST)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    return {};
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { name: "Acme Sub", mrr: 100 },
+        confirm: false,
+        dryRun: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.find((c) => c.method === "POST"), undefined);
+    assertEquals(captured.data!.action, "planned-create");
+    const payload = captured.data!.creationPayload as Record<string, unknown>;
+    assertEquals(payload.invoiceNinjaClientRef, "client-abc-123");
+    assertEquals(payload.name, "Acme Sub");
+  } finally {
+    restore();
+  }
+});
+
+// (T3) dryRun, PRESENT target => planned-update, no PATCH.
+Deno.test("upsertRecord: dryRun on an existing target plans an update (no PATCH)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [{ id: "sub1" }] } };
+    }
+    return {};
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { mrr: 200 },
+        confirm: false,
+        dryRun: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.find((c) => c.method === "PATCH"), undefined);
+    assertEquals(captured.data!.action, "planned-update");
+  } finally {
+    restore();
+  }
+});
+
+// (T4) confirm create => POST /rest/<plural> with matchField injected, id back.
+Deno.test("upsertRecord: confirm create POSTs with matchField injected", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createSubscription: { id: "sub-new" } } };
+    }
+    return {};
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { name: "Acme", mrr: 50 },
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the subscription");
+    assertEquals(post!.path, "/rest/subscriptions");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.invoiceNinjaClientRef, "client-abc-123");
+    assertEquals(body.name, "Acme");
+    assertEquals(captured.data!.action, "created");
+    assertEquals(captured.data!.recordId, "sub-new");
+  } finally {
+    restore();
+  }
+});
+
+// (T5) confirm update single hit => PATCH /rest/<plural>/<id>, matchField NOT in body.
+Deno.test("upsertRecord: confirm update PATCHes by id, matchField excluded from body", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [{ id: "sub1" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateSubscription: { id: "sub1" } } };
+    }
+    return {};
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { mrr: 250, status: "ACTIVE" },
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing subscription");
+    assertEquals(patch!.path, "/rest/subscriptions/sub1");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals("invoiceNinjaClientRef" in body, false);
+    assertEquals(body.mrr, 250);
+    assertEquals(body.status, "ACTIVE");
+    assertEquals(captured.data!.action, "updated");
+  } finally {
+    restore();
+  }
+});
+
+// (T6) POST fails => create-race fallback re-GET + PATCH => action=updated.
+Deno.test("upsertRecord: POST failure triggers create-race fallback (re-GET + PATCH)", async () => {
+  let getCount = 0;
+  const { calls, restore } = stubTwentyFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return { payload: REC_META };
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      getCount++;
+      // First find => empty (go to create); after the failed POST => 1 (raced).
+      return {
+        payload: {
+          data: { subscriptions: getCount === 1 ? [] : [{ id: "raced1" }] },
+        },
+      };
+    }
+    if (method === "POST") {
+      return { status: 409, payload: { error: "conflict" } };
+    }
+    if (method === "PATCH") {
+      return { payload: { data: { updateSubscription: { id: "raced1" } } } };
+    }
+    return { payload: {} };
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { mrr: 10 },
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a fallback PATCH after the POST conflict");
+    assertEquals(patch!.path, "/rest/subscriptions/raced1");
+    assertEquals(captured.data!.action, "updated");
+  } finally {
+    restore();
+  }
+});
+
+// (T7) re-GET returns 0 after a failed create => throws (unconfirmable).
+Deno.test("upsertRecord: create failure with no raced record throws (unconfirmable)", async () => {
+  const { restore } = stubTwentyFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return { payload: REC_META };
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { payload: { data: { subscriptions: [] } } };
+    }
+    if (method === "POST") return { status: 500, payload: { error: "boom" } };
+    return { payload: {} };
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { mrr: 10 },
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "unconfirmable",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (T8) ambiguous 2 hits on the initial find => throws, no write.
+Deno.test("upsertRecord: ambiguous natural key (2 hits) throws before any write", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [{ id: "a" }, { id: "b" }] } };
+    }
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { mrr: 10 },
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "Ambiguous natural key",
+    );
+    assertEquals(
+      calls.find((c) => c.method === "POST" || c.method === "PATCH"),
+      undefined,
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (T9) standard / non-allowlisted object => throws before any I/O.
+Deno.test("upsertRecord: a non-allowlisted object throws before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            objectNameSingular: "person",
+            matchField: "email",
+            matchValue: "x@y.com",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "not upsertable",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// (T10) matchField failing FIELD_NAME_RE => throws before any I/O.
+Deno.test("upsertRecord: a malformed matchField throws before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            matchField: "bad-field!",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid matchField",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// (T11) reserved field name (matchField or a fields key) => throws before I/O.
+Deno.test("upsertRecord: reserved field names are rejected before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            matchField: "id",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "reserved",
+    );
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { deletedAt: "2020-01-01" },
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "reserved",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// (T12) unknown field name => throws (fail-closed).
+Deno.test("upsertRecord: an unknown field is rejected fail-closed", async () => {
+  const { calls, restore } = stubTwentyFetch((_method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { totallyMadeUp: "x" },
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "Unknown field",
+    );
+    assertEquals(
+      calls.find((c) => c.method === "POST" || c.method === "PATCH"),
+      undefined,
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (T13) composite field type (CURRENCY) => throws with a clear pre-write error.
+Deno.test("upsertRecord: a composite field type is rejected pre-write", async () => {
+  const { calls, restore } = stubTwentyFetch((_method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { monthlyValue: 5 },
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "non-scalar type 'CURRENCY'",
+    );
+    assertEquals(
+      calls.find((c) => c.method === "POST" || c.method === "PATCH"),
+      undefined,
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (T14) filter-unsafe canonical matchValue => throws before any I/O.
+Deno.test("upsertRecord: a filter-unsafe matchValue throws before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            matchValue: "a[eq]:b",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "filter-unsafe",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// (T15) refuses a real run without confirm (redundant with T1, kept explicit).
+Deno.test("upsertRecord: refuses a real run without confirm:true", async () => {
+  const { ctx } = makeRecCtx();
+  await assertRejects(
+    () =>
+      model.methods.upsertRecord.execute(
+        {
+          ...REC_BASE,
+          fields: { mrr: 1 },
+          confirm: false,
+          dryRun: false,
+        } as never,
+        ctx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+// (T16) string fields sanitized; stored matchValue == searched matchValue.
+Deno.test("upsertRecord: string fields sanitized; stored value == searched value", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createSubscription: { id: "s1" } } };
+    }
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        objectNameSingular: "subscription",
+        matchField: "invoiceNinjaClientRef",
+        matchValue: "  ref-<b>42</b>  ",
+        fields: { name: "<i>Acme</i> Corp" },
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    // sanitizeText strips tags + collapses whitespace: "  ref-<b>42</b>  " -> "ref- 42".
+    const canonical = "ref- 42";
+    const find = calls.find((c) =>
+      c.method === "GET" && c.path.startsWith("/rest/subscriptions")
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(find && post, "expected a find GET and a create POST");
+    // The find filter encodes the SAME canonical bytes the create body stores.
+    assert(find!.path.includes(encodeURIComponent(canonical)), find!.path);
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.invoiceNinjaClientRef, canonical);
+    assertEquals(body.name, "Acme Corp"); // tags stripped
+  } finally {
+    restore();
+  }
+});
+
+// (T17) redactError applied to a thrown Twenty 4xx — no token/value leak.
+Deno.test("upsertRecord: a thrown Twenty 4xx leaks neither the token nor submitted values", async () => {
+  const secretToken = "tok"; // matches makeRecCtx apiToken
+  const { restore } = stubTwentyFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return { payload: REC_META };
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      // 4xx whose body echoes both the bearer token and the submitted value.
+      return {
+        status: 400,
+        payload:
+          `duplicate for value client-abc-123 with Bearer ${secretToken} and user bob@example.com`,
+      };
+    }
+    return { payload: {} };
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { mrr: 1 },
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+    );
+    const msg = (err as Error).message;
+    assertEquals(msg.includes("client-abc-123"), false); // submitted value scrubbed
+    assertEquals(msg.includes("bob@example.com"), false); // echoed PII scrubbed
+    assert(!/Bearer\s+tok\b/.test(msg), "bearer token must be redacted");
+  } finally {
+    restore();
+  }
+});
+
+// (Extra A — resolution #3) snapshot name uses the hash, not the raw matchValue.
+Deno.test("upsertRecord: snapshot instance name uses the hash, never the raw value", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    return {};
+  });
+  const { ctx, captured } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { mrr: 1 },
+        confirm: false,
+        dryRun: true,
+      } as never,
+      ctx as never,
+    );
+    const hash = await listInstanceHash({
+      object: "subscription",
+      matchField: "invoiceNinjaClientRef",
+      matchValue: "client-abc-123",
+    });
+    assertEquals(captured.spec, "recordUpserted");
+    assertEquals(captured.name, `record-subscription-${hash}`);
+    assertEquals(captured.name!.includes("client-abc-123"), false);
+    assertEquals(captured.data!.matchValueHash, hash);
+    assertEquals(
+      "matchValue" in (captured.data as Record<string, unknown>),
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (Extra B — resolution #1) matchField carried in `fields` never rewrites the key.
+Deno.test("upsertRecord: matchField carried in fields is stripped (never rewrites the natural key)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createSubscription: { id: "s1" } } };
+    }
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await model.methods.upsertRecord.execute(
+      {
+        ...REC_BASE,
+        fields: { invoiceNinjaClientRef: "HIJACKED", mrr: 7 },
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a create POST");
+    const body = post!.body as Record<string, unknown>;
+    // The natural key is the canonical matchValue, NOT the value smuggled in fields.
+    assertEquals(body.invoiceNinjaClientRef, "client-abc-123");
+    assertEquals(body.mrr, 7);
+  } finally {
+    restore();
+  }
+});
+
+// (Extra C — resolution #5) a SELECT value outside the live enum is rejected.
+Deno.test("upsertRecord: a SELECT value outside the live enum is rejected", async () => {
+  const { restore } = stubTwentyFetch((_method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { status: "BOGUS" },
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      // The submitted value is scrubbed by the error redaction (resolution #2),
+      // so assert on the stable field-name portion of the message.
+      "for SELECT field 'status'. Valid options: DRAFT, ACTIVE, CHURNED",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (Extra D — resolution #4) a matchField that is not on the object is rejected.
+Deno.test("upsertRecord: a matchField absent from the object metadata is rejected", async () => {
+  const { restore } = stubTwentyFetch((_method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            matchField: "notARealField",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "does not exist on object",
+    );
+  } finally {
+    restore();
+  }
+});

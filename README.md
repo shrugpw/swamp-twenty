@@ -158,9 +158,11 @@ make an API call.
 | `findPersonByLeadId`     | read    | Look up a Person by the `leadId` marker.                                   |
 | `findOpportunityByLeadId`| read    | Look up an Opportunity by the `leadId` marker (the primary idempotency check). |
 | `push_leads`             | write¹  | The fan-out lead sink (see above).                                         |
+| `upsertRecord`           | write¹  | Generic idempotent create-or-update for an allowlisted custom object (`subscription`, `channelPartner`), keyed on a scalar natural-key field. |
 
 ¹ Confirm-gated (`confirm=true`), and guarded by a live reachability pre-flight
-check. `push_leads` also supports `dryRun=true` for a no-write plan.
+check. `push_leads` and `upsertRecord` also support `dryRun=true` for a no-write
+plan.
 
 ## Development
 
