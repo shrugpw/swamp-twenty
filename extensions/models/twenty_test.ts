@@ -777,6 +777,20 @@ const OPP_META = {
         }, { value: "FUTURE" }],
       },
       { name: "asn", type: "TEXT" },
+      {
+        name: "offering",
+        type: "SELECT",
+        options: [
+          { value: "MANAGED" },
+          { value: "SUBSTRATE" },
+          {
+            value: "PROJECT",
+          },
+          { value: "RETAINER" },
+          { value: "LOCAL_IT" },
+          { value: "PEERING" },
+        ],
+      },
       // Generic-scalar fixtures for customFields tests: a plain TEXT field, a
       // non-reserved SELECT, and a composite (CURRENCY) that must be rejected.
       { name: "region", type: "TEXT" },
@@ -1657,6 +1671,192 @@ Deno.test("buildOpportunityBody drops a reserved customFields key (defense-in-de
   assertEquals(body.name, "X");
 });
 
+// --- upsertOpportunity: offering segmentation SELECT (TWENTY-OPP-OFFERING) ---
+
+Deno.test("upsertOpportunity writes offering on create", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "offering-create-2026",
+        name: "Offering Deal",
+        offering: "SUBSTRATE",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST");
+    assertEquals((post!.body as Record<string, unknown>).offering, "SUBSTRATE");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity rejects an offering token not in the live enum", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "offering-bad-2026",
+            name: "Bad Offering",
+            offering: "NOPE",
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "Invalid offering",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity writes offering on the UPDATE (PATCH) path; empty => omitted", async () => {
+  // First call: set offering on an existing opp. Second: empty offering => omit.
+  for (
+    const [val, expectPresent] of [["PROJECT", true], ["", false]] as Array<
+      [string, boolean]
+    >
+  ) {
+    const { calls, restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+      if (method === "GET" && path.startsWith("/rest/opportunities")) {
+        return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+      }
+      if (method === "PATCH") {
+        return { data: { updateOpportunity: { id: "opp1" } } };
+      }
+      return {};
+    });
+    try {
+      await model.methods.upsertOpportunity.execute(
+        {
+          leadId: "offering-update-2026",
+          name: "Upd Offering",
+          offering: val,
+          closeDate: "",
+          companyName: "",
+          companyDomain: "",
+          pointOfContactName: "",
+          pointOfContactEmail: "",
+          noteBody: "",
+          confirm: true,
+          dryRun: false,
+        } as never,
+        UPSERT_CTX as never,
+      );
+      const patch = calls.find((c) => c.method === "PATCH");
+      assert(patch, "expected a PATCH");
+      const body = patch!.body as Record<string, unknown>;
+      assertEquals("offering" in body, expectPresent);
+      if (expectPresent) assertEquals(body.offering, "PROJECT");
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("upsertOpportunity: customFields.offering is rejected (reserved — typed arg is authoritative)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "offering-reserved-2026",
+            name: "Reserved Offering",
+            offering: "SUBSTRATE",
+            customFields: { offering: "PROJECT" },
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "reserved",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("OpportunityUpsertSchema/OppViewSchema/OpportunityRefSchema round-trip offering (no strip)", () => {
+  const u = OpportunityUpsertSchema.parse({
+    baseUrl: "b",
+    action: "created",
+    dryRun: false,
+    leadId: "L1",
+    name: "X",
+    stage: "NEW",
+    offering: "MANAGED",
+    companyLinked: false,
+    noteEnsured: false,
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  assertEquals(u.offering, "MANAGED");
+  const v = OppViewSchema.parse({
+    id: "o1",
+    name: "X",
+    stage: "NEW",
+    offering: "PEERING",
+  });
+  assertEquals(v.offering, "PEERING");
+  const r = OpportunityRefSchema.parse({
+    baseUrl: "b",
+    found: true,
+    offering: "RETAINER",
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  assertEquals(r.offering, "RETAINER");
+});
+
 // --- Read surface (TWENTY-READ-SURFACE) -------------------------------------
 
 Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
@@ -1697,6 +1897,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     sourceChannel: "REFERRAL",
     asn: "AS64249",
     qualStatus: "TECH_QUALIFICATION_NEEDED",
+    offering: "SUBSTRATE",
     isEmergency: false,
   });
   assertEquals(v.id, "opp1");
@@ -1708,6 +1909,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   assertEquals(v.sourceChannel, "REFERRAL");
   assertEquals(v.asn, "AS64249");
   assertEquals(v.qualStatus, "TECH_QUALIFICATION_NEEDED");
+  assertEquals(v.offering, "SUBSTRATE");
   assertEquals(v.isEmergency, false);
   // A record with no amount composite omits amount/currencyCode; unset
   // segmentation SELECTs are omitted; absent isEmergency stays undefined.
@@ -1719,6 +1921,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     sourceChannel: null,
     asn: "",
     qualStatus: null,
+    offering: "",
   });
   assertEquals("amount" in bare, false);
   assertEquals("currencyCode" in bare, false);
@@ -1726,6 +1929,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   assertEquals("sourceChannel" in bare, false);
   assertEquals("asn" in bare, false);
   assertEquals("qualStatus" in bare, false);
+  assertEquals("offering" in bare, false);
   assertEquals("isEmergency" in bare, false);
 });
 
@@ -3997,14 +4201,15 @@ Deno.test("planSelectOptions throws on an invalid requested option (no partial p
 
 // --- Opportunity segmentation field specs (TWENTY-OPP-SEGMENTATION) ----------
 
-Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the two Opportunity SELECTs", () => {
-  assertEquals(OPPORTUNITY_SEGMENTATION_FIELDS.length, 2);
+Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the three Opportunity SELECTs", () => {
+  assertEquals(OPPORTUNITY_SEGMENTATION_FIELDS.length, 3);
   const byName = new Map(
     OPPORTUNITY_SEGMENTATION_FIELDS.map((f) => [f.name, f]),
   );
   const lob = byName.get("lineOfBusiness");
   const src = byName.get("sourceChannel");
-  assert(lob && src);
+  const off = byName.get("offering");
+  assert(lob && src && off);
   for (const f of OPPORTUNITY_SEGMENTATION_FIELDS) {
     assertEquals(f.objectNameSingular, "opportunity");
     assertEquals(f.type, "SELECT");
@@ -4025,6 +4230,15 @@ Deno.test("OPPORTUNITY_SEGMENTATION_FIELDS declares the two Opportunity SELECTs"
   assertEquals(
     src!.options!.find((o) => o.value === "CONSULTING_HANDOFF")!.color,
     "purple",
+  );
+  // offering: all 6 options with their deliberate colors (TWENTY-OPP-OFFERING).
+  assertEquals(
+    off!.options!.map((o) => o.value),
+    ["MANAGED", "SUBSTRATE", "PROJECT", "RETAINER", "LOCAL_IT", "PEERING"],
+  );
+  assertEquals(
+    off!.options!.map((o) => o.color),
+    ["blue", "turquoise", "orange", "green", "sky", "pink"],
   );
 });
 

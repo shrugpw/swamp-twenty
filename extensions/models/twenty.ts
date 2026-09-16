@@ -922,6 +922,8 @@ interface OpportunityWriteFields {
   // Provider-pipeline typed args (TWENTY-OPP-FIELDS).
   asn?: string;
   qualStatus?: string;
+  // Offering segmentation SELECT (TWENTY-OPP-OFFERING).
+  offering?: string;
   // Generic scalar escape hatch: already validated (existence + scalar type +
   // SELECT enum + reserved-key rejection) by the caller; spread verbatim into
   // the REST body on both create and update. Collisions with typed args are
@@ -945,6 +947,7 @@ export function buildOpportunityBody(
   if (f.sourceChannel !== undefined) body.sourceChannel = f.sourceChannel;
   if (f.asn !== undefined) body.asn = f.asn;
   if (f.qualStatus !== undefined) body.qualStatus = f.qualStatus;
+  if (f.offering !== undefined) body.offering = f.offering;
   if (f.customFields) {
     // Defense-in-depth: never let a customFields key emit a RESERVED field into
     // the body on ANY path, even though execute() already rejects reserved keys
@@ -1130,6 +1133,8 @@ export interface OppView {
   // (SELECT) — surfaced so an upsertOpportunity write is read-back verifiable.
   asn?: string;
   qualStatus?: string;
+  // Offering segmentation SELECT (TWENTY-OPP-OFFERING).
+  offering?: string;
   isEmergency?: boolean;
 }
 
@@ -1157,6 +1162,9 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   if (rec.asn != null && rec.asn !== "") v.asn = String(rec.asn);
   if (rec.qualStatus != null && rec.qualStatus !== "") {
     v.qualStatus = String(rec.qualStatus);
+  }
+  if (rec.offering != null && rec.offering !== "") {
+    v.offering = String(rec.offering);
   }
   // Surface isEmergency even when false (mirrors mapPersonView) so consumers can
   // reason about the flag without a second read.
@@ -1507,9 +1515,10 @@ async function listOpportunitiesFiltered(
 
 /**
  * Read the Opportunity object's live metadata: the `stage` SELECT enum values,
- * the two segmentation SELECT enums (`lineOfBusiness`, `sourceChannel`), and the
- * `closeDate` field type (DATE vs DATE_TIME). Used to fail fast on an invalid
- * stage / segmentation token and to format closeDate correctly for the instance.
+ * the segmentation SELECT enums (`lineOfBusiness`, `sourceChannel`, `offering`),
+ * the `qualStatus` enum, and the `closeDate` field type (DATE vs DATE_TIME). Used
+ * to fail fast on an invalid stage / segmentation token and to format closeDate
+ * correctly for the instance.
  */
 async function fetchOpportunityMeta(
   cfg: TwentyCfg,
@@ -1519,6 +1528,7 @@ async function fetchOpportunityMeta(
   lineOfBusiness: string[];
   sourceChannel: string[];
   qualStatus: string[];
+  offering: string[];
   // Full name → {type, SELECT-option values} map for EVERY opportunity field
   // (TWENTY-OPP-FIELDS F3): the ungated field-map that qualStatus AND every
   // customFields key are validated through. NOT restricted by
@@ -1556,6 +1566,7 @@ async function fetchOpportunityMeta(
   const lineOfBusiness = optionValues("lineOfBusiness");
   const sourceChannel = optionValues("sourceChannel");
   const qualStatus = optionValues("qualStatus");
+  const offering = optionValues("offering");
   const cdField = list.find((f) => String(f.name ?? "") === "closeDate");
   const closeDateType = cdField ? (String(cdField.type ?? "") || null) : null;
   return {
@@ -1564,6 +1575,7 @@ async function fetchOpportunityMeta(
     lineOfBusiness,
     sourceChannel,
     qualStatus,
+    offering,
     fields,
   };
 }
@@ -1624,6 +1636,7 @@ const OPP_CUSTOMFIELDS_RESERVED = new Set<string>([
   "sourceChannel",
   "asn",
   "qualStatus",
+  "offering",
 ]);
 
 /**
@@ -2255,10 +2268,12 @@ async function ensureFieldOnce(
 }
 
 /**
- * The two Opportunity segmentation SELECT fields (CRM-TASKS #5). Analytics only
- * — NOT a pipeline gate. `sourceChannel` is what push_leads stamps (see the
- * `leadSourceChannel` global). Provisioned via the shared append-only ensureField
- * path so a re-run is a clean no-op.
+ * The Opportunity segmentation SELECT fields (CRM-TASKS #5): `lineOfBusiness`,
+ * `sourceChannel`, and `offering`. Analytics only — NOT a pipeline gate.
+ * `sourceChannel` is what push_leads stamps (see the `leadSourceChannel` global);
+ * `offering` is set deliberately per deal (push_leads does not stamp it).
+ * Provisioned via the shared append-only ensureField path so a re-run is a clean
+ * no-op.
  */
 export const OPPORTUNITY_SEGMENTATION_FIELDS: ReadonlyArray<FieldSpec> = [
   {
@@ -2285,6 +2300,20 @@ export const OPPORTUNITY_SEGMENTATION_FIELDS: ReadonlyArray<FieldSpec> = [
         label: "Consulting hand-off",
         color: "purple",
       },
+    ],
+  },
+  {
+    objectNameSingular: "opportunity",
+    name: "offering",
+    label: "Offering",
+    type: "SELECT",
+    options: [
+      { value: "MANAGED", label: "Managed", color: "blue" },
+      { value: "SUBSTRATE", label: "Substrate", color: "turquoise" },
+      { value: "PROJECT", label: "Project", color: "orange" },
+      { value: "RETAINER", label: "Retainer", color: "green" },
+      { value: "LOCAL_IT", label: "Local IT", color: "sky" },
+      { value: "PEERING", label: "Peering", color: "pink" },
     ],
   },
 ];
@@ -2532,6 +2561,10 @@ export const OpportunityUpsertSchema = z.object({
     .string()
     .optional()
     .describe("Qualification-status SELECT token written, if set"),
+  offering: z
+    .string()
+    .optional()
+    .describe("Offering segmentation SELECT token written, if set"),
   customFields: z
     .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
     .optional()
@@ -2631,6 +2664,7 @@ export const OpportunityRefSchema = z.object({
   sourceChannel: z.string().optional(),
   asn: z.string().optional(),
   qualStatus: z.string().optional(),
+  offering: z.string().optional(),
   isEmergency: z.boolean().optional(),
   retrievedAt: z.iso.datetime(),
 });
@@ -2648,6 +2682,7 @@ export const OppViewSchema = z.object({
   sourceChannel: z.string().optional(),
   asn: z.string().optional(),
   qualStatus: z.string().optional(),
+  offering: z.string().optional(),
   isEmergency: z.boolean().optional(),
 });
 
@@ -3211,7 +3246,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.16.1",
+  version: "2026.09.16.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -3292,6 +3327,14 @@ export const model = {
       toVersion: "2026.09.16.1",
       description:
         "Teach upsertOpportunity to write the provider-pipeline Opportunity custom fields: optional asn (TEXT, ^AS<digits>$ guard) and qualStatus (SELECT, validated against the live enum like stage), plus a generic customFields scalar escape hatch (fail-closed: keys must exist and be scalar; reserved keys — the leadId marker + every typed-arg field + system fields — and composite/unknown types rejected pre-write; SELECT validated against the live enum; empty-string omitted; null forbidden). Fields written on both create and update, omitted (never nulled) when unset, and surfaced in the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method arguments + optional snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.16.2",
+      description:
+        "Add the Opportunity `offering` segmentation SELECT (MANAGED/SUBSTRATE/PROJECT/RETAINER/LOCAL_IT/PEERING): provisioned append-safe via OPPORTUNITY_SEGMENTATION_FIELDS/ensureOpportunitySegmentation; a new optional upsertOpportunity offering arg (sanitized + live-enum validated like stage, written on create+update, omitted-not-nulled when unset, added to OPP_CUSTOMFIELDS_RESERVED so customFields cannot shadow it); surfaced in mapOppView + the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method argument + optional snapshot fields + one manifest entry only; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4095,7 +4138,7 @@ export const model = {
     },
     getOpportunity: {
       description:
-        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId) plus the segmentation SELECTs (lineOfBusiness, sourceChannel) and isEmergency when set — so a written custom-field value is read-back verifiable; found:false + no fields on a miss. No writes.",
+        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId) plus the segmentation SELECTs (lineOfBusiness, sourceChannel, offering) and isEmergency when set — so a written custom-field value is read-back verifiable; found:false + no fields on a miss. No writes.",
       arguments: z
         .object({
           leadId: z.string().optional().describe(
@@ -4152,6 +4195,7 @@ export const model = {
             if (view.sourceChannel) snap.sourceChannel = view.sourceChannel;
             if (view.asn) snap.asn = view.asn;
             if (view.qualStatus) snap.qualStatus = view.qualStatus;
+            if (view.offering) snap.offering = view.offering;
             if (view.isEmergency !== undefined) {
               snap.isEmergency = view.isEmergency;
             }
@@ -4175,7 +4219,7 @@ export const model = {
     },
     listOpportunities: {
       description:
-        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views (id/leadId/name/stage/amount/currency/closeDate/companyId + segmentation lineOfBusiness/sourceChannel + isEmergency when set) + a `truncated` flag. No writes, no per-id loop.",
+        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views (id/leadId/name/stage/amount/currency/closeDate/companyId + segmentation lineOfBusiness/sourceChannel/offering + isEmergency when set) + a `truncated` flag. No writes, no per-id loop.",
       arguments: z.object({
         companyId: z.string().optional().describe("Filter: company UUID"),
         stage: z.string().optional().describe(
@@ -4872,7 +4916,7 @@ export const model = {
     },
     upsertOpportunity: {
       description:
-        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact, and the lineOfBusiness/sourceChannel segmentation SELECTs) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
+        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact, and the lineOfBusiness/sourceChannel/offering segmentation SELECTs) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
       arguments: z.object({
         leadId: z
           .string()
@@ -4922,6 +4966,12 @@ export const model = {
           .optional()
           .describe(
             "Technical-qualification SELECT option token (e.g. RESEARCH, CONTACT_IDENTIFIED, TECH_QUALIFICATION_NEEDED, FUTURE). Validated against the live opportunity.qualStatus enum exactly like stage. Omitted / empty => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureField).",
+          ),
+        offering: z
+          .string()
+          .optional()
+          .describe(
+            "Offering segmentation SELECT option token (UPPER_SNAKE: MANAGED, SUBSTRATE, PROJECT, RETAINER, LOCAL_IT, PEERING). Validated against the live opportunity.offering enum exactly like stage. Omitted / empty => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
           ),
         customFields: z
           .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
@@ -4981,6 +5031,7 @@ export const model = {
           sourceChannel?: string;
           asn?: string;
           qualStatus?: string;
+          offering?: string;
           customFields?: Record<string, string | number | boolean>;
           closeDate: string;
           companyName: string;
@@ -5018,6 +5069,7 @@ export const model = {
           lineOfBusiness: string[];
           sourceChannel: string[];
           qualStatus: string[];
+          offering: string[];
           fields: Map<string, { type: string; options: string[] }>;
         } = {
           stages: [],
@@ -5025,6 +5077,7 @@ export const model = {
           lineOfBusiness: [],
           sourceChannel: [],
           qualStatus: [],
+          offering: [],
           fields: new Map(),
         };
         // Fail-closed gate for customFields (F2): typed args keep the
@@ -5114,6 +5167,22 @@ export const model = {
             throw new Error(
               `Invalid qualStatus '${qualStatus}'. Valid options: ${
                 oppMeta.qualStatus.join(", ")
+              }`,
+            );
+          }
+
+          // offering SELECT (segmentation, TWENTY-OPP-OFFERING): same posture as
+          // the other segmentation SELECTs — sanitizeText floor, best-effort
+          // enum validation, empty => unset (leave unchanged, never nulled),
+          // skipped when options unreadable.
+          const offering = sanitizeText(args.offering ?? "", 120) || undefined;
+          if (
+            offering !== undefined && oppMeta.offering.length &&
+            !oppMeta.offering.includes(offering)
+          ) {
+            throw new Error(
+              `Invalid offering '${offering}'. Valid options: ${
+                oppMeta.offering.join(", ")
               }`,
             );
           }
@@ -5311,6 +5380,7 @@ export const model = {
             ...(sourceChannel !== undefined ? { sourceChannel } : {}),
             ...(asn !== undefined ? { asn } : {}),
             ...(qualStatus !== undefined ? { qualStatus } : {}),
+            ...(offering !== undefined ? { offering } : {}),
             ...(Object.keys(validatedCustomFields).length
               ? { customFields: validatedCustomFields }
               : {}),
@@ -5386,6 +5456,7 @@ export const model = {
               ...(sourceChannel !== undefined ? { sourceChannel } : {}),
               ...(asn !== undefined ? { asn } : {}),
               ...(qualStatus !== undefined ? { qualStatus } : {}),
+              ...(offering !== undefined ? { offering } : {}),
               ...(Object.keys(validatedCustomFields).length
                 ? { customFields: validatedCustomFields }
                 : {}),
@@ -6195,7 +6266,7 @@ export const model = {
     },
     ensureOpportunitySegmentation: {
       description:
-        "Fan-out (repo rule 6): idempotently provision the two Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games) and Source Channel (Direct / Referral / Consulting hand-off) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op when the live options already match the spec; a field that exists with extra options keeps them, and by default (reconcile) an option whose label/color drifted from the spec is corrected in place (pass reconcile:false for strict append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
+        "Fan-out (repo rule 6): idempotently provision the three Opportunity segmentation SELECT fields — Line of Business (Consulting / Hosting / Games), Source Channel (Direct / Referral / Consulting hand-off), and Offering (Managed / Substrate / Project / Retainer / Local IT / Peering) — through the shared append-only ensureField path in ONE execution (single GET, one lock). Analytics only, not a pipeline gate. Re-run is a clean no-op when the live options already match the spec; a field that exists with extra options keeps them, and by default (reconcile) an option whose label/color drifted from the spec is corrected in place (pass reconcile:false for strict append-only). confirm:true for a real run; dryRun:true previews. Snapshots one `fieldEnsured` resource per field.",
       arguments: z.object({
         confirm: z
           .boolean()

@@ -2,6 +2,27 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.16.2
+
+### Added
+
+- **Opportunity `offering` segmentation SELECT** (`TWENTY-OPP-OFFERING`) — a third
+  segmentation field alongside `lineOfBusiness`/`sourceChannel`, options
+  `MANAGED` / `SUBSTRATE` / `PROJECT` / `RETAINER` / `LOCAL_IT` / `PEERING`:
+  - Provisioned append-safe via `OPPORTUNITY_SEGMENTATION_FIELDS` /
+    `ensureOpportunitySegmentation` (existing options never destructively
+    recolored; confirm-gated).
+  - New optional `upsertOpportunity` `offering` arg — sanitized then validated
+    against the live `opportunity.offering` enum exactly like `stage`, written on
+    both create and update, omitted (never nulled) when unset, and added to
+    `OPP_CUSTOMFIELDS_RESERVED` so the generic `customFields` escape hatch cannot
+    shadow it.
+  - Surfaced in `mapOppView` + the `opportunityUpsert` / `opportunityRef` /
+    `opportunityList` read-back snapshots.
+
+Additive method argument + optional snapshot fields + one manifest entry only;
+`globalArguments` unchanged (no-op attribute migration).
+
 ## 2026.09.16.1
 
 ### Added
