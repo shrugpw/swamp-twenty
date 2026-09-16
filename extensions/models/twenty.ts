@@ -5193,6 +5193,15 @@ export const model = {
                   }); composite fields are not supported`,
                 );
               }
+              // A non-finite number (Infinity/-Infinity/NaN) passes z.number()
+              // and the null check, but JSON.stringify serializes it to `null` —
+              // which would silently CLEAR the field, the exact outcome the
+              // null-forbidden invariant exists to prevent. Reject it here.
+              if (typeof v === "number" && !Number.isFinite(v)) {
+                throw new Error(
+                  `customFields key '${safeKey}' is a non-finite number (Infinity/NaN); only finite numeric values are permitted`,
+                );
+              }
               let out: string | number | boolean = v;
               if (typeof v === "string") {
                 const s = sanitizeText(v, UPSERT_FIELD_TEXT_CAP);

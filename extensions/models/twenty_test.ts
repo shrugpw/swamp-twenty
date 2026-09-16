@@ -785,6 +785,7 @@ const OPP_META = {
         type: "SELECT",
         options: [{ value: "STANDARD" }, { value: "PRIORITY" }],
       },
+      { name: "priorityScore", type: "NUMBER" },
       { name: "annualRevenue", type: "CURRENCY" },
       { name: "closeDate", type: "DATE_TIME" },
     ],
@@ -1558,6 +1559,81 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on the UPDATE 
     const body = patch!.body as Record<string, unknown>;
     assertEquals(body.asn, "AS64249");
     assertEquals(body.qualStatus, "CONTACT_IDENTIFIED");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity customFields: a non-finite NUMBER (Infinity) is rejected (null-forbidden invariant)", async () => {
+  // Infinity passes z.number() and the `v === null` check, but JSON.stringify
+  // would serialize it to null and silently clear the field — the exact outcome
+  // the null-forbidden contract prevents. Must be rejected pre-write.
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "cf-inf-2026",
+            name: "Inf CF",
+            customFields: { priorityScore: Infinity },
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "non-finite",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity customFields: a finite NUMBER passes through to the body", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cf-num-2026",
+        name: "Num CF",
+        customFields: { priorityScore: 42 },
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST");
+    assertEquals((post!.body as Record<string, unknown>).priorityScore, 42);
   } finally {
     restore();
   }

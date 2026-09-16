@@ -23,7 +23,8 @@ All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`)
     reserved keys (the `leadId` marker, every typed-arg field, and system fields)
     and composite/unknown types are rejected pre-write; `SELECT` values validated
     against the live enum; strings sanitized; empty-string ⇒ omitted; `null`
-    forbidden.
+    forbidden; non-finite numbers (`Infinity`/`NaN`) rejected (they would
+    serialize to `null` and silently clear the field).
   - All three are written on **both** the create and update paths, omitted (never
     nulled) when unset, and surfaced in the `opportunityUpsert` / `opportunityRef`
     / `opportunityList` read-back snapshots.
