@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/twenty"
-version: "2026.09.15.5"
+version: "2026.09.16.1"
 description: "Drive a Twenty CRM instance over its REST v1 API (validated against v2.38.1): read/create People, Companies, Opportunities, and Notes, look records up idempotently by an immutable leadId marker (or composite email/domain filters), and self-provision the custom leadId/isEmergency fields. Its core is push_leads — a single fan-out method that ingests a batch of contact-form leads in one execution: it validates and sanitizes every field first (a bad lead writes nothing), dedups within the batch and against Twenty on leadId, reuses but never structurally mutates an existing Person, creates/links a Company only for business leads on a real corporate domain, always ensures the per-lead message Note, and flags emergency leads independently of the idempotency skip so an urgent alert can never be dropped. Mutations are confirm-gated with a no-write dryRun plan, run a live reachability pre-flight, and log the vaulted bearer token length-only. The token inherits whatever role you assign its API key in-workspace (Twenty gates by object-, field-, and row-level permissions); the REST API cannot manage roles, so emergency-record visibility is a documented UI pre-config rather than an API call. Ships a Claude skill playbook for driving the model."
 
 repository: https://github.com/shrugpw/swamp-twenty

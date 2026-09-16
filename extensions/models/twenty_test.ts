@@ -764,6 +764,24 @@ const OPP_META = {
           value: "CONSULTING_HANDOFF",
         }],
       },
+      // Provider-pipeline fields (TWENTY-OPP-FIELDS).
+      {
+        name: "qualStatus",
+        type: "SELECT",
+        options: [{ value: "RESEARCH" }, { value: "CONTACT_IDENTIFIED" }, {
+          value: "TECH_QUALIFICATION_NEEDED",
+        }, { value: "FUTURE" }],
+      },
+      { name: "asn", type: "TEXT" },
+      // Generic-scalar fixtures for customFields tests: a plain TEXT field, a
+      // non-reserved SELECT, and a composite (CURRENCY) that must be rejected.
+      { name: "region", type: "TEXT" },
+      {
+        name: "tier",
+        type: "SELECT",
+        options: [{ value: "STANDARD" }, { value: "PRIORITY" }],
+      },
+      { name: "annualRevenue", type: "CURRENCY" },
       { name: "closeDate", type: "DATE_TIME" },
     ],
   }],
@@ -1049,6 +1067,364 @@ Deno.test("upsertOpportunity rejects a segmentation token not in the live enum",
   }
 });
 
+// --- upsertOpportunity: asn / qualStatus / customFields (TWENTY-OPP-FIELDS) --
+
+Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on create", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "shrug-net-example-2026",
+        name: "Provider Deal",
+        asn: "as64249", // lowercase input => uppercased on store
+        qualStatus: "TECH_QUALIFICATION_NEEDED",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the opportunity");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.asn, "AS64249");
+    assertEquals(body.qualStatus, "TECH_QUALIFICATION_NEEDED");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity rejects a qualStatus token not in the live enum", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "qs-bad-2026",
+            name: "Bad Qual",
+            qualStatus: "NOT_A_STATUS",
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "Invalid qualStatus",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity rejects a malformed asn (^AS<digits>$ guard)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    // Bare digits (no AS prefix) and junk both fail the positive guard.
+    for (const bad of ["64249", "AS64249; DROP", "ASN-64249"]) {
+      await assertRejects(
+        () =>
+          model.methods.upsertOpportunity.execute(
+            {
+              leadId: "asn-bad-2026",
+              name: "Bad ASN",
+              asn: bad,
+              closeDate: "",
+              companyName: "",
+              companyDomain: "",
+              pointOfContactName: "",
+              pointOfContactEmail: "",
+              noteBody: "",
+              confirm: true,
+              dryRun: false,
+            } as never,
+            UPSERT_CTX as never,
+          ),
+        Error,
+        "Invalid asn",
+      );
+    }
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity omits asn/qualStatus when empty or unset (update path, never nulled)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "asn-empty-2026",
+        name: "Empty ASN",
+        asn: "", // empty => leave unchanged
+        // qualStatus deliberately unset
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals("asn" in body, false);
+    assertEquals("qualStatus" in body, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity customFields: scalar TEXT + valid SELECT pass through to the body", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cf-ok-2026",
+        name: "Custom Fields",
+        customFields: { region: "us-east", tier: "PRIORITY" },
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST to create the opportunity");
+    const body = post!.body as Record<string, unknown>;
+    assertEquals(body.region, "us-east");
+    assertEquals(body.tier, "PRIORITY");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity customFields: unknown key, composite type, and bad SELECT are rejected", async () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ notAField: "x" }, "Unknown customFields key"],
+    [{ annualRevenue: 100 }, "non-scalar type"],
+    [{ tier: "NOPE" }, "Valid options"],
+  ];
+  for (const [customFields, needle] of cases) {
+    const { calls, restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+      if (method === "GET" && path.startsWith("/rest/opportunities")) {
+        return { data: { opportunities: [] } };
+      }
+      return {};
+    });
+    try {
+      await assertRejects(
+        () =>
+          model.methods.upsertOpportunity.execute(
+            {
+              leadId: "cf-bad-2026",
+              name: "Bad CF",
+              customFields,
+              closeDate: "",
+              companyName: "",
+              companyDomain: "",
+              pointOfContactName: "",
+              pointOfContactEmail: "",
+              noteBody: "",
+              confirm: true,
+              dryRun: false,
+            } as never,
+            UPSERT_CTX as never,
+          ),
+        Error,
+        needle,
+      );
+      assertEquals(calls.some((c) => c.method === "POST"), false);
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("upsertOpportunity customFields: reserved keys and null are rejected", async () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ leadId: "hijack" }, "reserved"],
+    [{ lineOfBusiness: "HOSTING" }, "reserved"],
+    [{ asn: "AS1" }, "reserved"],
+    [{ region: null }, "null is not permitted"],
+  ];
+  for (const [customFields, needle] of cases) {
+    const { calls, restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+      if (method === "GET" && path.startsWith("/rest/opportunities")) {
+        return { data: { opportunities: [] } };
+      }
+      return {};
+    });
+    try {
+      await assertRejects(
+        () =>
+          model.methods.upsertOpportunity.execute(
+            {
+              leadId: "cf-reserved-2026",
+              name: "Reserved CF",
+              customFields,
+              closeDate: "",
+              companyName: "",
+              companyDomain: "",
+              pointOfContactName: "",
+              pointOfContactEmail: "",
+              noteBody: "",
+              confirm: true,
+              dryRun: false,
+            } as never,
+            UPSERT_CTX as never,
+          ),
+        Error,
+        needle,
+      );
+      assertEquals(calls.some((c) => c.method === "POST"), false);
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("upsertOpportunity customFields: empty-string value is omitted (not written)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cf-empty-2026",
+        name: "Empty CF",
+        customFields: { region: "", tier: "STANDARD" },
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH to the existing opportunity");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals("region" in body, false); // empty-string => omitted
+    assertEquals(body.tier, "STANDARD");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity customFields: fail-closed when opportunity metadata is unreadable", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { status: 500, body: { messages: ["boom"] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { data: { opportunities: [] } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "cf-failclosed-2026",
+            name: "Fail Closed",
+            customFields: { region: "us-east" },
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "fail-closed",
+    );
+    // No create attempted.
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
 // --- Read surface (TWENTY-READ-SURFACE) -------------------------------------
 
 Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
@@ -1087,6 +1463,8 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     pointOfContactId: "poc1",
     lineOfBusiness: "HOSTING",
     sourceChannel: "REFERRAL",
+    asn: "AS64249",
+    qualStatus: "TECH_QUALIFICATION_NEEDED",
     isEmergency: false,
   });
   assertEquals(v.id, "opp1");
@@ -1096,6 +1474,8 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   // Custom/segmentation SELECTs surfaced from flat scalars; isEmergency even when false.
   assertEquals(v.lineOfBusiness, "HOSTING");
   assertEquals(v.sourceChannel, "REFERRAL");
+  assertEquals(v.asn, "AS64249");
+  assertEquals(v.qualStatus, "TECH_QUALIFICATION_NEEDED");
   assertEquals(v.isEmergency, false);
   // A record with no amount composite omits amount/currencyCode; unset
   // segmentation SELECTs are omitted; absent isEmergency stays undefined.
@@ -1105,11 +1485,15 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     stage: "NEW",
     lineOfBusiness: "",
     sourceChannel: null,
+    asn: "",
+    qualStatus: null,
   });
   assertEquals("amount" in bare, false);
   assertEquals("currencyCode" in bare, false);
   assertEquals("lineOfBusiness" in bare, false);
   assertEquals("sourceChannel" in bare, false);
+  assertEquals("asn" in bare, false);
+  assertEquals("qualStatus" in bare, false);
   assertEquals("isEmergency" in bare, false);
 });
 

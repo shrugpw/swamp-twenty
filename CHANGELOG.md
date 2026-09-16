@@ -2,6 +2,39 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.16.1
+
+### Added
+
+- **`upsertOpportunity` provider-pipeline fields** (`TWENTY-OPP-FIELDS`) — the
+  method can now write the two Opportunity custom fields the SHRUG-NET provider
+  pipeline needs, plus a generic scalar escape hatch:
+  - **`asn`** (TEXT) — Autonomous System Number, guarded to `^AS<digits>$`
+    (case-insensitive input, uppercased on store); a non-empty value that doesn't
+    match is rejected. Empty ⇒ left unchanged.
+  - **`qualStatus`** (SELECT) — technical-qualification state, validated against
+    the live `opportunity.qualStatus` enum exactly like `stage`. Empty ⇒ left
+    unchanged.
+  - **`customFields`** — a `Record<string, string|number|boolean>` escape hatch
+    for scalar Opportunity custom fields without a typed argument. **Fail-closed**:
+    rejected entirely if opportunity metadata is unreadable; each key must exist
+    and be a scalar TYPE (`TEXT`/`NUMBER`/`BOOLEAN`/`DATE_TIME`/`SELECT`/`UUID`);
+    reserved keys (the `leadId` marker, every typed-arg field, and system fields)
+    and composite/unknown types are rejected pre-write; `SELECT` values validated
+    against the live enum; strings sanitized; empty-string ⇒ omitted; `null`
+    forbidden.
+  - All three are written on **both** the create and update paths, omitted (never
+    nulled) when unset, and surfaced in the `opportunityUpsert` / `opportunityRef`
+    / `opportunityList` read-back snapshots.
+- **README reconciliation** — `upsertOpportunity` (a live method previously
+  missing from the Methods table) is now documented, including an
+  `upsertOpportunity fields` section covering the `asn` / `qualStatus` /
+  `customFields` contract.
+
+Additive method arguments + optional snapshot fields only; `globalArguments` is
+unchanged (no-op attribute migration; `twenty-prod` / `twenty-local` upgrade
+cleanly).
+
 ## 2026.09.15.5
 
 ### Added

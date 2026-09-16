@@ -158,11 +158,46 @@ make an API call.
 | `findPersonByLeadId`     | read    | Look up a Person by the `leadId` marker.                                   |
 | `findOpportunityByLeadId`| read    | Look up an Opportunity by the `leadId` marker (the primary idempotency check). |
 | `push_leads`             | write¹  | The fan-out lead sink (see above).                                         |
+| `upsertOpportunity`      | write¹  | Idempotent (on `leadId`) Opportunity create-or-update with the full field set — see [upsertOpportunity fields](#upsertopportunity-fields). |
 | `upsertRecord`           | write¹  | Generic idempotent create-or-update for an allowlisted custom object (`subscription`, `channelPartner`), keyed on a scalar natural-key field. |
 
 ¹ Confirm-gated (`confirm=true`), and guarded by a live reachability pre-flight
-check. `push_leads` and `upsertRecord` also support `dryRun=true` for a no-write
-plan.
+check. `push_leads`, `upsertOpportunity`, and `upsertRecord` also support
+`dryRun=true` for a no-write plan.
+
+### upsertOpportunity fields
+
+`upsertOpportunity` finds any existing Opportunity by the immutable `leadId`
+marker (hit ⇒ PATCH, miss ⇒ create) and writes the fields you supply. Every
+field is **omitted when unset** (never nulled), so a re-run only touches what you
+pass. Beyond `name` / `amount` / `stage` / `closeDate` / company / point-of-contact
+/ `isEmergency`, it writes these typed SELECT/TEXT fields (each validated against
+the live workspace metadata, exactly like `stage`):
+
+| Arg              | Type   | Notes                                                                                          |
+| ---------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| `lineOfBusiness` | SELECT | Segmentation (`CONSULTING` / `HOSTING` / `GAMES`). Validated against the live enum.             |
+| `sourceChannel`  | SELECT | Segmentation (`DIRECT` / `REFERRAL` / `CONSULTING_HANDOFF`). Validated against the live enum.   |
+| `asn`            | TEXT   | Autonomous System Number. Guarded to `^AS<digits>$` (case-insensitive input, uppercased on store); a non-empty value that doesn't match is rejected. |
+| `qualStatus`     | SELECT | Technical-qualification state. Validated against the live `opportunity.qualStatus` enum.        |
+
+An empty string for any of these means **leave unchanged** (not "clear").
+
+**`customFields` (generic scalar escape hatch).** For scalar Opportunity custom
+fields without a typed argument, pass
+`customFields: { <fieldName>: <string|number|boolean> }`. It is **fail-closed**:
+
+- if opportunity metadata is unreadable, the whole map is rejected (no blind write);
+- every key must be a camelCase field that **exists** on `opportunity` and is a
+  **scalar** TYPE (`TEXT` / `NUMBER` / `BOOLEAN` / `DATE_TIME` / `SELECT` / `UUID`) —
+  unknown keys and composite types (`CURRENCY` / `RELATION` / …) are rejected pre-write;
+- **reserved keys are rejected**: the `leadId` idempotency marker, every field owned
+  by a typed argument (`name`, `stage`, `amount`, `currencyCode`, `closeDate`,
+  company / point-of-contact, `isEmergency`, `lineOfBusiness`, `sourceChannel`,
+  `asn`, `qualStatus`), and the base system fields — so the escape hatch can never
+  rewrite the marker or collide with a typed arg (set those via their typed arg);
+- `SELECT` values are validated against the live enum; strings are sanitized;
+- an empty string means unset (omitted); `null` is not permitted.
 
 ## Development
 

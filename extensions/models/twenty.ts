@@ -919,6 +919,14 @@ interface OpportunityWriteFields {
   isEmergency?: boolean;
   lineOfBusiness?: string;
   sourceChannel?: string;
+  // Provider-pipeline typed args (TWENTY-OPP-FIELDS).
+  asn?: string;
+  qualStatus?: string;
+  // Generic scalar escape hatch: already validated (existence + scalar type +
+  // SELECT enum + reserved-key rejection) by the caller; spread verbatim into
+  // the REST body on both create and update. Collisions with typed args are
+  // rejected pre-write, so no key here can shadow one.
+  customFields?: Record<string, string | number | boolean>;
 }
 
 /** Assemble a REST body from only the fields that are set (partial-update safe). */
@@ -935,6 +943,11 @@ function buildOpportunityBody(
   if (f.isEmergency !== undefined) body.isEmergency = f.isEmergency;
   if (f.lineOfBusiness !== undefined) body.lineOfBusiness = f.lineOfBusiness;
   if (f.sourceChannel !== undefined) body.sourceChannel = f.sourceChannel;
+  if (f.asn !== undefined) body.asn = f.asn;
+  if (f.qualStatus !== undefined) body.qualStatus = f.qualStatus;
+  if (f.customFields) {
+    for (const [k, v] of Object.entries(f.customFields)) body[k] = v;
+  }
   return body;
 }
 
@@ -1103,6 +1116,10 @@ export interface OppView {
   // set without dropping to the Twenty UI.
   lineOfBusiness?: string;
   sourceChannel?: string;
+  // Provider-pipeline custom fields (TWENTY-OPP-FIELDS): asn (TEXT) + qualStatus
+  // (SELECT) — surfaced so an upsertOpportunity write is read-back verifiable.
+  asn?: string;
+  qualStatus?: string;
   isEmergency?: boolean;
 }
 
@@ -1125,6 +1142,11 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   }
   if (rec.sourceChannel != null && rec.sourceChannel !== "") {
     v.sourceChannel = String(rec.sourceChannel);
+  }
+  // Provider-pipeline custom fields; empty/unset => omit (mirrors segmentation).
+  if (rec.asn != null && rec.asn !== "") v.asn = String(rec.asn);
+  if (rec.qualStatus != null && rec.qualStatus !== "") {
+    v.qualStatus = String(rec.qualStatus);
   }
   // Surface isEmergency even when false (mirrors mapPersonView) so consumers can
   // reason about the flag without a second read.
@@ -1486,14 +1508,21 @@ async function fetchOpportunityMeta(
   closeDateType: string | null;
   lineOfBusiness: string[];
   sourceChannel: string[];
+  qualStatus: string[];
+  // Full name → {type, SELECT-option values} map for EVERY opportunity field
+  // (TWENTY-OPP-FIELDS F3): the ungated field-map that qualStatus AND every
+  // customFields key are validated through. NOT restricted by
+  // UPSERT_OBJECT_ALLOWLIST (that allowlist governs upsertRecord's arbitrary
+  // objects; opportunity is a first-class typed target here).
+  fields: Map<string, { type: string; options: string[] }>;
 }> {
   const objs = await fetchObjectsMeta(cfg);
   const opp = objs.find((o) => String(o.nameSingular ?? "") === "opportunity");
-  const fields = (opp?.fields ?? []) as Array<Record<string, unknown>>;
-  const list = Array.isArray(fields) ? fields : [];
+  const fieldList = (opp?.fields ?? []) as Array<Record<string, unknown>>;
+  const list = Array.isArray(fieldList) ? fieldList : [];
   // Extract a SELECT field's option value tokens (value ?? label), the same way
-  // stage validation has always read them — shared so stage and the two
-  // segmentation fields cannot drift.
+  // stage validation has always read them — shared so stage and the
+  // segmentation/qualification fields cannot drift.
   const optionValues = (fieldName: string): string[] => {
     const f = list.find((x) => String(x.name ?? "") === fieldName);
     const opts = (f?.options ?? []) as Array<Record<string, unknown>>;
@@ -1501,12 +1530,32 @@ async function fetchOpportunityMeta(
       ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
       : [];
   };
+  // name → {type, options} for every field, built from the SAME metadata read
+  // (no extra API call) — the field-map customFields/qualStatus validate against.
+  const fields = new Map<string, { type: string; options: string[] }>();
+  for (const f of list) {
+    const name = String(f.name ?? "");
+    if (!name) continue;
+    const opts = (f.options ?? []) as Array<Record<string, unknown>>;
+    const options = Array.isArray(opts)
+      ? opts.map((o) => String(o.value ?? o.label ?? "")).filter(Boolean)
+      : [];
+    fields.set(name, { type: String(f.type ?? ""), options });
+  }
   const stages = optionValues("stage");
   const lineOfBusiness = optionValues("lineOfBusiness");
   const sourceChannel = optionValues("sourceChannel");
+  const qualStatus = optionValues("qualStatus");
   const cdField = list.find((f) => String(f.name ?? "") === "closeDate");
   const closeDateType = cdField ? (String(cdField.type ?? "") || null) : null;
-  return { stages, closeDateType, lineOfBusiness, sourceChannel };
+  return {
+    stages,
+    closeDateType,
+    lineOfBusiness,
+    sourceChannel,
+    qualStatus,
+    fields,
+  };
 }
 
 // --- Generic record upsert: strict controls (TWENTY-RECORD-UPSERT) ----------
@@ -1541,6 +1590,31 @@ const UPSERT_RESERVED_FIELDS = new Set<string>([
 ]);
 const UPSERT_MATCH_VALUE_CAP = 200;
 const UPSERT_FIELD_TEXT_CAP = 500;
+
+// upsertOpportunity.customFields reserved keys (TWENTY-OPP-FIELDS F1/F4): the
+// immutable leadId idempotency marker, every Opportunity field owned by a typed
+// upsertOpportunity argument, and the base system fields. A customFields key in
+// this set is a HARD reject pre-write — the generic escape hatch can never
+// rewrite the idempotency marker or bypass a typed arg's enum validation, and a
+// collision with a typed arg is an error, not a silent merge.
+const OPP_CUSTOMFIELDS_RESERVED = new Set<string>([
+  ...UPSERT_RESERVED_FIELDS, // id, createdAt, updatedAt, deletedAt, position
+  "leadId",
+  "name",
+  "stage",
+  "amount",
+  "currencyCode",
+  "closeDate",
+  "companyId",
+  "company",
+  "pointOfContactId",
+  "pointOfContact",
+  "isEmergency",
+  "lineOfBusiness",
+  "sourceChannel",
+  "asn",
+  "qualStatus",
+]);
 
 /**
  * Resolve the write-relevant metadata for ONE object by nameSingular: its REST
@@ -2440,6 +2514,20 @@ const OpportunityUpsertSchema = z.object({
     .string()
     .optional()
     .describe("Source Channel segmentation token written, if set"),
+  asn: z
+    .string()
+    .optional()
+    .describe("ASN (AS<digits>) written, if set"),
+  qualStatus: z
+    .string()
+    .optional()
+    .describe("Qualification-status SELECT token written, if set"),
+  customFields: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+    .optional()
+    .describe(
+      "Generic scalar custom fields written, if any (keys+values as submitted; PII in non-identity scalars is out of contract)",
+    ),
   amount: z.number().optional().describe("Deal value in whole currency units"),
   currencyCode: z.string().optional(),
   closeDate: z.string().optional(),
@@ -2531,6 +2619,8 @@ const OpportunityRefSchema = z.object({
   pointOfContactId: z.string().optional(),
   lineOfBusiness: z.string().optional(),
   sourceChannel: z.string().optional(),
+  asn: z.string().optional(),
+  qualStatus: z.string().optional(),
   isEmergency: z.boolean().optional(),
   retrievedAt: z.iso.datetime(),
 });
@@ -2546,6 +2636,8 @@ const OppViewSchema = z.object({
   companyId: z.string().optional(),
   lineOfBusiness: z.string().optional(),
   sourceChannel: z.string().optional(),
+  asn: z.string().optional(),
+  qualStatus: z.string().optional(),
   isEmergency: z.boolean().optional(),
 });
 
@@ -3109,7 +3201,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.15.2",
+  version: "2026.09.16.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -3182,6 +3274,14 @@ export const model = {
       toVersion: "2026.09.15.2",
       description:
         "Fix ensureObject recording objectId:null after a live create: the create POST response envelope (Twenty v2.38.x) does not match the best-effort id extraction, so objectId is now resolved deterministically by re-reading the authoritative objects list and matching nameSingular/namePlural (mirrors ensureRelation's created-path read-back). Behavior-only fix; no method/argument/resource shape changes, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.16.1",
+      description:
+        "Teach upsertOpportunity to write the provider-pipeline Opportunity custom fields: optional asn (TEXT, ^AS<digits>$ guard) and qualStatus (SELECT, validated against the live enum like stage), plus a generic customFields scalar escape hatch (fail-closed: keys must exist and be scalar; reserved keys — the leadId marker + every typed-arg field + system fields — and composite/unknown types rejected pre-write; SELECT validated against the live enum; empty-string omitted; null forbidden). Fields written on both create and update, omitted (never nulled) when unset, and surfaced in the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method arguments + optional snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4040,6 +4140,8 @@ export const model = {
             }
             if (view.lineOfBusiness) snap.lineOfBusiness = view.lineOfBusiness;
             if (view.sourceChannel) snap.sourceChannel = view.sourceChannel;
+            if (view.asn) snap.asn = view.asn;
+            if (view.qualStatus) snap.qualStatus = view.qualStatus;
             if (view.isEmergency !== undefined) {
               snap.isEmergency = view.isEmergency;
             }
@@ -4799,6 +4901,24 @@ export const model = {
           .describe(
             "Source Channel segmentation SELECT option token (UPPER_SNAKE: DIRECT, REFERRAL, CONSULTING_HANDOFF). Validated against the live opportunity.sourceChannel enum exactly like stage. Omitted => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureOpportunitySegmentation).",
           ),
+        asn: z
+          .string()
+          .optional()
+          .describe(
+            "Autonomous System Number (TEXT), e.g. AS64249. Format-guarded to ^AS<digits>$ (case-insensitive input, uppercased on store); a non-empty value not matching is rejected. Omitted / empty => left unchanged on both create and update (never nulled).",
+          ),
+        qualStatus: z
+          .string()
+          .optional()
+          .describe(
+            "Technical-qualification SELECT option token (e.g. RESEARCH, CONTACT_IDENTIFIED, TECH_QUALIFICATION_NEEDED, FUTURE). Validated against the live opportunity.qualStatus enum exactly like stage. Omitted / empty => left unchanged on both create and update (never nulled). Requires the field to be provisioned (ensureField).",
+          ),
+        customFields: z
+          .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+          .optional()
+          .describe(
+            "Generic scalar-field escape hatch for Opportunity custom fields without a typed argument. Each key must be a camelCase field that exists on opportunity and is a scalar TYPE (TEXT/NUMBER/BOOLEAN/DATE_TIME/SELECT/UUID); reserved keys (leadId + every typed-arg field + system fields) and composite/unknown types are rejected pre-write; SELECT values are validated against the live enum; string values are sanitized; an empty string means unset (omit); null is not permitted. FAIL-CLOSED: if opportunity metadata is unreadable, the whole map is rejected. Omitted keys are left unchanged.",
+          ),
         closeDate: z
           .string()
           .default("")
@@ -4849,6 +4969,9 @@ export const model = {
           stage?: string;
           lineOfBusiness?: string;
           sourceChannel?: string;
+          asn?: string;
+          qualStatus?: string;
+          customFields?: Record<string, string | number | boolean>;
           closeDate: string;
           companyName: string;
           companyDomain: string;
@@ -4884,14 +5007,23 @@ export const model = {
           closeDateType: string | null;
           lineOfBusiness: string[];
           sourceChannel: string[];
+          qualStatus: string[];
+          fields: Map<string, { type: string; options: string[] }>;
         } = {
           stages: [],
           closeDateType: null,
           lineOfBusiness: [],
           sourceChannel: [],
+          qualStatus: [],
+          fields: new Map(),
         };
+        // Fail-closed gate for customFields (F2): typed args keep the
+        // best-effort "skip validation when metadata unreadable" posture, but
+        // customFields is rejected entirely unless metadata was read.
+        let oppMetaReadable = false;
         try {
           oppMeta = await fetchOpportunityMeta(cfg);
+          oppMetaReadable = true;
         } catch (_e) {
           context.logger.warning(
             "Opportunity metadata unreadable; skipping stage/segmentation validation",
@@ -4952,6 +5084,109 @@ export const model = {
                 oppMeta.sourceChannel.join(", ")
               }`,
             );
+          }
+
+          // qualStatus SELECT (technical-qualification): same best-effort enum
+          // validation posture as the segmentation SELECTs — empty => unset
+          // (leave unchanged), invalid token fails fast, skipped when the
+          // field's options are unreadable.
+          const qualStatus = args.qualStatus || undefined;
+          if (
+            qualStatus !== undefined && oppMeta.qualStatus.length &&
+            !oppMeta.qualStatus.includes(qualStatus)
+          ) {
+            throw new Error(
+              `Invalid qualStatus '${qualStatus}'. Valid options: ${
+                oppMeta.qualStatus.join(", ")
+              }`,
+            );
+          }
+
+          // asn TEXT (F5): sanitize + length-cap, then a positive format guard
+          // ^AS<digits>$ (case-insensitive input, uppercased on store). A
+          // non-empty value that does not match is rejected pre-write; empty =>
+          // unset (omit, never nulled). asn is a write value, never a filter
+          // operand, so no filter-safety framing.
+          let asn: string | undefined;
+          {
+            const rawAsn = sanitizeText(args.asn ?? "", 64);
+            if (rawAsn) {
+              const up = rawAsn.toUpperCase();
+              if (!/^AS\d+$/.test(up)) {
+                throw new Error(
+                  `Invalid asn '${rawAsn}': expected AS followed by digits (e.g. AS64249), or empty to leave unchanged`,
+                );
+              }
+              asn = up;
+            }
+          }
+
+          // customFields (generic scalar escape hatch) — FAIL-CLOSED (F2):
+          // reject the whole map if opportunity metadata is unreadable. Each
+          // key: reserved-key reject (F1/F4), camelCase shape, must exist and be
+          // a scalar TYPE, SELECT validated against the live enum, strings
+          // sanitized, empty-string => omit (F8), null forbidden (F8).
+          const validatedCustomFields: Record<
+            string,
+            string | number | boolean
+          > = {};
+          const rawCustomFields = args.customFields ?? {};
+          if (Object.keys(rawCustomFields).length) {
+            if (!oppMetaReadable) {
+              throw new Error(
+                "customFields supplied but opportunity field metadata is unreadable — refusing to write (fail-closed)",
+              );
+            }
+            for (const [k, v] of Object.entries(rawCustomFields)) {
+              const key = String(k).trim();
+              if (!FIELD_NAME_RE.test(key)) {
+                throw new Error(
+                  `Invalid customFields key '${
+                    sanitizeText(key, 80)
+                  }': must be a camelCase identifier (letter-led, alphanumeric)`,
+                );
+              }
+              if (OPP_CUSTOMFIELDS_RESERVED.has(key)) {
+                throw new Error(
+                  `customFields key '${key}' is reserved — set it via its typed argument, not customFields`,
+                );
+              }
+              if (v === null) {
+                throw new Error(
+                  `customFields key '${key}' is null; null is not permitted (omit the key to leave the field unchanged)`,
+                );
+              }
+              const fMeta = oppMeta.fields.get(key);
+              if (!fMeta) {
+                throw new Error(
+                  `Unknown customFields key '${key}' on opportunity (fail-closed; refusing to write an unrecognized field)`,
+                );
+              }
+              if (!UPSERT_SCALAR_TYPES.has(fMeta.type)) {
+                throw new Error(
+                  `customFields key '${key}' has non-scalar type '${fMeta.type}' (allowed: ${
+                    [...UPSERT_SCALAR_TYPES].join(", ")
+                  }); composite fields are not supported`,
+                );
+              }
+              let out: string | number | boolean = v;
+              if (typeof v === "string") {
+                const s = sanitizeText(v, UPSERT_FIELD_TEXT_CAP);
+                if (!s) continue; // empty-string => omit (leave unchanged)
+                out = s;
+              }
+              if (fMeta.type === "SELECT") {
+                const token = String(out);
+                if (fMeta.options.length && !fMeta.options.includes(token)) {
+                  throw new Error(
+                    `Invalid value '${token}' for SELECT customFields key '${key}'. Valid options: ${
+                      fMeta.options.join(", ")
+                    }`,
+                  );
+                }
+              }
+              validatedCustomFields[key] = out;
+            }
           }
 
           // amount: default USD only on create; on an amount-only update preserve
@@ -5041,6 +5276,11 @@ export const model = {
               : {}),
             ...(lineOfBusiness !== undefined ? { lineOfBusiness } : {}),
             ...(sourceChannel !== undefined ? { sourceChannel } : {}),
+            ...(asn !== undefined ? { asn } : {}),
+            ...(qualStatus !== undefined ? { qualStatus } : {}),
+            ...(Object.keys(validatedCustomFields).length
+              ? { customFields: validatedCustomFields }
+              : {}),
           };
           let opportunityId = existingOpp ? String(existingOpp.id ?? "") : "";
           let action:
@@ -5111,6 +5351,11 @@ export const model = {
               stage: reportedStage,
               ...(lineOfBusiness !== undefined ? { lineOfBusiness } : {}),
               ...(sourceChannel !== undefined ? { sourceChannel } : {}),
+              ...(asn !== undefined ? { asn } : {}),
+              ...(qualStatus !== undefined ? { qualStatus } : {}),
+              ...(Object.keys(validatedCustomFields).length
+                ? { customFields: validatedCustomFields }
+                : {}),
               ...(args.amount !== undefined ? { amount: args.amount } : {}),
               ...(amount ? { currencyCode: amount.currencyCode } : {}),
               ...(closeDate ? { closeDate } : {}),
