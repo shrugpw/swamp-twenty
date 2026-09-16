@@ -2460,12 +2460,15 @@ const OpportunityUpsertSchema = z.object({
 
 // --- Generic record upsert snapshot (TWENTY-RECORD-UPSERT) ------------------
 // The outcome of an upsertRecord run: the action taken, the resolved object
-// identity + plural, the natural-key field, and the create/patch payload. The
-// matchValue is stored ONLY as a hash (matchValueHash) — never raw — so an
-// attacker-influenced natural key cannot leak into durable data; the raw
-// canonical value survives only inside creationPayload (the exact body a create
-// WOULD/DID POST), matching upsertOpportunity's posture of persisting submitted
-// (never Twenty-response) values. No raw Twenty response body is persisted.
+// identity + plural, the natural-key field, and the create/patch payload shape.
+// The raw natural-key matchValue is NEVER persisted: it is stored only as a hash
+// (matchValueHash), and inside creationPayload the matchField entry is likewise
+// the hash placeholder `[hashed:<hash>]`, not the raw value — so an
+// attacker-influenced natural key cannot leak into this durable
+// (lifetime:infinite) resource. The other scalar VALUES in writtenFields /
+// creationPayload are recorded as submitted (in-scope by spec, matching
+// upsertOpportunity's posture of persisting submitted — never Twenty-response —
+// values). No raw Twenty response body is persisted.
 const RecordUpsertedSchema = z.object({
   baseUrl: z.string(),
   action: z.enum(["created", "updated", "planned-create", "planned-update"]),
@@ -2485,7 +2488,7 @@ const RecordUpsertedSchema = z.object({
   creationPayload: z
     .record(z.string(), z.unknown())
     .describe(
-      "The exact body a create did/would POST: writtenFields plus the canonical matchField value",
+      "The create body SHAPE: writtenFields plus the matchField — whose value is the `[hashed:<hash>]` placeholder here, never the raw natural key (the real POST sends the canonical value)",
     ),
   retrievedAt: z.iso.datetime(),
 });
@@ -5180,13 +5183,22 @@ export const model = {
             "Refusing to write without confirm:true (use dryRun:true to plan)",
           );
         }
+        // Render a caller-supplied identifier safely inside a pre-I/O validation
+        // error: strip control chars (ANSI escapes, newlines) and hard-cap the
+        // length so a hostile objectNameSingular / matchField / fields key can't
+        // inject terminal escapes or an unbounded blob into the durable
+        // method-summary report. (The redactError/scrubSubmitted try/catch below
+        // only wraps errors thrown AFTER this block.)
+        const safeLabel = (s: unknown): string => sanitizeText(s, 80);
         // (Allowlist) reject any non-allowlisted object BEFORE any I/O. This is
         // the real control; there is no isCustom flag to lean on (see
         // fetchUpsertObjectMeta).
         const objectNameSingular = String(args.objectNameSingular ?? "").trim();
         if (!UPSERT_OBJECT_ALLOWLIST.has(objectNameSingular)) {
           throw new Error(
-            `Object '${objectNameSingular}' is not upsertable (allowed: ${
+            `Object '${
+              safeLabel(objectNameSingular)
+            }' is not upsertable (allowed: ${
               [...UPSERT_OBJECT_ALLOWLIST].join(", ")
             })`,
           );
@@ -5195,12 +5207,16 @@ export const model = {
         const matchField = String(args.matchField ?? "").trim();
         if (!FIELD_NAME_RE.test(matchField)) {
           throw new Error(
-            `Invalid matchField '${matchField}': must be a camelCase identifier (letter-led, alphanumeric)`,
+            `Invalid matchField '${
+              safeLabel(matchField)
+            }': must be a camelCase identifier (letter-led, alphanumeric)`,
           );
         }
         if (UPSERT_RESERVED_FIELDS.has(matchField)) {
           throw new Error(
-            `matchField '${matchField}' is reserved and cannot be a natural key`,
+            `matchField '${
+              safeLabel(matchField)
+            }' is reserved and cannot be a natural key`,
           );
         }
         // (matchValue) canonicalize ONCE. The IDENTICAL bytes are used for both
@@ -5228,11 +5244,15 @@ export const model = {
           if (key === matchField) continue; // strip the natural key from fields
           if (!FIELD_NAME_RE.test(key)) {
             throw new Error(
-              `Invalid field name '${key}': must be a camelCase identifier (letter-led, alphanumeric)`,
+              `Invalid field name '${
+                safeLabel(key)
+              }': must be a camelCase identifier (letter-led, alphanumeric)`,
             );
           }
           if (UPSERT_RESERVED_FIELDS.has(key)) {
-            throw new Error(`Field '${key}' is reserved and cannot be set`);
+            throw new Error(
+              `Field '${safeLabel(key)}' is reserved and cannot be set`,
+            );
           }
           cleaned[key] = v;
         }
@@ -5284,6 +5304,34 @@ export const model = {
               })`,
             );
           }
+          // (matchField VALUE) validate the natural-key value against the field
+          // itself — the same enum path used for `fields` SELECT values — so a
+          // SELECT/NUMBER key can't send a blind out-of-enum / non-numeric value
+          // and eat an opaque Twenty 400. (canonicalMatchValue is a submitted
+          // string, so it is scrubbed from any error by scrubSubmitted below;
+          // the message deliberately omits the raw value.)
+          if (mfMeta.type === "SELECT") {
+            if (
+              mfMeta.options.length &&
+              !mfMeta.options.includes(canonicalMatchValue)
+            ) {
+              throw new Error(
+                `Invalid value for SELECT matchField '${matchField}'. Valid options: ${
+                  mfMeta.options.join(", ")
+                }`,
+              );
+            }
+          } else if (mfMeta.type === "NUMBER") {
+            // matchValue always arrives as a string and is filtered/stored in
+            // that canonical string form (stored == searched). A NUMBER natural
+            // key must therefore parse as a finite number; reject pre-write
+            // rather than send Twenty a value it will reject.
+            if (!Number.isFinite(Number(canonicalMatchValue))) {
+              throw new Error(
+                `matchField '${matchField}' is NUMBER but matchValue is not a finite number`,
+              );
+            }
+          }
 
           // (fields) existence (fail-closed) + scalar type + SELECT option
           // validation + string sanitization → the field set actually written.
@@ -5323,12 +5371,31 @@ export const model = {
             writtenFields[key] = out;
           }
 
-          // The full create body (used on the create path AND recorded as the
-          // canonical "would-create" payload). matchField carries the IDENTICAL
-          // canonical bytes used in the find filter.
+          // One hash of {object, matchField, canonical value} feeds BOTH the
+          // snapshot instance name and the non-raw matchValueHash attribute
+          // (single object arg — resolution #3). Computed here so the persisted
+          // create payload can reference it instead of the raw value.
+          const matchValueHash = await listInstanceHash({
+            object: objectNameSingular,
+            matchField,
+            matchValue: canonicalMatchValue,
+          });
+
+          // The full create body actually sent to Twenty: matchField carries the
+          // IDENTICAL canonical bytes used in the find filter.
           const creationPayload: Record<string, unknown> = {
             ...writtenFields,
             [matchField]: canonicalMatchValue,
+          };
+          // The form PERSISTED in the durable (lifetime:infinite) snapshot: the
+          // raw natural-key value is replaced with its hash so the recorded
+          // attributes honor the method's "matchValue stored hashed, never raw"
+          // guarantee. (The other scalar VALUES in writtenFields are recorded
+          // as-is — in-scope by spec; a caller putting PII in a non-identity
+          // scalar field is out of this method's contract to protect.)
+          const persistedCreationPayload: Record<string, unknown> = {
+            ...writtenFields,
+            [matchField]: `[hashed:${matchValueHash}]`,
           };
 
           // (2) find by natural key; limit=2 detects ambiguity.
@@ -5368,8 +5435,9 @@ export const model = {
           } else {
             // create, with a check-then-act race fallback (Twenty has no unique
             // constraint on the natural key).
+            let created = false;
             try {
-              const created = firstRecord(
+              const rec = firstRecord(
                 await twentyRequest(
                   cfg,
                   "POST",
@@ -5377,17 +5445,9 @@ export const model = {
                   creationPayload,
                 ),
               );
-              recordId = String(created.id ?? "");
+              recordId = String(rec.id ?? "");
               action = "created";
-              if (!recordId) {
-                // Response envelope carried no id (version drift): resolve it
-                // authoritatively by re-reading the natural key.
-                const after = unwrapList(
-                  await twentyRequest(cfg, "GET", findPath),
-                  plural,
-                );
-                if (after.length === 1) recordId = String(after[0].id ?? "");
-              }
+              created = true;
             } catch (e) {
               // A concurrent run may have created it between our find and POST.
               const raced = unwrapList(
@@ -5415,16 +5475,24 @@ export const model = {
                 );
               }
             }
+            // The create response envelope carried no id (Twenty version drift):
+            // resolve it authoritatively by re-reading the natural key. Done
+            // OUTSIDE the race catch so an ambiguous (>=2) result is a hard
+            // error — consistent with the primary find and the race catch —
+            // rather than being swallowed or reported 'created' with no id.
+            if (created && !recordId) {
+              const after = unwrapList(
+                await twentyRequest(cfg, "GET", findPath),
+                plural,
+              );
+              if (after.length >= 2) {
+                throw new Error(
+                  `Create succeeded but the natural key now matches ${after.length} ${plural} — refusing to guess the created record's id (de-dupe manually)`,
+                );
+              }
+              if (after.length === 1) recordId = String(after[0].id ?? "");
+            }
           }
-
-          // Snapshot instance name + the non-raw match-value key both derive
-          // from ONE listInstanceHash of {object, matchField, canonical value}
-          // (single object arg — resolution #3).
-          const matchValueHash = await listInstanceHash({
-            object: objectNameSingular,
-            matchField,
-            matchValue: canonicalMatchValue,
-          });
 
           context.logger.info(
             "upsertRecord {object}.{field}: {action} (id {id}){dry}",
@@ -5450,7 +5518,7 @@ export const model = {
               matchValueHash,
               ...(recordId ? { recordId } : {}),
               writtenFields,
-              creationPayload,
+              creationPayload: persistedCreationPayload,
               retrievedAt: new Date().toISOString(),
             },
           );

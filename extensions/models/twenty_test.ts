@@ -4250,7 +4250,16 @@ Deno.test("upsertRecord: dryRun on a missing target plans a create (no POST)", a
     assertEquals(calls.find((c) => c.method === "POST"), undefined);
     assertEquals(captured.data!.action, "planned-create");
     const payload = captured.data!.creationPayload as Record<string, unknown>;
-    assertEquals(payload.invoiceNinjaClientRef, "client-abc-123");
+    // The persisted payload carries the matchField as a HASH placeholder, never
+    // the raw natural key (finding #1); scalar field values remain as submitted.
+    assertEquals(
+      String(payload.invoiceNinjaClientRef).startsWith("[hashed:"),
+      true,
+    );
+    assertEquals(
+      payload.invoiceNinjaClientRef,
+      `[hashed:${captured.data!.matchValueHash}]`,
+    );
     assertEquals(payload.name, "Acme Sub");
   } finally {
     restore();
@@ -4755,9 +4764,14 @@ Deno.test("upsertRecord: snapshot instance name uses the hash, never the raw val
   });
   const { ctx, captured } = makeRecCtx();
   try {
+    // A distinctive raw value we can grep for across the WHOLE serialized
+    // snapshot (finding #1: it must not appear anywhere, incl. creationPayload).
+    const rawValue = "client-secret-natural-key-9x7z";
     await model.methods.upsertRecord.execute(
       {
-        ...REC_BASE,
+        objectNameSingular: "subscription",
+        matchField: "invoiceNinjaClientRef",
+        matchValue: rawValue,
         fields: { mrr: 1 },
         confirm: false,
         dryRun: true,
@@ -4767,16 +4781,21 @@ Deno.test("upsertRecord: snapshot instance name uses the hash, never the raw val
     const hash = await listInstanceHash({
       object: "subscription",
       matchField: "invoiceNinjaClientRef",
-      matchValue: "client-abc-123",
+      matchValue: rawValue,
     });
     assertEquals(captured.spec, "recordUpserted");
     assertEquals(captured.name, `record-subscription-${hash}`);
-    assertEquals(captured.name!.includes("client-abc-123"), false);
     assertEquals(captured.data!.matchValueHash, hash);
     assertEquals(
       "matchValue" in (captured.data as Record<string, unknown>),
       false,
     );
+    // creationPayload stores the matchField as the hash placeholder, not raw.
+    const payload = captured.data!.creationPayload as Record<string, unknown>;
+    assertEquals(payload.invoiceNinjaClientRef, `[hashed:${hash}]`);
+    // The raw value must not appear ANYWHERE in the persisted attributes.
+    const serialized = JSON.stringify(captured.data);
+    assertEquals(serialized.includes(rawValue), false);
   } finally {
     restore();
   }
@@ -4867,6 +4886,138 @@ Deno.test("upsertRecord: a matchField absent from the object metadata is rejecte
         ),
       Error,
       "does not exist on object",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (Finding #2) hostile identifiers are sanitized in pre-I/O error messages:
+// control chars / ANSI escapes stripped and length hard-capped, so nothing
+// unbounded or escape-laden lands in the durable method-summary report.
+Deno.test("upsertRecord: hostile identifiers are sanitized (bounded, no control chars) in pre-I/O throws", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = makeRecCtx();
+  const CONTROL = /[\x00-\x1f]/;
+  try {
+    // Hostile object name: ANSI escape + newline + a huge blob.
+    const hostileObject = "\x1b[31mevil\npwn" + "A".repeat(5000);
+    const objErr = await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            objectNameSingular: hostileObject,
+            matchField: "invoiceNinjaClientRef",
+            matchValue: "x-1",
+            fields: {},
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+    );
+    const m1 = (objErr as Error).message;
+    assertEquals(CONTROL.test(m1), false); // no control chars / ESC
+    assert(m1.length < 200, `message should be bounded, got ${m1.length}`);
+
+    // Hostile fields key gets the same treatment (fails FIELD_NAME_RE, echoed).
+    const keyErr = await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            objectNameSingular: "subscription",
+            matchField: "invoiceNinjaClientRef",
+            matchValue: "x-1",
+            fields: { ["\x1b[0mbad\nkey" + "B".repeat(5000)]: "v" },
+            confirm: true,
+            dryRun: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+    );
+    const m2 = (keyErr as Error).message;
+    assertEquals(CONTROL.test(m2), false);
+    assert(m2.length < 200, `message should be bounded, got ${m2.length}`);
+
+    assertEquals(calls.length, 0); // rejected before any I/O
+  } finally {
+    restore();
+  }
+});
+
+// (Finding #3) create succeeded but the response envelope carried no id, and the
+// authoritative re-GET is ambiguous (2 rows) => throw, never 'created' w/o id.
+Deno.test("upsertRecord: no-id create envelope with an ambiguous re-GET throws", async () => {
+  let getCount = 0;
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      getCount++;
+      // 1st find => empty (go create); the no-id re-GET => 2 rows (ambiguous).
+      return {
+        data: {
+          subscriptions: getCount === 1 ? [] : [{ id: "a" }, { id: "b" }],
+        },
+      };
+    }
+    // POST succeeds but returns an envelope with NO id.
+    if (method === "POST") return { data: { createSubscription: {} } };
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            ...REC_BASE,
+            fields: { mrr: 1 },
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "refusing to guess the created record's id",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// (Finding #4) a SELECT matchField whose matchValue is outside the live enum is
+// rejected pre-write (same enum path used for `fields` SELECT values).
+Deno.test("upsertRecord: a SELECT matchField with an out-of-enum matchValue throws before any write", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return REC_META;
+    if (method === "GET" && path.startsWith("/rest/subscriptions")) {
+      return { data: { subscriptions: [] } };
+    }
+    return {};
+  });
+  const { ctx } = makeRecCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertRecord.execute(
+          {
+            objectNameSingular: "subscription",
+            matchField: "status",
+            matchValue: "BOGUS",
+            fields: {},
+            confirm: true,
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "SELECT matchField 'status'. Valid options: DRAFT, ACTIVE, CHURNED",
+    );
+    assertEquals(
+      calls.find((c) => c.method === "POST" || c.method === "PATCH"),
+      undefined,
     );
   } finally {
     restore();
