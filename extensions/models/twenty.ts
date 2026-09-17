@@ -156,6 +156,62 @@ export async function twentyRequest(
   return text ? JSON.parse(text) : {};
 }
 
+/**
+ * Minimal Twenty **Core GraphQL** client over fetch (TWENTY-DASHBOARDS). POSTs
+ * `{query, variables}` to `/graphql` with the vaulted bearer token — the SAME
+ * workspace API key as the REST surface (only native-dashboard *authoring* needs
+ * a user token, which this model does not do). Throws (caller-redacts) on a
+ * non-2xx HTTP status OR when the GraphQL response carries `errors`, so any
+ * failure is uniform and a caller can fall back to REST. **READ-ONLY by
+ * contract:** refuses a document whose first significant token is `mutation` or
+ * `subscription` (a bare `{...}` selection is a query). Returns the `data` object.
+ */
+export async function twentyGraphQL(
+  cfg: TwentyCfg,
+  query: string,
+  variables?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  // Read-only guard: drop a BOM + line/block comments, then reject a
+  // mutation/subscription operation before any network call.
+  const head = query
+    .replace(/^﻿/, "")
+    .replace(/#[^\n]*(?:\n|$)/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .trimStart();
+  if (/^(mutation|subscription)\b/i.test(head)) {
+    throw new Error(
+      "twentyGraphQL refuses a non-query operation (read-only transport)",
+    );
+  }
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const resp = await fetch(`${base}/graphql`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${cfg.apiToken}`,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(variables ? { query, variables } : { query }),
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(
+      `Twenty GraphQL failed: ${resp.status} ${resp.statusText} — ${
+        text.slice(0, 300)
+      }`,
+    );
+  }
+  const json = (text ? JSON.parse(text) : {}) as {
+    data?: Record<string, unknown>;
+    errors?: Array<{ message?: string }>;
+  };
+  if (json.errors && json.errors.length > 0) {
+    const msg = json.errors.map((e) => e?.message ?? "").join("; ");
+    throw new Error(`Twenty GraphQL errors: ${msg.slice(0, 300)}`);
+  }
+  return json.data ?? {};
+}
+
 /** Extract a list from a Twenty REST list response (`{data:{<plural>:[...]}}`). */
 function unwrapList(
   json: unknown,
@@ -1211,6 +1267,166 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   return v;
 }
 
+// --- Pipeline analytics aggregation (TWENTY-DASHBOARDS) ---------------------
+// Pure, PII-free aggregation over OppViews for the CRM dashboard. Reads ONLY the
+// allowlisted scalar/enum fields already on OppView — never name/companyId/
+// contacts. Group-bys use OBSERVED values (not a hardcoded enum list), so a
+// legacy/added stage or LOB option is counted, never silently dropped (AD10).
+
+/** Open (in-flight) pipeline stages — the Sales-pipeline board (positive set). */
+export const OPEN_STAGES: readonly string[] = [
+  "NEW",
+  "SCREENING",
+  "MEETING",
+  "PROPOSAL",
+];
+/** Won stages: CUSTOMER (won-active) + CLOSED_WON (won-terminal), ontology §2.2. */
+export const WON_STAGES: readonly string[] = ["CUSTOMER", "CLOSED_WON"];
+/** Lost stage(s). */
+export const LOST_STAGES: readonly string[] = ["CLOSED_LOST"];
+
+const UNSET_LOB = "UNSET";
+const UNATTRIBUTED = "UNATTRIBUTED";
+const UNKNOWN_CURRENCY = "UNKNOWN";
+
+/** Per-currency money accumulator (whole units; never cross-currency summed). */
+interface AmountEntry {
+  currency: string;
+  amount: number;
+}
+interface StageBucket {
+  stage: string;
+  count: number;
+  amounts: AmountEntry[];
+}
+interface LobBucket {
+  lineOfBusiness: string;
+  count: number;
+  amounts: AmountEntry[];
+}
+interface ChannelBucket {
+  sourceChannel: string;
+  count: number;
+}
+
+/** The PII-free CRM dashboard metric set. */
+export interface OppAggregates {
+  totalOpps: number;
+  emergencyExcluded: number;
+  currencies: string[];
+  byStage: StageBucket[];
+  byLineOfBusiness: LobBucket[];
+  bySourceChannel: ChannelBucket[];
+  openPipeline: { count: number; amounts: AmountEntry[] };
+  winLoss: { won: number; lost: number; winRate: number | null };
+  activeCustomers: number;
+}
+
+/** Add a view's whole-unit amount into a per-currency accumulator. */
+function addAmount(acc: Record<string, number>, view: OppView): void {
+  if (view.amount === undefined) return;
+  const cur = view.currencyCode || UNKNOWN_CURRENCY;
+  acc[cur] = (acc[cur] ?? 0) + view.amount;
+}
+
+/** Freeze a per-currency accumulator into a sorted AmountEntry[]. */
+function toAmounts(acc: Record<string, number>): AmountEntry[] {
+  return Object.entries(acc)
+    .map(([currency, amount]) => ({ currency, amount }))
+    .sort((a, b) => a.currency.localeCompare(b.currency));
+}
+
+/**
+ * Aggregate a set of OppViews into the PII-free dashboard metric set. Excludes
+ * isEmergency opps by default (SE4 — never disclose emergency volume in an
+ * aggregate a non-restricted viewer might see); pass includeEmergency to count
+ * them. Findings folded: win = CUSTOMER+CLOSED_WON, lost = CLOSED_LOST, winRate
+ * null on 0/0 (AD1); legacy CLOSED (or any stage) gets its own observed bucket,
+ * never dropped (AD2/AD10); null sourceChannel -> UNATTRIBUTED (AD3);
+ * per-currency sums, no whole-run fail-closed on mixed currency (AD11).
+ */
+export function aggregateOppViews(
+  views: readonly OppView[],
+  opts: { includeEmergency?: boolean } = {},
+): OppAggregates {
+  const stage = new Map<
+    string,
+    { count: number; amt: Record<string, number> }
+  >();
+  const lob = new Map<string, { count: number; amt: Record<string, number> }>();
+  const chan = new Map<string, number>();
+  const openAmt: Record<string, number> = {};
+  const currencies = new Set<string>();
+  let openCount = 0;
+  let won = 0;
+  let lost = 0;
+  let activeCustomers = 0;
+  let total = 0;
+  let emergencyExcluded = 0;
+
+  for (const v of views) {
+    if (v.isEmergency && !opts.includeEmergency) {
+      emergencyExcluded++;
+      continue;
+    }
+    total++;
+    if (v.currencyCode) currencies.add(v.currencyCode);
+
+    const sKey = v.stage || "UNSET";
+    const sb = stage.get(sKey) ?? { count: 0, amt: {} };
+    sb.count++;
+    addAmount(sb.amt, v);
+    stage.set(sKey, sb);
+
+    const lKey = v.lineOfBusiness || UNSET_LOB;
+    const lb = lob.get(lKey) ?? { count: 0, amt: {} };
+    lb.count++;
+    addAmount(lb.amt, v);
+    lob.set(lKey, lb);
+
+    const cKey = v.sourceChannel || UNATTRIBUTED;
+    chan.set(cKey, (chan.get(cKey) ?? 0) + 1);
+
+    if (OPEN_STAGES.includes(v.stage)) {
+      openCount++;
+      addAmount(openAmt, v);
+    }
+    if (WON_STAGES.includes(v.stage)) won++;
+    if (LOST_STAGES.includes(v.stage)) lost++;
+    if (v.stage === "CUSTOMER") activeCustomers++;
+  }
+
+  const winRate = (won + lost) > 0 ? won / (won + lost) : null;
+  const byCount = <T extends { count: number }>(a: T, b: T) =>
+    b.count - a.count;
+
+  return {
+    totalOpps: total,
+    emergencyExcluded,
+    currencies: [...currencies].sort(),
+    byStage: [...stage.entries()]
+      .map(([stage, b]) => ({
+        stage,
+        count: b.count,
+        amounts: toAmounts(b.amt),
+      }))
+      .sort(byCount),
+    byLineOfBusiness: [...lob.entries()]
+      .map(([lineOfBusiness, b]) => ({
+        lineOfBusiness,
+        count: b.count,
+        amounts: toAmounts(b.amt),
+      }))
+      .sort(byCount),
+    bySourceChannel: [...chan.entries()]
+      .map(([sourceChannel, count]) => ({ sourceChannel, count }))
+      .sort(byCount),
+    openPipeline: { count: openCount, amounts: toAmounts(openAmt) },
+    winLoss: { won, lost, winRate },
+    activeCustomers,
+  };
+}
+
 // --- Bulk-list compact views (TWENTY-SNAPSHOT-READS) ------------------------
 // Deliberately mirror the *Ref posture: only join keys + non-sensitive scalars,
 // never bulk PII. No person name/email/phone/jobTitle, no company beyond
@@ -1550,6 +1766,65 @@ async function listOpportunitiesFiltered(
     LIST_ORDER,
   );
   return { items: page.items, truncated: page.truncated };
+}
+
+// GraphQL field selection for an Opportunity row — the allowlisted analytics
+// fields only (never name/contacts). `amount` is Twenty's CURRENCY composite,
+// selected as its {amountMicros, currencyCode} subfields so mapOppView's
+// extractAmount consumes the GraphQL node exactly like a REST record.
+const OPP_AGG_NODE_FIELDS =
+  "id stage amount { amountMicros currencyCode } lineOfBusiness sourceChannel isEmergency";
+
+/**
+ * GraphQL-primary acquisition (TWENTY-DASHBOARDS): page the full Opportunity set
+ * over the Core GraphQL `opportunities` connection (Relay `first`/`after`),
+ * selecting only the allowlisted analytics fields. Also returns the connection's
+ * server-side `totalCount` + `sumAmountAmountMicros` (all-currency micros sum) so
+ * the caller can cross-check its in-extension aggregation. Node shape matches a
+ * REST opportunity record for the fields we read, so callers map with mapOppView.
+ * Throws (caller-redacts) on any GraphQL failure so acquisition can fall back to
+ * REST. Verified live on v2.38.1 (sumAmountAmountMicros == in-extension sum).
+ */
+async function acquireOppRowsGraphQL(cfg: TwentyCfg): Promise<{
+  rows: Array<Record<string, unknown>>;
+  truncated: boolean;
+  serverTotalCount: number | null;
+  serverSumMicros: number | null;
+}> {
+  const rows: Array<Record<string, unknown>> = [];
+  let after: string | null = null;
+  let serverTotalCount: number | null = null;
+  let serverSumMicros: number | null = null;
+  let pages = 0;
+  const PAGE = 60; // Twenty caps a page at 60.
+  const query =
+    `query($first:Int,$after:String){ opportunities(first:$first, after:$after){ totalCount sumAmountAmountMicros edges { node { ${OPP_AGG_NODE_FIELDS} } } pageInfo { hasNextPage endCursor } } }`;
+  for (;;) {
+    const data = await twentyGraphQL(cfg, query, { first: PAGE, after });
+    const conn = data.opportunities as {
+      totalCount?: number;
+      sumAmountAmountMicros?: number;
+      edges?: Array<{ node?: Record<string, unknown> }>;
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    } | undefined;
+    if (!conn) throw new Error("GraphQL opportunities returned no connection");
+    if (typeof conn.totalCount === "number") serverTotalCount = conn.totalCount;
+    if (typeof conn.sumAmountAmountMicros === "number") {
+      serverSumMicros = conn.sumAmountAmountMicros;
+    }
+    for (const e of conn.edges ?? []) if (e?.node) rows.push(e.node);
+    pages++;
+    const next = conn.pageInfo?.endCursor;
+    if (
+      !conn.pageInfo?.hasNextPage || rows.length >= MAX_LIST_CAP ||
+      !next || next === after || pages > 100
+    ) {
+      const truncated = Boolean(conn.pageInfo?.hasNextPage) &&
+        rows.length >= MAX_LIST_CAP;
+      return { rows, truncated, serverTotalCount, serverSumMicros };
+    }
+    after = next;
+  }
 }
 
 /**
@@ -2753,6 +3028,70 @@ const OpportunityListSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Dashboard aggregate snapshot (TWENTY-DASHBOARDS) -----------------------
+
+const AmountEntrySchema = z.object({
+  currency: z.string(),
+  amount: z.number(),
+});
+
+/**
+ * PII-free CRM pipeline analytics snapshot from aggregateOpportunities. Only
+ * counts, per-currency sums, and enum labels — no opp names/ids/contacts.
+ * `source` = which acquisition path produced the numbers (rest until the live
+ * `graphqlProbe` verifies GraphQL aggregation); `graphqlProbe` records the
+ * verify-first Phase-0 findings (introspection state + whether a GraphQL read
+ * worked) without depending on them.
+ */
+export const OppAggregatesSchema = z.object({
+  baseUrl: z.string(),
+  source: z.enum(["graphql", "rest"]),
+  truncated: z
+    .boolean()
+    .describe("True if acquisition was capped with more opps available"),
+  includeEmergency: z.boolean(),
+  totalOpps: z.number(),
+  emergencyExcluded: z.number(),
+  currencies: z.array(z.string()),
+  byStage: z.array(z.object({
+    stage: z.string(),
+    count: z.number(),
+    amounts: z.array(AmountEntrySchema),
+  })),
+  byLineOfBusiness: z.array(z.object({
+    lineOfBusiness: z.string(),
+    count: z.number(),
+    amounts: z.array(AmountEntrySchema),
+  })),
+  bySourceChannel: z.array(z.object({
+    sourceChannel: z.string(),
+    count: z.number(),
+  })),
+  openPipeline: z.object({
+    count: z.number(),
+    amounts: z.array(AmountEntrySchema),
+  }),
+  winLoss: z.object({
+    won: z.number(),
+    lost: z.number(),
+    winRate: z.number().nullable(),
+  }),
+  activeCustomers: z.number(),
+  graphqlProbe: z.object({
+    attempted: z.boolean().describe("Whether GraphQL acquisition was tried"),
+    ok: z.boolean().describe("GraphQL acquisition succeeded (source==graphql)"),
+    serverSumMicros: z
+      .number()
+      .nullable()
+      .describe("Connection sumAmountAmountMicros (all-currency micros sum)"),
+    crossCheck: z
+      .enum(["match", "mismatch", "na"])
+      .describe("Server micros sum vs in-extension raw micros sum"),
+    detail: z.string().optional(),
+  }),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Bulk-list snapshots (TWENTY-SNAPSHOT-READS) ----------------------------
 // opportunityList-shaped PLUS continuation (AR-1) + honesty (AR-2) fields.
 
@@ -3323,7 +3662,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.16.4",
+  version: "2026.09.17.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -3432,6 +3771,14 @@ export const model = {
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
+    {
+      toVersion: "2026.09.17.1",
+      description:
+        "Add CRM pipeline analytics (TWENTY-DASHBOARDS): aggregateOpportunities — a read-only fan-out that aggregates all Opportunities into a PII-free oppAggregates snapshot (counts + per-currency sums by stage/lineOfBusiness/sourceChannel, open-pipeline, win/loss + win rate, active customers; isEmergency excluded by default) — plus a folded-in read-only Core-GraphQL transport (twentyGraphQL) and a verify-first GraphQL probe recorded on the snapshot. Additive method + one new resource; globalArguments unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
   ],
   resources: {
     "capability": {
@@ -3508,6 +3855,14 @@ export const model = {
       schema: OpportunityListSchema,
       lifetime: "infinite",
       garbageCollection: 100,
+    },
+    "oppAggregates": {
+      description:
+        "Snapshot from aggregateOpportunities: PII-free CRM pipeline analytics (counts + per-currency sums by stage/lineOfBusiness/sourceChannel, open-pipeline, win/loss, active customers) + the read-only GraphQL verification probe. No opp names/ids/contacts.",
+      schema: OppAggregatesSchema,
+      // Analytics snapshot: finite TTL + tight GC like the other bulk reads.
+      lifetime: "3d",
+      garbageCollection: 5,
     },
     "peopleList": {
       description:
@@ -4233,6 +4588,103 @@ export const model = {
           return { dataHandles: [handle] };
         } catch (e) {
           throw new Error(redactError(e));
+        }
+      },
+    },
+    aggregateOpportunities: {
+      description:
+        "Read-only CRM pipeline analytics: aggregate all Opportunities into PII-free metrics — counts + per-currency sums grouped by stage / lineOfBusiness / sourceChannel (observed values, incl. a legacy CLOSED bucket), open-pipeline value (NEW/SCREENING/MEETING/PROPOSAL), win/loss + win rate (won = CUSTOMER+CLOSED_WON, lost = CLOSED_LOST, n/a on 0/0), and active customers. isEmergency opps are EXCLUDED by default (never disclose emergency volume). GraphQL-primary: pages the Core-GraphQL opportunities connection (allowlisted fields) and cross-checks its server-side sumAmountAmountMicros against the in-extension sum; falls back to the fully-paginated REST read on any GraphQL failure. Snapshots an `oppAggregates` resource (no opp names/ids/contacts).",
+      arguments: z.object({
+        includeEmergency: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Include isEmergency opps in the aggregates (default false — excluded so the snapshot can't disclose emergency volume to a non-restricted viewer).",
+          ),
+      }),
+      execute: async (
+        args: { includeEmergency: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          // GraphQL-primary acquisition (server-side field selection + the
+          // connection sumAmountAmountMicros cross-check); on ANY GraphQL
+          // failure fall back to the fully-paginated REST read. Both paths yield
+          // raw opportunity records that mapOppView maps identically.
+          let source: "graphql" | "rest" = "graphql";
+          let rows: Array<Record<string, unknown>>;
+          let truncated: boolean;
+          let serverSumMicros: number | null = null;
+          const probe: {
+            attempted: boolean;
+            ok: boolean;
+            serverSumMicros: number | null;
+            crossCheck: "match" | "mismatch" | "na";
+            detail?: string;
+          } = {
+            attempted: true,
+            ok: false,
+            serverSumMicros: null,
+            crossCheck: "na",
+          };
+          try {
+            const g = await acquireOppRowsGraphQL(cfg);
+            rows = g.rows;
+            truncated = g.truncated;
+            serverSumMicros = g.serverSumMicros;
+            probe.ok = true;
+          } catch (e) {
+            source = "rest";
+            probe.ok = false;
+            probe.detail = redactError(e, 200, cfg.apiToken);
+            const r = await listOpportunitiesFiltered(cfg, {
+              limit: MAX_LIST_CAP,
+            });
+            rows = r.items;
+            truncated = r.truncated;
+          }
+
+          const views = rows.map(mapOppView);
+          const agg = aggregateOppViews(views, {
+            includeEmergency: args.includeEmergency,
+          });
+
+          // Cross-check the server's all-currency micros sum against the local
+          // raw-micros sum over the SAME (unfiltered) rows — an integrity signal
+          // that GraphQL aggregation and our acquisition agree.
+          probe.serverSumMicros = serverSumMicros;
+          if (serverSumMicros !== null) {
+            const localMicros = rows.reduce((s, r) => {
+              const a = (r.amount as { amountMicros?: unknown } | null)
+                ?.amountMicros;
+              return s + (typeof a === "number" ? a : 0);
+            }, 0);
+            probe.crossCheck = localMicros === serverSumMicros
+              ? "match"
+              : "mismatch";
+            if (probe.crossCheck === "mismatch") {
+              probe.detail =
+                `server ${serverSumMicros} != local ${localMicros}`;
+            }
+          }
+
+          const handle = await context.writeResource(
+            "oppAggregates",
+            "oppAggregates",
+            {
+              baseUrl: cfg.baseUrl,
+              source,
+              truncated,
+              includeEmergency: args.includeEmergency,
+              ...agg,
+              graphqlProbe: probe,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },

@@ -14,6 +14,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  aggregateOppViews,
   amountFromMicros,
   buildFilterPath,
   buildLeadNoteBody,
@@ -39,6 +40,7 @@ import {
   normalizeDomainHost,
   normalizePhone,
   normalizeRequestedOption,
+  OppAggregatesSchema,
   OPPORTUNITY_SEGMENTATION_FIELDS,
   OpportunityRefSchema,
   OpportunityUpsertSchema,
@@ -51,6 +53,7 @@ import {
   splitName,
   titleCaseToken,
   toCurrency,
+  twentyGraphQL,
   validateDomain,
   validateEmail,
   validateLeadId,
@@ -6435,4 +6438,157 @@ Deno.test("upsertRecord: a SELECT matchField with an out-of-enum matchValue thro
   } finally {
     restore();
   }
+});
+
+// --- TWENTY-DASHBOARDS: aggregateOppViews + twentyGraphQL guard --------------
+
+// Compact OppView factory for aggregation tests. `name` is set (and deliberately
+// ignored by the aggregator) to prove the metrics are PII-free.
+function ov(
+  stage: string,
+  extra: Partial<{
+    amount: number;
+    currencyCode: string;
+    lineOfBusiness: string;
+    sourceChannel: string;
+    isEmergency: boolean;
+  }> = {},
+) {
+  return { id: crypto.randomUUID(), name: "Ignored Co", stage, ...extra };
+}
+
+Deno.test("aggregateOppViews: win = CUSTOMER + CLOSED_WON, lost = CLOSED_LOST (AD1)", () => {
+  const agg = aggregateOppViews([
+    ov("CUSTOMER"),
+    ov("CUSTOMER"),
+    ov("CLOSED_WON"),
+    ov("CLOSED_LOST"),
+    ov("NEW"),
+  ]);
+  assertEquals(agg.winLoss.won, 3); // 2 CUSTOMER + 1 CLOSED_WON
+  assertEquals(agg.winLoss.lost, 1);
+  assertEquals(agg.winLoss.winRate, 0.75);
+  assertEquals(agg.activeCustomers, 2);
+});
+
+Deno.test("aggregateOppViews: winRate is null on 0/0, never a crash (AD1)", () => {
+  const agg = aggregateOppViews([ov("NEW"), ov("SCREENING")]);
+  assertEquals(agg.winLoss.won, 0);
+  assertEquals(agg.winLoss.lost, 0);
+  assertEquals(agg.winLoss.winRate, null);
+});
+
+Deno.test("aggregateOppViews: legacy CLOSED gets its own bucket, not dropped (AD2)", () => {
+  const agg = aggregateOppViews([ov("NEW"), ov("CLOSED"), ov("CUSTOMER")]);
+  const closed = agg.byStage.find((b) => b.stage === "CLOSED");
+  assert(closed, "legacy CLOSED must appear as its own observed bucket");
+  assertEquals(closed?.count, 1);
+  // ...and never counts toward open / won / lost.
+  assertEquals(agg.openPipeline.count, 1); // only NEW
+  assertEquals(agg.winLoss.won, 1); // only CUSTOMER
+  assertEquals(agg.winLoss.lost, 0);
+});
+
+Deno.test("aggregateOppViews: null sourceChannel -> UNATTRIBUTED (AD3)", () => {
+  const agg = aggregateOppViews([
+    ov("NEW", { sourceChannel: "DIRECT" }),
+    ov("NEW"),
+    ov("NEW"),
+  ]);
+  const unattr = agg.bySourceChannel.find((b) =>
+    b.sourceChannel === "UNATTRIBUTED"
+  );
+  assertEquals(unattr?.count, 2);
+  assertEquals(
+    agg.bySourceChannel.find((b) => b.sourceChannel === "DIRECT")?.count,
+    1,
+  );
+});
+
+Deno.test("aggregateOppViews: per-currency sums, no cross-currency add (AD11)", () => {
+  const agg = aggregateOppViews([
+    ov("NEW", { amount: 100, currencyCode: "USD" }),
+    ov("SCREENING", { amount: 200, currencyCode: "USD" }),
+    ov("PROPOSAL", { amount: 50, currencyCode: "EUR" }),
+  ]);
+  // sorted by currency: EUR then USD; never a single blended number.
+  assertEquals(agg.openPipeline.count, 3);
+  assertEquals(agg.openPipeline.amounts, [
+    { currency: "EUR", amount: 50 },
+    { currency: "USD", amount: 300 },
+  ]);
+  assertEquals(agg.currencies, ["EUR", "USD"]);
+});
+
+Deno.test("aggregateOppViews: isEmergency excluded by default, counted with flag (SE4)", () => {
+  const views = [
+    ov("NEW"),
+    ov("NEW", { isEmergency: true }),
+  ];
+  const def = aggregateOppViews(views);
+  assertEquals(def.totalOpps, 1);
+  assertEquals(def.emergencyExcluded, 1);
+
+  const incl = aggregateOppViews(views, { includeEmergency: true });
+  assertEquals(incl.totalOpps, 2);
+  assertEquals(incl.emergencyExcluded, 0);
+});
+
+Deno.test("aggregateOppViews: lineOfBusiness grouped by observed value incl UNSET (AD10)", () => {
+  const agg = aggregateOppViews([
+    ov("NEW", { lineOfBusiness: "CONSULTING" }),
+    ov("NEW", { lineOfBusiness: "HOSTING" }),
+    ov("NEW"), // no LOB -> UNSET
+  ]);
+  assertEquals(
+    agg.byLineOfBusiness.find((b) => b.lineOfBusiness === "UNSET")?.count,
+    1,
+  );
+  assertEquals(agg.byLineOfBusiness.length, 3);
+});
+
+Deno.test("OppAggregatesSchema round-trips an aggregate snapshot", () => {
+  const agg = aggregateOppViews([
+    ov("NEW", { amount: 100, currencyCode: "USD", sourceChannel: "DIRECT" }),
+    ov("CLOSED_WON", { amount: 500, currencyCode: "USD" }),
+  ]);
+  const snap = {
+    baseUrl: "https://crm.example.com",
+    source: "rest" as const,
+    truncated: false,
+    includeEmergency: false,
+    ...agg,
+    graphqlProbe: {
+      attempted: true,
+      ok: true,
+      serverSumMicros: 600000000,
+      crossCheck: "match" as const,
+    },
+    retrievedAt: new Date().toISOString(),
+  };
+  const parsed = OppAggregatesSchema.parse(snap);
+  assertEquals(parsed.totalOpps, 2);
+  assertEquals(parsed.winLoss.won, 1);
+  assertEquals(parsed.graphqlProbe.crossCheck, "match");
+  assertEquals(parsed.source, "rest");
+});
+
+Deno.test("twentyGraphQL refuses mutation/subscription operations (read-only)", async () => {
+  const cfg = { baseUrl: "https://crm.example.com", apiToken: "tok" };
+  await assertRejects(
+    () => twentyGraphQL(cfg, "mutation { createFoo(x: 1) { id } }"),
+    Error,
+    "read-only",
+  );
+  await assertRejects(
+    () => twentyGraphQL(cfg, "  subscription { onFoo { id } }"),
+    Error,
+    "read-only",
+  );
+  // A leading comment must not smuggle a mutation past the guard.
+  await assertRejects(
+    () => twentyGraphQL(cfg, "# sneaky\nmutation { drop { id } }"),
+    Error,
+    "read-only",
+  );
 });
