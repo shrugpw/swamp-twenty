@@ -6831,13 +6831,13 @@ export const model = {
           const willWrite = args.confirm === true && args.dryRun !== true;
           const snap = (
             action: string,
-            found: boolean,
+            found?: boolean,
           ): Record<string, unknown> => ({
             baseUrl: cfg.baseUrl,
             op: "update",
             action,
             id: noteId,
-            found,
+            ...(found !== undefined ? { found } : {}),
             title,
             bodyLength: body?.length,
             targetsLinked: [],
@@ -6845,8 +6845,22 @@ export const model = {
             confirmed: args.confirm === true,
             writtenAt: new Date().toISOString(),
           });
-          // A body write needs the note (404 + blocknote check); a title-only
-          // write still resolves it to report not-found honestly.
+          // SR-1 parity (appendNote/getNoteBody): only a CONFIRMED real write
+          // resolves the note. A dryRun / unconfirmed / title-only call plans
+          // WITHOUT a body-bearing GET — updateNote is a full-replace and never
+          // uses the existing body, so an unconfirmed read would cross the
+          // note-body privacy boundary for nothing. Existence is verified at
+          // write time; a plan does not pre-confirm the note exists.
+          if (!willWrite) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("planned-update"),
+            );
+            return { dataHandles: [handle] };
+          }
+          // confirm===true, real write: resolving the note here is the SR-1
+          // crossing, acknowledged by confirm:true (404 + dormant blocknote guard).
           const note = await getByIdOrNull(
             cfg,
             `/rest/notes/${encodeURIComponent(noteId)}`,
@@ -6867,14 +6881,6 @@ export const model = {
               "noteWrite",
               instance,
               snap("refused-blocknote", true),
-            );
-            return { dataHandles: [handle] };
-          }
-          if (!willWrite) {
-            const handle = await context.writeResource(
-              "noteWrite",
-              instance,
-              snap("planned-update", true),
             );
             return { dataHandles: [handle] };
           }

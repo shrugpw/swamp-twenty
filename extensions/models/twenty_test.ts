@@ -7411,6 +7411,60 @@ Deno.test("updateNote: neither title nor body → refuse", async () => {
   }
 });
 
+// SR-1 parity: an unconfirmed / dryRun updateNote must NOT read the note body.
+Deno.test("updateNote: dryRun/unconfirmed makes NO body-bearing GET (SR-1 parity)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  try {
+    // dryRun with confirm — still not a real write, so still no read.
+    await model.methods.updateNote.execute(
+      { noteId: NM_NOTE, title: "T", body: "B", dryRun: true, confirm: true },
+      ctx as never,
+    );
+    assertEquals(calls.length, 0, "a plan must not GET (or PATCH) the note");
+    const snap = writes[writes.length - 1].data;
+    assertEquals(snap.action, "planned-update");
+    assert(!("found" in snap), "a plan does not pre-confirm existence");
+  } finally {
+    restore();
+  }
+});
+
+// A3/S1: updateNote's PATCH failure must not echo the submitted body.
+Deno.test("updateNote: a 4xx echoing the body throws GENERIC, no body leak (A3/S1)", async () => {
+  const { ctx } = readCtx();
+  const { restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return {
+        body: { data: { note: { id: NM_NOTE, bodyV2: { markdown: "old" } } } },
+      };
+    }
+    if (method === "PATCH") {
+      return { status: 400, body: { message: "bad value: SUPERSECRETBODY" } };
+    }
+    return {};
+  });
+  try {
+    const err = await model.methods.updateNote.execute(
+      {
+        noteId: NM_NOTE,
+        body: "SUPERSECRETBODY",
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    ).then(() => null).catch((e) => e as Error);
+    assert(err instanceof Error);
+    assert(
+      !err.message.includes("SUPERSECRETBODY"),
+      "submitted body must never appear in the thrown error",
+    );
+    assert(err.message.includes("status 400"));
+  } finally {
+    restore();
+  }
+});
+
 // --- appendNote (SR-1) ---
 Deno.test("appendNote: dryRun WITHOUT confirm makes NO body read (S2)", async () => {
   const { writes, ctx } = readCtx();
@@ -7443,6 +7497,55 @@ Deno.test("appendNote: non-dry WITHOUT confirm refuses before any read (S2)", as
       "SR-1",
     );
     assertEquals(calls.length, 0, "no read happens on refusal");
+  } finally {
+    restore();
+  }
+});
+
+// A3/S1: appendNote's PATCH failure must leak NEITHER the appended text NOR the
+// pre-existing (SR-1) body it read to build the merge.
+Deno.test("appendNote: a 4xx echoing the merged body leaks neither the pre-existing body nor the append (A3/S1)", async () => {
+  const { ctx } = readCtx();
+  const { restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return {
+        body: {
+          data: {
+            note: { id: NM_NOTE, bodyV2: { markdown: "PREEXISTINGSECRET" } },
+          },
+        },
+      };
+    }
+    if (method === "PATCH") {
+      return {
+        status: 422,
+        body: {
+          message: "bad markdown: PREEXISTINGSECRET\n\nSUPERSECRETAPPEND",
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    const err = await model.methods.appendNote.execute(
+      {
+        noteId: NM_NOTE,
+        text: "SUPERSECRETAPPEND",
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    ).then(() => null).catch((e) => e as Error);
+    assert(err instanceof Error);
+    assert(
+      !err.message.includes("PREEXISTINGSECRET"),
+      "the pre-existing SR-1 body must never appear in the thrown error",
+    );
+    assert(
+      !err.message.includes("SUPERSECRETAPPEND"),
+      "the appended text must never appear in the thrown error",
+    );
+    assert(err.message.includes("status 422"));
   } finally {
     restore();
   }
