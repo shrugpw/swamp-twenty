@@ -30,6 +30,7 @@ import {
   fetchObjectsMeta,
   isBlockedDomain,
   isFilterSafe,
+  isReadOnlyGraphQL,
   leadFromKvEntry,
   leadFromKvRecord,
   listFiltered,
@@ -7095,7 +7096,7 @@ Deno.test("VIEW-MGMT ensureOpportunityViews(confirm): filter-POST failure rolls 
   try {
     await model.methods.ensureOpportunityViews.execute(
       { confirm: true, names: ["Sales Pipeline"] },
-      ctx,
+      ctx as never,
     );
     // The view was created, then rolled back via DELETE on its exact id.
     const del = calls.find((c) => c.method === "DELETE");
@@ -7107,6 +7108,533 @@ Deno.test("VIEW-MGMT ensureOpportunityViews(confirm): filter-POST failure rolls 
     assert(String(res.reason).includes("rolled back"));
     // Token never leaks into the persisted error (redactError).
     assert(!String(res.error ?? "").includes("tok"));
+  } finally {
+    restore();
+  }
+});
+
+// ===========================================================================
+// TWENTY-NOTE-MGMT + .17.1 remediation (R1 guard)
+// ===========================================================================
+
+// --- R1: isReadOnlyGraphQL (guard hardening) ---
+Deno.test("R1 guard: a plain query is read-only", () => {
+  assert(
+    isReadOnlyGraphQL("query Q { opportunities { edges { node { id } } } }"),
+  );
+});
+Deno.test("R1 guard: an anonymous { ... } selection is a query", () => {
+  assert(isReadOnlyGraphQL("{ opportunities { edges { node { id } } } }"));
+});
+Deno.test("R1 guard: a leading mutation is refused", () => {
+  assert(!isReadOnlyGraphQL('mutation M { deleteOpportunity(id:"x") { id } }'));
+});
+Deno.test("R1 guard: whitespace-separated multi-op mutation is refused", () => {
+  assert(
+    !isReadOnlyGraphQL("query A { id } mutation Evil { deleteAllData { id } }"),
+  );
+});
+Deno.test("R1 guard: COMMA-separated multi-op mutation is refused (bypass 1)", () => {
+  assert(
+    !isReadOnlyGraphQL("query A { id },mutation Evil { deleteAllData { id } }"),
+  );
+});
+Deno.test("R1 guard: a # inside a string does NOT hide a later mutation (bypass 2)", () => {
+  assert(
+    !isReadOnlyGraphQL(
+      'query A { field(x: "#") }\nmutation Evil { deleteAllData { id } }',
+    ),
+  );
+});
+Deno.test("R1 guard: a block string cannot hide a mutation (bypass 3)", () => {
+  assert(
+    !isReadOnlyGraphQL(
+      'query A { field(x: """ } mutation Hidden { x """) }\nmutation Evil { wipe { id } }',
+    ),
+  );
+});
+Deno.test("R1 guard: the word mutation inside a string is NOT a real op", () => {
+  assert(isReadOnlyGraphQL('query A { field(note: "please mutation this") }'));
+});
+
+// --- note write test helpers ---
+const NM_NOTE = "11111111-1111-1111-1111-111111111111";
+const TARGET_UUID = "22222222-2222-2222-2222-222222222222";
+const ROW_UUID = "33333333-3333-3333-3333-333333333333";
+
+// --- createNote ---
+Deno.test("createNote dryRun: planned-create, stable leadId instance, no writes", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  try {
+    await model.methods.createNote.execute(
+      {
+        title: "Kickoff call",
+        body: "notes",
+        targets: [{ personId: TARGET_UUID }],
+        leadId: "L-1",
+        dryRun: true,
+        confirm: false,
+      },
+      ctx as never,
+    );
+    assertEquals(calls.length, 0, "dryRun writes nothing to Twenty");
+    assertEquals(writes[0].name, "note-write-lead-L-1");
+    assertEquals(writes[0].data.action, "planned-create");
+    assertEquals(writes[0].data.bodyLength, 5);
+    assert(!("body" in writes[0].data), "snapshot must not carry body text");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote confirm: creates the note + links the target (verified id)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "POST" && path === "/rest/notes") {
+      return { body: { data: { createNote: { id: NM_NOTE } } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return { body: { data: { noteTargets: [] } } };
+    }
+    if (method === "POST" && path === "/rest/noteTargets") {
+      return {
+        body: { data: { createNoteTarget: { targetPersonId: TARGET_UUID } } },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.createNote.execute(
+      {
+        title: "Kickoff",
+        targets: [{ personId: TARGET_UUID }],
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    const snap = writes[writes.length - 1].data;
+    assertEquals(snap.action, "created");
+    assertEquals(snap.id, NM_NOTE);
+    assertEquals(snap.targetsLinked, [TARGET_UUID]);
+    assert(calls.some((c) => c.method === "POST" && c.path === "/rest/notes"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote leadId dedup: reuse existing note, no create POST", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/notes?filter=leadId")) {
+      return { body: { data: { notes: [{ id: NM_NOTE }] } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return { body: { data: { noteTargets: [] } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.createNote.execute(
+      { title: "x", leadId: "L-9", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "present");
+    assert(
+      !calls.some((c) => c.method === "POST" && c.path === "/rest/notes"),
+      "must not POST a new note when leadId already exists",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote: a target with two ids is rejected pre-write", async () => {
+  const { ctx } = readCtx();
+  const { restore } = stubFetchStatus(() => ({}));
+  try {
+    await assertRejects(
+      () =>
+        model.methods.createNote.execute(
+          {
+            title: "x",
+            targets: [{ personId: TARGET_UUID, companyId: NM_NOTE }],
+            dryRun: true,
+            confirm: false,
+          },
+          ctx as never,
+        ) as Promise<unknown>,
+      Error,
+      "EXACTLY one",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- A3/S1: a body-echoing 4xx never leaks the submitted content ---
+Deno.test("createNote: a 4xx echoing the body throws GENERIC, no body leak (A3/S1)", async () => {
+  const { ctx } = readCtx();
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "POST" && path === "/rest/notes") {
+      return { status: 400, body: { message: "bad value: SUPERSECRETBODY" } };
+    }
+    return {};
+  });
+  try {
+    const err = await model.methods.createNote.execute(
+      { title: "x", body: "SUPERSECRETBODY", dryRun: false, confirm: true },
+      ctx as never,
+    ).then(() => null).catch((e) => e as Error);
+    assert(err instanceof Error);
+    assert(
+      !err.message.includes("SUPERSECRETBODY"),
+      "submitted body must never appear in the thrown error",
+    );
+    assert(err.message.includes("status 400"));
+  } finally {
+    restore();
+  }
+});
+
+// --- updateNote ---
+Deno.test("updateNote: 404 → not-found, no PATCH", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method) => {
+    if (method === "GET") return { status: 404, body: {} };
+    return {};
+  });
+  try {
+    await model.methods.updateNote.execute(
+      { noteId: NM_NOTE, title: "new", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "not-found");
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote: refuses a body write on a note carrying blocknote (A5/S6)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return {
+        body: {
+          data: {
+            note: {
+              id: NM_NOTE,
+              bodyV2: { markdown: "x", blocknote: "[{...}]" },
+            },
+          },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.updateNote.execute(
+      { noteId: NM_NOTE, body: "new", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "refused-blocknote");
+    assert(!calls.some((c) => c.method === "PATCH"), "must not PATCH");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote: title+body on a markdown-only note → updated (PATCH sent)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return {
+        body: {
+          data: { note: { id: NM_NOTE, bodyV2: { markdown: "old" } } },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.updateNote.execute(
+      {
+        noteId: NM_NOTE,
+        title: "T",
+        body: "B",
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "updated");
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "a PATCH is sent");
+    assertEquals(
+      (patch!.body as { bodyV2: { markdown: string } }).bodyV2.markdown,
+      "B",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote: neither title nor body → refuse", async () => {
+  const { ctx } = readCtx();
+  const { restore } = stubFetchStatus(() => ({}));
+  try {
+    await assertRejects(
+      () =>
+        model.methods.updateNote.execute(
+          { noteId: NM_NOTE, dryRun: true, confirm: false },
+          ctx as never,
+        ) as Promise<unknown>,
+      Error,
+      "title and/or body",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- appendNote (SR-1) ---
+Deno.test("appendNote: dryRun WITHOUT confirm makes NO body read (S2)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  try {
+    await model.methods.appendNote.execute(
+      { noteId: NM_NOTE, text: "hi", dryRun: true, confirm: false },
+      ctx as never,
+    );
+    assertEquals(calls.length, 0, "must not GET the body without confirm");
+    const snap = writes[writes.length - 1].data;
+    assertEquals(snap.action, "planned-append");
+    assert(!("bodyLength" in snap), "no bodyLength without a read");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("appendNote: non-dry WITHOUT confirm refuses before any read (S2)", async () => {
+  const { ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  try {
+    await assertRejects(
+      () =>
+        model.methods.appendNote.execute(
+          { noteId: NM_NOTE, text: "hi", dryRun: false, confirm: false },
+          ctx as never,
+        ) as Promise<unknown>,
+      Error,
+      "SR-1",
+    );
+    assertEquals(calls.length, 0, "no read happens on refusal");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("appendNote confirm: merges old + new with a blank line", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return {
+        body: {
+          data: { note: { id: NM_NOTE, bodyV2: { markdown: "AAA\n" } } },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.appendNote.execute(
+      { noteId: NM_NOTE, text: "BBB", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "appended");
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch!.body as { bodyV2: { markdown: string } }).bodyV2.markdown,
+      "AAA\n\nBBB",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("appendNote confirm: bodyMissing note → text alone, no separator", async () => {
+  const { calls, restore } = stubFetchStatus((method) => {
+    if (method === "GET") {
+      return { body: { data: { note: { id: NM_NOTE, bodyV2: null } } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await model.methods.appendNote.execute(
+      { noteId: NM_NOTE, text: "BBB", dryRun: false, confirm: true },
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assertEquals(
+      (patch!.body as { bodyV2: { markdown: string } }).bodyV2.markdown,
+      "BBB",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- linkNote / unlinkNote (A4 exact match) ---
+Deno.test("linkNote: already-linked (exact id) is an idempotent no-op", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return {
+        body: {
+          data: {
+            noteTargets: [{ id: ROW_UUID, targetPersonId: TARGET_UUID }],
+          },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.linkNote.execute(
+      {
+        noteId: NM_NOTE,
+        target: { personId: TARGET_UUID },
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "already-linked");
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "no POST when already linked",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("linkNote: a DIFFERENT person is linked (exact match, not any-of-kind — A4)", async () => {
+  const { writes, ctx } = readCtx();
+  const other = "44444444-4444-4444-4444-444444444444";
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return {
+        body: {
+          data: { noteTargets: [{ id: ROW_UUID, targetPersonId: other }] },
+        },
+      };
+    }
+    if (method === "POST" && path === "/rest/noteTargets") {
+      return {
+        body: { data: { createNoteTarget: { targetPersonId: TARGET_UUID } } },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.linkNote.execute(
+      {
+        noteId: NM_NOTE,
+        target: { personId: TARGET_UUID },
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "linked");
+    assert(
+      calls.some((c) => c.method === "POST" && c.path === "/rest/noteTargets"),
+      "must POST — a different person being linked is not a no-op",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("unlinkNote: deletes ONLY the matching row", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return {
+        body: {
+          data: {
+            noteTargets: [{ id: ROW_UUID, targetPersonId: TARGET_UUID }],
+          },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.unlinkNote.execute(
+      {
+        noteId: NM_NOTE,
+        target: { personId: TARGET_UUID },
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "unlinked");
+    assert(
+      calls.some((c) =>
+        c.method === "DELETE" && c.path === `/rest/noteTargets/${ROW_UUID}`
+      ),
+      "DELETEs the exact matching row id",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("unlinkNote: target absent → not-linked, no DELETE", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return { body: { data: { noteTargets: [] } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.unlinkNote.execute(
+      {
+        noteId: NM_NOTE,
+        target: { personId: TARGET_UUID },
+        dryRun: false,
+        confirm: true,
+      },
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "not-linked");
+    assert(!calls.some((c) => c.method === "DELETE"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("note methods: a non-UUID noteId is rejected pre-I/O", async () => {
+  const { ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  try {
+    await assertRejects(
+      () =>
+        model.methods.appendNote.execute(
+          { noteId: "not-a-uuid", text: "x", dryRun: false, confirm: true },
+          ctx as never,
+        ) as Promise<unknown>,
+      Error,
+      "valid UUID",
+    );
+    assertEquals(calls.length, 0);
   } finally {
     restore();
   }

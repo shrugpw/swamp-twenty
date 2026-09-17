@@ -1,50 +1,86 @@
 # Changelog
 
-All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
+All notable changes to `@shrug/twenty`. Versions are CalVer
+(`YYYY.MM.DD.micro`).
+
+## 2026.09.17.2
+
+### Added — full Note management (`TWENTY-NOTE-MGMT`)
+
+- **`createNote` / `updateNote` / `appendNote` / `linkNote` / `unlinkNote`** — a
+  confirm-gated, `dryRun`-by-default write surface over `/rest/notes` +
+  `/rest/noteTargets`. `createNote` dedups on `leadId` when given (the
+  `push_leads` contract) and links opportunity/person/company targets;
+  `updateNote` replaces title and/or body; `appendNote` reads-then-appends the
+  body **only under `confirm`** — the read crosses the SR-1 note-body boundary,
+  so without `confirm` NO read happens; `linkNote`/`unlinkNote` manage
+  `noteTarget` links by exact id. The internal `ensureNoteForLead` is now a thin
+  wrapper over the shared create+link core (behavior-preserving).
+- A short-TTL (`3d`) `noteWrite` snapshot records id/action/targets/`bodyLength`
+  — **never** the body text; the free-text `title` is PII-at-rest bounded by the
+  TTL.
+- **Safety:** a body write is refused (`action: refused-blocknote`) on a note
+  that already carries a non-empty `bodyV2.blocknote` until markdown
+  re-derivation is verified on twenty-local (design §6); write errors never echo
+  the submitted title/body.
+
+### Changed — `.17.1` adversarial-review remediation
+
+- `twentyGraphQL`'s read-only guard is now string/comment/block-string-aware
+  (rejects comma-separated multi-op and `#`/`"""`-obfuscated mutations); its
+  real safety boundary is the in-code-literal-only invariant, documented on the
+  fn.
+- `listViews` no longer persists a raw view record — only an allowlisted shape
+  sample; `ensureOpportunityViews` errors are now redacted like every other
+  method.
 
 ## 2026.09.16.4
 
 ### Added
 
-- **`getNoteBody(noteId, confirm=true)`** (`TWENTY-NOTE-BODY-READ`) — a **narrow,
-  sanctioned exception to the SR-1 note-body privacy boundary**. `listNotes` /
-  `mapNoteView` still NEVER return a body; this is the *only* body path, and it is
-  deliberately gated:
-  - `confirm:true` is REQUIRED — an explicit acknowledgement that the call reads a
-    note body across the privacy boundary (NOT a mutation gate). Without it, the
-    call refuses.
-  - `noteId` must be a UUID (validated pre-I/O). `404 ⇒ found:false`; found with no
-    markdown (blocknote-only/empty) ⇒ `bodyMissing:true`, no body.
-  - The body (`bodyV2.markdown`, verbatim) is delivered via a **short-TTL (`3d`)**
-    `noteBodyRead` snapshot (`data.latest("noteBodyRead", "note-body-<id>")`) — the
-    TTL is the PII-at-rest bound. The note title is emitted verbatim on this gated
-    method only (the `listNotes` title guard is unaffected).
-- **`listNotesByOpportunity(opportunityId)`** — a **body-free** discovery read over
-  the `noteTargets` join, returning compact `mapNoteView` views (SR-1 preserved) so
-  callers can find a `noteId` to feed `getNoteBody` even when a note isn't
-  `leadId`-tagged. Records a `noteList` snapshot (`note-list-opp-<id>`).
+- **`getNoteBody(noteId, confirm=true)`** (`TWENTY-NOTE-BODY-READ`) — a
+  **narrow, sanctioned exception to the SR-1 note-body privacy boundary**.
+  `listNotes` / `mapNoteView` still NEVER return a body; this is the _only_ body
+  path, and it is deliberately gated:
+  - `confirm:true` is REQUIRED — an explicit acknowledgement that the call reads
+    a note body across the privacy boundary (NOT a mutation gate). Without it,
+    the call refuses.
+  - `noteId` must be a UUID (validated pre-I/O). `404 ⇒ found:false`; found with
+    no markdown (blocknote-only/empty) ⇒ `bodyMissing:true`, no body.
+  - The body (`bodyV2.markdown`, verbatim) is delivered via a **short-TTL
+    (`3d`)** `noteBodyRead` snapshot
+    (`data.latest("noteBodyRead", "note-body-<id>")`) — the TTL is the
+    PII-at-rest bound. The note title is emitted verbatim on this gated method
+    only (the `listNotes` title guard is unaffected).
+- **`listNotesByOpportunity(opportunityId)`** — a **body-free** discovery read
+  over the `noteTargets` join, returning compact `mapNoteView` views (SR-1
+  preserved) so callers can find a `noteId` to feed `getNoteBody` even when a
+  note isn't `leadId`-tagged. Records a `noteList` snapshot
+  (`note-list-opp-<id>`).
 
-Additive methods + one new short-TTL resource + a `NoteListSchema.filter.opportunityId`;
-`globalArguments` unchanged (no-op attribute migration).
+Additive methods + one new short-TTL resource + a
+`NoteListSchema.filter.opportunityId`; `globalArguments` unchanged (no-op
+attribute migration).
 
 ## 2026.09.16.3
 
 ### Added
 
-- **`upsertOpportunity` channelPartner linking** (`TWENTY-OPP-CHANNEL`) — link an
-  Opportunity to a `channelPartner` record (the `opportunity.channelPartner`
+- **`upsertOpportunity` channelPartner linking** (`TWENTY-OPP-CHANNEL`) — link
+  an Opportunity to a `channelPartner` record (the `opportunity.channelPartner`
   MANY_TO_ONE relation) for marketplace attribution:
   - **`channelPartnerId`** — a `channelPartner` UUID, validated early (fails
-    pre-write even under `dryRun`); sets the FK directly like `companyId`. Empty /
-    omitted ⇒ left unchanged (never nulled).
-  - **`channelPartnerName`** — resolve-and-link by name (link-only; `channelPartner`
-    is keyed by `name`, e.g. `Globex`/`Initech`), so `crm-opps-sync` needn't
-    hardcode UUIDs. Used only when `channelPartnerId` is unset; a name with no match
-    records `channelPartnerSkipped` and leaves the link unchanged — never creates a
-    partner.
+    pre-write even under `dryRun`); sets the FK directly like `companyId`. Empty
+    / omitted ⇒ left unchanged (never nulled).
+  - **`channelPartnerName`** — resolve-and-link by name (link-only;
+    `channelPartner` is keyed by `name`, e.g. `Globex`/`Initech`), so
+    `crm-opps-sync` needn't hardcode UUIDs. Used only when `channelPartnerId` is
+    unset; a name with no match records `channelPartnerSkipped` and leaves the
+    link unchanged — never creates a partner.
   - Both `channelPartnerId` and `channelPartner` added to
-    `OPP_CUSTOMFIELDS_RESERVED`; `channelPartnerId` surfaced in `mapOppView` + the
-    `opportunityUpsert` / `opportunityRef` / `opportunityList` read-back snapshots.
+    `OPP_CUSTOMFIELDS_RESERVED`; `channelPartnerId` surfaced in `mapOppView` +
+    the `opportunityUpsert` / `opportunityRef` / `opportunityList` read-back
+    snapshots.
 
 Additive method arguments + optional snapshot fields only; `globalArguments`
 unchanged (no-op attribute migration).
@@ -53,17 +89,17 @@ unchanged (no-op attribute migration).
 
 ### Added
 
-- **Opportunity `offering` segmentation SELECT** (`TWENTY-OPP-OFFERING`) — a third
-  segmentation field alongside `lineOfBusiness`/`sourceChannel`, options
+- **Opportunity `offering` segmentation SELECT** (`TWENTY-OPP-OFFERING`) — a
+  third segmentation field alongside `lineOfBusiness`/`sourceChannel`, options
   `MANAGED` / `SUBSTRATE` / `PROJECT` / `RETAINER` / `LOCAL_IT` / `PEERING`:
   - Provisioned append-safe via `OPPORTUNITY_SEGMENTATION_FIELDS` /
     `ensureOpportunitySegmentation` (existing options never destructively
     recolored; confirm-gated).
   - New optional `upsertOpportunity` `offering` arg — sanitized then validated
-    against the live `opportunity.offering` enum exactly like `stage`, written on
-    both create and update, omitted (never nulled) when unset, and added to
-    `OPP_CUSTOMFIELDS_RESERVED` so the generic `customFields` escape hatch cannot
-    shadow it.
+    against the live `opportunity.offering` enum exactly like `stage`, written
+    on both create and update, omitted (never nulled) when unset, and added to
+    `OPP_CUSTOMFIELDS_RESERVED` so the generic `customFields` escape hatch
+    cannot shadow it.
   - Surfaced in `mapOppView` + the `opportunityUpsert` / `opportunityRef` /
     `opportunityList` read-back snapshots.
 
@@ -77,25 +113,26 @@ Additive method argument + optional snapshot fields + one manifest entry only;
 - **`upsertOpportunity` provider-pipeline fields** (`TWENTY-OPP-FIELDS`) — the
   method can now write the two Opportunity custom fields the SHRUG-NET provider
   pipeline needs, plus a generic scalar escape hatch:
-  - **`asn`** (TEXT) — Autonomous System Number, guarded to `^AS\d{1,10}$`
-    (AS + 1–10 digits — a 32-bit ASN maxes at 4294967295; case-insensitive input,
+  - **`asn`** (TEXT) — Autonomous System Number, guarded to `^AS\d{1,10}$` (AS +
+    1–10 digits — a 32-bit ASN maxes at 4294967295; case-insensitive input,
     uppercased on store); a non-empty value that doesn't match is rejected.
     Empty ⇒ left unchanged.
   - **`qualStatus`** (SELECT) — technical-qualification state, validated against
     the live `opportunity.qualStatus` enum exactly like `stage`. Empty ⇒ left
     unchanged.
   - **`customFields`** — a `Record<string, string|number|boolean>` escape hatch
-    for scalar Opportunity custom fields without a typed argument. **Fail-closed**:
-    rejected entirely if opportunity metadata is unreadable; each key must exist
-    and be a scalar TYPE (`TEXT`/`NUMBER`/`BOOLEAN`/`DATE_TIME`/`SELECT`/`UUID`);
-    reserved keys (the `leadId` marker, every typed-arg field, and system fields)
-    and composite/unknown types are rejected pre-write; `SELECT` values validated
+    for scalar Opportunity custom fields without a typed argument.
+    **Fail-closed**: rejected entirely if opportunity metadata is unreadable;
+    each key must exist and be a scalar TYPE
+    (`TEXT`/`NUMBER`/`BOOLEAN`/`DATE_TIME`/`SELECT`/`UUID`); reserved keys (the
+    `leadId` marker, every typed-arg field, and system fields) and
+    composite/unknown types are rejected pre-write; `SELECT` values validated
     against the live enum; strings sanitized; empty-string ⇒ omitted; `null`
     forbidden; non-finite numbers (`Infinity`/`NaN`) rejected (they would
     serialize to `null` and silently clear the field).
-  - All three are written on **both** the create and update paths, omitted (never
-    nulled) when unset, and surfaced in the `opportunityUpsert` / `opportunityRef`
-    / `opportunityList` read-back snapshots.
+  - All three are written on **both** the create and update paths, omitted
+    (never nulled) when unset, and surfaced in the `opportunityUpsert` /
+    `opportunityRef` / `opportunityList` read-back snapshots.
 - **README reconciliation** — `upsertOpportunity` (a live method previously
   missing from the Methods table) is now documented, including an
   `upsertOpportunity fields` section covering the `asn` / `qualStatus` /
@@ -115,8 +152,9 @@ cleanly).
   throughout:
   - `objectNameSingular` MUST be in a strict in-code allowlist (v1:
     `subscription`, `channelPartner`); any other object — standard or unlisted
-    custom — errors **before any I/O**. (The `/rest/metadata/objects` API carries
-    no `isCustom` flag to lean on, so the allowlist is the real control.)
+    custom — errors **before any I/O**. (The `/rest/metadata/objects` API
+    carries no `isCustom` flag to lean on, so the allowlist is the real
+    control.)
   - `matchField` must be a camelCase, non-reserved, **scalar** field that exists
     on the object; `matchValue` is canonicalized once (sanitized + filter-safety
     checked) and used **identically** for the find filter and the stored create
@@ -124,22 +162,22 @@ cleanly).
   - `fields` accepts scalar types only (`TEXT` / `NUMBER` / `BOOLEAN` /
     `DATE_TIME` / `SELECT` / `UUID`); unknown keys are rejected fail-closed,
     composite types (`CURRENCY` / `RELATION` / …) are rejected pre-write with a
-    clear error (never a blind Twenty 400), `SELECT` values are validated against
-    the live enum, string values are sanitized, and reserved fields
+    clear error (never a blind Twenty 400), `SELECT` values are validated
+    against the live enum, string values are sanitized, and reserved fields
     (`id` / `createdAt` / `updatedAt` / `deletedAt` / `position`) are refused.
     `matchField` is stripped from `fields` entirely so it can never rewrite the
     natural key.
-  - Find keyed on the natural key (`limit=2`): 0 → create, 1 → update, ≥2 → refuse
-    (ambiguous). The create path has a create→conflict→re-GET→update race
-    fallback. `PATCH` sends only the caller's fields (`matchField` excluded), so a
-    re-run is a value-identical no-op and the natural key is preserved. Best-effort
-    idempotency (Twenty has no unique constraint) — a pre-existing ≥2 hard-errors
-    by design; single-operator serialized use.
+  - Find keyed on the natural key (`limit=2`): 0 → create, 1 → update, ≥2 →
+    refuse (ambiguous). The create path has a create→conflict→re-GET→update race
+    fallback. `PATCH` sends only the caller's fields (`matchField` excluded), so
+    a re-run is a value-identical no-op and the natural key is preserved.
+    Best-effort idempotency (Twenty has no unique constraint) — a pre-existing
+    ≥2 hard-errors by design; single-operator serialized use.
   - `confirm:true` required for a real write; `dryRun:true` plans
     (`planned-create` / `planned-update`) and writes nothing. Wrapped in
-    `redactError` plus a submitted-value scrub so a Twenty 4xx can never leak the
-    token or a submitted value. Snapshots a `recordUpserted` resource with the
-    match value stored **hashed**, never raw, and no Twenty response body.
+    `redactError` plus a submitted-value scrub so a Twenty 4xx can never leak
+    the token or a submitted value. Snapshots a `recordUpserted` resource with
+    the match value stored **hashed**, never raw, and no Twenty response body.
 
 ## 2026.09.10.2
 
@@ -148,42 +186,42 @@ cleanly).
 - **`upsertOpportunity` can now write the two Opportunity segmentation `SELECT`
   fields.** Two optional arguments — `lineOfBusiness` (CONSULTING / HOSTING /
   GAMES) and `sourceChannel` (DIRECT / REFERRAL / CONSULTING_HANDOFF) — let
-  existing opportunities be flagged declaratively.
-  Each token is validated against the live field's enum options (via the same
-  `fetchOpportunityMeta` read that already validates `stage`), so an invalid
-  token fails fast with the valid set rather than a blind Twenty 4xx; validation
-  is skipped best-effort when the field's options are unreadable, matching
-  `stage`. Written on **both** the create and update paths, and — like every
-  other `upsertOpportunity` field — omitted from the request body when unset, so
-  a partial update never nulls a value a re-run didn't set. The `opportunityUpsert`
-  snapshot now carries the two tokens when written. `push_leads` (which stamps
-  `sourceChannel` on the leads it creates) is unchanged.
+  existing opportunities be flagged declaratively. Each token is validated
+  against the live field's enum options (via the same `fetchOpportunityMeta`
+  read that already validates `stage`), so an invalid token fails fast with the
+  valid set rather than a blind Twenty 4xx; validation is skipped best-effort
+  when the field's options are unreadable, matching `stage`. Written on **both**
+  the create and update paths, and — like every other `upsertOpportunity` field
+  — omitted from the request body when unset, so a partial update never nulls a
+  value a re-run didn't set. The `opportunityUpsert` snapshot now carries the
+  two tokens when written. `push_leads` (which stamps `sourceChannel` on the
+  leads it creates) is unchanged.
 
 ## 2026.09.10.1
 
 ### Added
 
 - **`ensureField`** — the generalized, idempotent field-provisioning foundation
-  (`POST /rest/metadata/fields`) for `TEXT` / `BOOLEAN` / `NUMBER` / `DATE_TIME` /
-  `SELECT`. Non-destructive: an absent field is created; a present scalar field
-  is a no-op (a differing type is **reported**, never mutated); a present `SELECT`
-  gets its options **appended** — existing options preserved verbatim (never
-  dropped, reordered, or recolored), reusing `ensureStageOption`'s append-only +
-  optimistic-concurrency (re-read + drift-abort) discipline. The `SELECT` option
-  planner (`planSelectOptions`) and per-option normalizer
+  (`POST /rest/metadata/fields`) for `TEXT` / `BOOLEAN` / `NUMBER` / `DATE_TIME`
+  / `SELECT`. Non-destructive: an absent field is created; a present scalar
+  field is a no-op (a differing type is **reported**, never mutated); a present
+  `SELECT` gets its options **appended** — existing options preserved verbatim
+  (never dropped, reordered, or recolored), reusing `ensureStageOption`'s
+  append-only + optimistic-concurrency (re-read + drift-abort) discipline. The
+  `SELECT` option planner (`planSelectOptions`) and per-option normalizer
   (`normalizeRequestedOption`) are pure and unit-tested: values UPPER_SNAKE,
   colors palette-validated, labels defaulted to the title-cased token, duplicate
-  requested values collapsed, new options positioned after the current max. Field
-  names are camelCase-validated before any write. `confirm`-gated with a no-write
-  `dryRun` (`planned-create` / `planned-append`); wrapped in `redactError`;
-  guarded by the `reachable` live pre-flight. Snapshots a `fieldEnsured` resource.
+  requested values collapsed, new options positioned after the current max.
+  Field names are camelCase-validated before any write. `confirm`-gated with a
+  no-write `dryRun` (`planned-create` / `planned-append`); wrapped in
+  `redactError`; guarded by the `reachable` live pre-flight. Snapshots a
+  `fieldEnsured` resource.
 - **`ensureOpportunitySegmentation`** — a single fan-out (repo rule 6) that
   provisions the two Opportunity segmentation `SELECT` fields in one execution
   (one metadata GET, one lock): **Line of Business** (Consulting / Hosting /
   Games) and **Source Channel** (Direct / Referral / Consulting hand-off).
-  Analytics only — NOT a pipeline gate. Append-only, so a
-  re-run is a clean no-op. `confirm`-gated + `dryRun`. Snapshots one
-  `fieldEnsured` per field.
+  Analytics only — NOT a pipeline gate. Append-only, so a re-run is a clean
+  no-op. `confirm`-gated + `dryRun`. Snapshots one `fieldEnsured` per field.
 - **`fieldEnsured` resource** — the per-field outcome (action taken, `SELECT`
   options added/present, non-mutating drift notes, any type mismatch).
 
@@ -196,19 +234,19 @@ cleanly).
   `ensureLeadFields` cannot diverge.
 - **`push_leads` stamps `sourceChannel`** on Opportunities it **creates**, from
   the new `leadSourceChannel` global. Contact-form leads are inbound-direct, so
-  the value is `DIRECT` once the field is provisioned. The global defaults to `""`
-  (do not set), so until the `opportunity.sourceChannel` `SELECT` exists the
-  create body is byte-identical to before — no risk of writing an unprovisioned
-  field. Set only on create (never on an idempotent skip/update).
+  the value is `DIRECT` once the field is provisioned. The global defaults to
+  `""` (do not set), so until the `opportunity.sourceChannel` `SELECT` exists
+  the create body is byte-identical to before — no risk of writing an
+  unprovisioned field. Set only on create (never on an idempotent skip/update).
 
 ### Notes
 
 - `globalArguments` gains one **optional** field, `leadSourceChannel` (default
-  `""`), so existing pinned instances upgrade lazily with no behavior change (the
-  `2026.09.10.1` upgrade is a no-op attribute migration).
-- Live PATCH/POST body shape for new `SELECT` options mirrors `ensureStageOption`
-  (each new option carries a client-generated `id`); reconfirm against a live
-  instance before the first `confirm:true` run.
+  `""`), so existing pinned instances upgrade lazily with no behavior change
+  (the `2026.09.10.1` upgrade is a no-op attribute migration).
+- Live PATCH/POST body shape for new `SELECT` options mirrors
+  `ensureStageOption` (each new option carries a client-generated `id`);
+  reconfirm against a live instance before the first `confirm:true` run.
 
 ## 2026.09.08.1
 
@@ -219,20 +257,21 @@ cleanly).
   not just the opportunity pipeline. Each optionally filters (people:
   `companyId`/`leadId`; companies: `domain`/`name`; notes: `leadId`), composes
   clauses with AND, sends the immutable composite `order_by=createdAt,id`, pages
-  Twenty's cursor pagination at `PAGE_SIZE=60` up to a per-call cap
-  (`limit` 1..500, default 60), dedups by id, and records a compact page
-  snapshot. For `listPeople`, emergency-restricted rows are excluded by default
-  via a NULL-safe clause (`or(isEmergency[eq]:false,isEmergency[is]:NULL)`) so the
+  Twenty's cursor pagination at `PAGE_SIZE=60` up to a per-call cap (`limit`
+  1..500, default 60), dedups by id, and records a compact page snapshot. For
+  `listPeople`, emergency-restricted rows are excluded by default via a
+  NULL-safe clause (`or(isEmergency[eq]:false,isEmergency[is]:NULL)`) so the
   NULL/unset majority is kept; `includeEmergency:true` opts them in. `listNotes`
-  omits emergency filtering entirely (no `includeEmergency` arg, no `isEmergency`
-  in its view) because this extension does not provision `isEmergency` on Note —
-  only on Person/Opportunity — so there is no marker on a Note to filter or
-  surface. A per-CALL cap is not a snapshot ceiling: each call returns `hasMore` +
-  `nextCursor` for a workflow to continue via `startingAfter`, and an honesty
-  envelope (`incomplete` + `stopReason`) that reports `complete` only on a clean
-  end reconciled against Twenty's `totalCount`. No writes, no per-id loop; compact
-  views carry only join keys — never person name/email/phone, never a Note body,
-  and a Note title only when it matches the machine `Inbound lead ` pattern.
+  omits emergency filtering entirely (no `includeEmergency` arg, no
+  `isEmergency` in its view) because this extension does not provision
+  `isEmergency` on Note — only on Person/Opportunity — so there is no marker on
+  a Note to filter or surface. A per-CALL cap is not a snapshot ceiling: each
+  call returns `hasMore` + `nextCursor` for a workflow to continue via
+  `startingAfter`, and an honesty envelope (`incomplete` + `stopReason`) that
+  reports `complete` only on a clean end reconciled against Twenty's
+  `totalCount`. No writes, no per-id loop; compact views carry only join keys —
+  never person name/email/phone, never a Note body, and a Note title only when
+  it matches the machine `Inbound lead` pattern.
 - **`peopleList` / `companyList` / `noteList` resources** — the bulk snapshots,
   keyed by a SHA-256 of the canonical `(filter, cursor)` so each page gets its
   own instance. Finite `lifetime: 3d` + `garbageCollection: 5` — bulk snapshots
@@ -242,26 +281,28 @@ cleanly).
 
 - **`listOpportunities`** now routes through the shared generic cursor paginator
   (single-sourcing cursor advance, dedup, guards, and continuation across all
-  four list methods) and sends the immutable `order_by=createdAt,id` for gap-free,
-  byte-stable paging. Its `opportunityList` output shape is unchanged.
+  four list methods) and sends the immutable `order_by=createdAt,id` for
+  gap-free, byte-stable paging. Its `opportunityList` output shape is unchanged.
 - **`redactError`** now also scrubs the bearer token (`Bearer <token>` and any
-  exact literal token the caller passes) plus the `filter=` and `starting_after=`
-  query values from captured error strings (which embed raw leadId/name/domain
-  and the opaque cursor), not just the email/digit PII shapes.
+  exact literal token the caller passes) plus the `filter=` and
+  `starting_after=` query values from captured error strings (which embed raw
+  leadId/name/domain and the opaque cursor), not just the email/digit PII
+  shapes.
 - **`limit` is a soft per-call floor, not a hard ceiling.** All four list
   methods page in whole `PAGE_SIZE` (60) pages: the call stops after the first
-  full page that reaches `limit`, so a call may return up to `PAGE_SIZE - 1` more
-  rows than `limit` (rounded up to the page boundary). This is what makes the
-  continuation cursor safe (see Fixed).
+  full page that reaches `limit`, so a call may return up to `PAGE_SIZE - 1`
+  more rows than `limit` (rounded up to the page boundary). This is what makes
+  the continuation cursor safe (see Fixed).
 
 ### Fixed
 
-- **Continuation is now gap-free and duplication-free (whole-page capping).** The
-  paginator never slices a page mid-way: it consumes each page in full and only
-  ever hands back the `endCursor` of a fully-consumed page, so the next call
-  resumes strictly after it — no duplicated rows when `limit` is not a multiple
-  of the page size, and no skipped rows when `limit < PAGE_SIZE` (a sub-page
-  `limit` simply returns the first full page then stops with `hasMore=true`).
+- **Continuation is now gap-free and duplication-free (whole-page capping).**
+  The paginator never slices a page mid-way: it consumes each page in full and
+  only ever hands back the `endCursor` of a fully-consumed page, so the next
+  call resumes strictly after it — no duplicated rows when `limit` is not a
+  multiple of the page size, and no skipped rows when `limit < PAGE_SIZE` (a
+  sub-page `limit` simply returns the first full page then stops with
+  `hasMore=true`).
 - **Per-call completeness no longer masks cross-call state.** A single call
   cannot know its cumulative offset, so completeness is now end-of-cursor:
   `stopReason='complete'` + `incomplete=false` whenever the loop ends on
@@ -269,9 +310,9 @@ cleanly).
   `max-pages` backstop are continuable and NOT flagged incomplete. A count is
   reconciled against `totalCount` only for a single-call whole-set read (no
   `startingAfter`, `hasMore=false`) → `count-mismatch` / `no-total`; cumulative
-  reconciliation across a page loop is the workflow's job, using the `totalCount`
-  the envelope still exposes. `incomplete=true` is reserved for an untrustworthy
-  cursor (`no-progress` / `cursor-repeat`).
+  reconciliation across a page loop is the workflow's job, using the
+  `totalCount` the envelope still exposes. `incomplete=true` is reserved for an
+  untrustworthy cursor (`no-progress` / `cursor-repeat`).
 - **`max-pages` backstop no longer strands the workflow** — it now returns
   `hasMore=true` + `nextCursor` (the last consumed page boundary) so paging can
   continue.
@@ -299,8 +340,8 @@ cleanly).
   email so concurrent runs converge on one Person. `confirm`-gated with a
   no-write `dryRun`; whole execute wrapped in `redactError` (snapshot carries no
   raw PII).
-- **`personUpsert` resource** — records the action taken, the resolved Person id,
-  the fields set, and the Company link.
+- **`personUpsert` resource** — records the action taken, the resolved Person
+  id, the fields set, and the Company link.
 
 ### Changed
 
@@ -345,8 +386,8 @@ cleanly).
   guard (zero-new-id or repeated cursor hard-stops) and dedup by id, so a wrong
   cursor field can never infinite-loop; multi-clause AND composed as one
   comma-joined `filter=` param with each value UUID/filter-safe validated and
-  URL-encoded; every read wrapped in `redactError` so an ambiguous-match throw or
-  4xx never leaks the raw email/name. Additive only — `push_leads` and every
+  URL-encoded; every read wrapped in `redactError` so an ambiguous-match throw
+  or 4xx never leaks the raw email/name. Additive only — `push_leads` and every
   write path untouched.
 - **`personRef` / `companyRef` / `opportunityRef` / `opportunityList`
   snapshots** — misses recorded as `found:false` ("looked, not there" vs "never
@@ -366,19 +407,19 @@ cleanly).
   Sets the full field set the lead-sink `createOpportunity` omits: `name`,
   `amount` (whole units → currency micros), `stage` (validated against the live
   SELECT enum), `closeDate` (formatted per the live DATE vs DATE_TIME field
-  type), a linked Company (dedup by domain, else filter-safe exact name;
-  created only when a domain is supplied), a link-only point-of-contact Person
-  (dedup by email; never created or leadId-stamped), and an optional Note.
-  Defaults the stage only on create and preserves an existing opportunity's
-  stage/currency on an amount-only update. `confirm`-gated with a no-write
-  `dryRun`; writes an `opportunityUpsert` resource.
+  type), a linked Company (dedup by domain, else filter-safe exact name; created
+  only when a domain is supplied), a link-only point-of-contact Person (dedup by
+  email; never created or leadId-stamped), and an optional Note. Defaults the
+  stage only on create and preserves an existing opportunity's stage/currency on
+  an amount-only update. `confirm`-gated with a no-write `dryRun`; writes an
+  `opportunityUpsert` resource.
 - **`opportunityUpsert` resource** — records the action taken and the resolved
   opportunity/company/contact ids plus any skip/degrade notes.
 
 ### Changed
 
-- Version bump to `2026.09.05.2` with a no-op `upgrades[]` entry (globalArguments
-  unchanged) so existing pinned instances upgrade lazily.
+- Version bump to `2026.09.05.2` with a no-op `upgrades[]` entry
+  (globalArguments unchanged) so existing pinned instances upgrade lazily.
 
 ## 2026.09.05.1
 
@@ -397,8 +438,8 @@ Initial release.
     (BOOLEAN) on Person/Opportunity. Confirm-gated.
   - `findPersonByLeadId` / `findOpportunityByLeadId` — idempotency lookups by
     the immutable `leadId` marker.
-- **`push_leads`** — the one fan-out method (repo rule 6) that ingests a batch of
-  leads in a single execution:
+- **`push_leads`** — the one fan-out method (repo rule 6) that ingests a batch
+  of leads in a single execution:
   - validates + sanitizes every field before any write (email/domain RFC-shaped
     and URL-encoded → anti filter-injection; HTML/control chars stripped → anti
     record-poisoning);
@@ -418,10 +459,11 @@ Initial release.
     reachability pre-flight.
 - **Security discipline** — the `apiToken` global is marked sensitive
   (vault-resolved, never a literal, logged length-only); mutations are audited.
-- **Bundled Claude skill** (`skills/twenty`) — a task playbook covering first-run
-  field provisioning, the `push_leads` idempotency + emergency contract, reading
-  the `pushRun` audit via CEL, and Twenty's role/permission model (why the token
-  can't manage RBAC and how emergency-record visibility is actually restricted).
+- **Bundled Claude skill** (`skills/twenty`) — a task playbook covering
+  first-run field provisioning, the `push_leads` idempotency + emergency
+  contract, reading the `pushRun` audit via CEL, and Twenty's role/permission
+  model (why the token can't manage RBAC and how emergency-record visibility is
+  actually restricted).
 
 ### Notes
 
@@ -429,6 +471,6 @@ Initial release.
   Twenty rejects bare national numbers. If a number is still not dialable, the
   Person is created without it rather than dropping the lead.
 - Emergency-record **visibility restriction** is a documented workspace
-  pre-config (a restricted role + a saved view filtered on `isEmergency`), not an
-  API call — Twenty v2.38.1's REST API cannot manage RBAC.
+  pre-config (a restricted role + a saved view filtered on `isEmergency`), not
+  an API call — Twenty v2.38.1's REST API cannot manage RBAC.
 - Verified against Twenty **v2.38.1**.

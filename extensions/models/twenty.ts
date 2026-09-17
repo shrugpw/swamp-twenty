@@ -157,31 +157,115 @@ export async function twentyRequest(
 }
 
 /**
+ * Blank out GraphQL string literals (`"..."` and block `"""..."""`) and `#` line
+ * comments, replacing each span with a single space, so a subsequent STRUCTURAL
+ * scan cannot be fooled by a `}`, a `#`, or the words `mutation`/`subscription`
+ * appearing INSIDE a string or comment. NOT a full GraphQL lexer — it only
+ * neutralizes the spans that must not be scanned. (GraphQL has no C-style block
+ * comments; only `#` line comments and triple-quoted block strings.)
+ */
+export function stripGraphQLStringsAndComments(query: string): string {
+  let out = "";
+  let i = 0;
+  const n = query.length;
+  while (i < n) {
+    const c = query[i];
+    if (c === '"' && query[i + 1] === '"' && query[i + 2] === '"') {
+      i += 3;
+      while (
+        i < n &&
+        !(query[i] === '"' && query[i + 1] === '"' && query[i + 2] === '"')
+      ) i++;
+      i += 3;
+      out += " ";
+      continue;
+    }
+    if (c === '"') {
+      i++;
+      while (i < n && query[i] !== '"') {
+        if (query[i] === "\\") i++; // skip the char after a backslash escape
+        i++;
+      }
+      i++;
+      out += " ";
+      continue;
+    }
+    if (c === "#") {
+      while (i < n && query[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * True iff `query` contains NO top-level `mutation`/`subscription` operation —
+ * i.e. it is a read-only document. Strips strings/comments first, then scans at
+ * brace depth 0: the first identifier of each operation (document start, or just
+ * after a top-level `}`) is the operation type; a bare `{...}` selection is an
+ * anonymous query. Commas are treated as insignificant (GraphQL ignores them),
+ * so a comma-separated multi-op cannot slip a mutation past. This is
+ * DEFENSE-IN-DEPTH: the real guarantee is that {@link twentyGraphQL}'s `query` is
+ * ALWAYS an in-code constant literal (never caller-supplied); this guard is NOT a
+ * safe boundary for untrusted query text.
+ */
+export function isReadOnlyGraphQL(query: string): boolean {
+  const stripped = stripGraphQLStringsAndComments(query).replace(/^﻿/, "");
+  let depth = 0;
+  let atOpStart = true; // document start or just after a top-level `}`
+  const re = /[{}]|[A-Za-z_][A-Za-z0-9_]*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) {
+    const tok = m[0];
+    if (tok === "{") {
+      depth++;
+      atOpStart = false;
+      continue;
+    }
+    if (tok === "}") {
+      depth--;
+      if (depth <= 0) {
+        depth = 0;
+        atOpStart = true;
+      }
+      continue;
+    }
+    if (depth === 0 && atOpStart) {
+      const low = tok.toLowerCase();
+      if (low === "mutation" || low === "subscription") return false;
+      atOpStart = false; // first identifier consumed (query/field/op name)
+    }
+  }
+  return true;
+}
+
+/**
  * Minimal Twenty **Core GraphQL** client over fetch (TWENTY-DASHBOARDS). POSTs
  * `{query, variables}` to `/graphql` with the vaulted bearer token — the SAME
  * workspace API key as the REST surface (only native-dashboard *authoring* needs
  * a user token, which this model does not do). Throws (caller-redacts) on a
  * non-2xx HTTP status OR when the GraphQL response carries `errors`, so any
- * failure is uniform and a caller can fall back to REST. **READ-ONLY by
- * contract:** refuses a document whose first significant token is `mutation` or
- * `subscription` (a bare `{...}` selection is a query). Returns the `data` object.
+ * failure is uniform and a caller can fall back to REST.
+ *
+ * **READ-ONLY, in-code-literal-only:** `query` MUST be a compile-time constant
+ * literal built inside this module — NEVER a caller-supplied string. That
+ * invariant (not the guard below) is the real safety boundary; a
+ * `stripGraphQLStringsAndComments`-based {@link isReadOnlyGraphQL} check is
+ * applied as defense-in-depth to reject any top-level mutation/subscription
+ * (incl. comma-separated multi-op and `#`/`"""`-obfuscated docs), but it is NOT
+ * hardened for untrusted input. Returns the `data` object.
  */
 export async function twentyGraphQL(
   cfg: TwentyCfg,
   query: string,
   variables?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  // Read-only guard: drop a BOM + line/block comments, then reject a
-  // mutation/subscription operation before any network call.
-  const head = query
-    .replace(/^﻿/, "")
-    .replace(/#[^\n]*(?:\n|$)/g, " ")
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .trimStart();
-  // Reject a mutation/subscription as the FIRST operation or as a later
-  // operation in a multi-op document (after a `}`) — not just the leading token
-  // (CR-A-L2). All call sites pin single-op query docs; this is defense in depth.
-  if (/(^|\})\s*(mutation|subscription)\b/i.test(head)) {
+  // Read-only guard (defense-in-depth; see docstring — the real guarantee is the
+  // in-code-literal-only invariant): reject a top-level mutation/subscription.
+  if (!isReadOnlyGraphQL(query)) {
     throw new Error(
       "twentyGraphQL refuses a non-query operation (read-only transport)",
     );
@@ -2801,11 +2885,177 @@ async function findNoteByLeadId(
   return unwrapList(json, "notes")[0] ?? null;
 }
 
+// --- Note write core (TWENTY-NOTE-MGMT) -------------------------------------
+
 /**
- * Attach the per-lead Note idempotently: if a Note already carries this leadId,
- * do nothing; otherwise create the Note (markdown body) and link it to the
- * given person/opportunity via separate noteTarget records. Returns whether a
- * new Note was created.
+ * A Note write (POST/PATCH `/rest/notes…`, POST `/rest/noteTargets`) whose thrown
+ * error NEVER carries the response body (CR-NOTE A3/S1): a note title/body is
+ * submitted here and Twenty can echo the submitted value in a 4xx, which
+ * redactError's pattern-scrubber does NOT cover (it only scrubs bearer/filter/
+ * email/digits, not arbitrary free text). So the response body is DISCARDED and a
+ * GENERIC `note <label> failed (status N)` is thrown. Returns parsed JSON on 2xx.
+ */
+async function noteWriteRequest(
+  cfg: TwentyCfg,
+  method: string,
+  path: string,
+  body: Record<string, unknown>,
+  label: string,
+): Promise<unknown> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const resp = await fetch(`${base}${path}`, {
+    method,
+    headers: {
+      "Authorization": `Bearer ${cfg.apiToken}`,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    // Body intentionally discarded — never echo a submitted title/body.
+    throw new Error(`note ${label} failed (status ${resp.status})`);
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+/** Envelope-independent first record from a `{data:{<op>:{...}}}` response. */
+function firstRecordOf(json: unknown): Record<string, unknown> {
+  const d = (json as { data?: Record<string, unknown> })?.data ?? {};
+  const v = Object.values(d)[0];
+  return (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
+}
+
+/** The three noteTarget kinds and their REST field names. */
+const NOTE_TARGET_KINDS = [
+  { arg: "opportunityId", field: "targetOpportunityId" },
+  { arg: "personId", field: "targetPersonId" },
+  { arg: "companyId", field: "targetCompanyId" },
+] as const;
+
+interface NoteTarget {
+  field: string;
+  id: string;
+  kind: string;
+}
+
+/**
+ * Normalize a `{opportunityId?|personId?|companyId?}` target entry to
+ * `{field,id,kind}` — EXACTLY one UUID-validated id, else throw (pre-I/O).
+ */
+function normalizeNoteTarget(t: Record<string, unknown>): NoteTarget {
+  const present = NOTE_TARGET_KINDS
+    .map((k) => ({ ...k, raw: t[k.arg] }))
+    .filter((k) => k.raw != null && String(k.raw).trim() !== "");
+  if (present.length !== 1) {
+    throw new Error(
+      "each note target must carry EXACTLY one of opportunityId/personId/companyId",
+    );
+  }
+  const only = present[0];
+  const id = validateUuid(only.raw);
+  if (!id) throw new Error(`note target ${only.arg} is not a valid UUID`);
+  return { field: only.field, id, kind: only.arg };
+}
+
+/**
+ * Shared note create-or-reuse core (used by ensureNoteForLead + createNote).
+ * When `dedupByLeadId` and a Note already carries `leadId`, reuse it (no create);
+ * otherwise POST a new Note. Title/body are submitted VERBATIM (caller sanitizes
+ * the title; untrusted callers escapeMarkdown the body). Uses noteWriteRequest so
+ * a failure never echoes the submitted content (A3/S1). A1: POST unwraps
+ * `createNote`.
+ */
+async function createOrReuseNote(
+  cfg: TwentyCfg,
+  input: {
+    title: string;
+    body?: string;
+    leadId?: string;
+    dedupByLeadId?: boolean;
+  },
+): Promise<{ noteId: string; created: boolean }> {
+  if (input.dedupByLeadId && input.leadId) {
+    const existing = await findNoteByLeadId(cfg, input.leadId);
+    if (existing) return { noteId: String(existing.id ?? ""), created: false };
+  }
+  const bodyRec: Record<string, unknown> = { title: input.title };
+  if (input.body != null) bodyRec.bodyV2 = { markdown: input.body };
+  if (input.leadId != null && input.leadId !== "") {
+    bodyRec.leadId = input.leadId;
+  }
+  const json = await noteWriteRequest(
+    cfg,
+    "POST",
+    "/rest/notes",
+    bodyRec,
+    "create",
+  );
+  return {
+    noteId: String(unwrapRecord(json, "createNote").id ?? ""),
+    created: true,
+  };
+}
+
+/**
+ * Idempotently link `targets` to a Note. A4: EXACT target-id equality (never the
+ * any-of-kind check) so linking person B never no-ops because A is linked, and
+ * unlink can't hit the wrong row. S7: after a create POST, verify the returned
+ * row carries the intended id before counting it linked (guards a silent
+ * schema-drift no-op — e.g. a wrong targetCompanyId field — from a false audit).
+ * A6: with `bestEffort`, a link failure is collected, never thrown, so a partial
+ * failure after the note create can't orphan/duplicate. Returns linked + failed.
+ */
+async function reconcileNoteTargets(
+  cfg: TwentyCfg,
+  noteId: string,
+  targets: NoteTarget[],
+  opts: { bestEffort?: boolean } = {},
+): Promise<{ linked: string[]; failed: string[] }> {
+  const linked: string[] = [];
+  const failed: string[] = [];
+  if (!targets.length) return { linked, failed };
+  const existing = unwrapList(
+    await twentyRequest(
+      cfg,
+      "GET",
+      buildFilterPath("/rest/noteTargets", "noteId", noteId),
+    ),
+    "noteTargets",
+  );
+  for (const t of targets) {
+    if (existing.some((r) => String(r[t.field] ?? "") === t.id)) {
+      linked.push(t.id); // already linked (exact match) — idempotent no-op
+      continue;
+    }
+    try {
+      const json = await noteWriteRequest(
+        cfg,
+        "POST",
+        "/rest/noteTargets",
+        { noteId, [t.field]: t.id },
+        "link",
+      );
+      if (String(firstRecordOf(json)[t.field] ?? "") === t.id) {
+        linked.push(t.id); // S7: row confirmed to carry the intended id
+      } else {
+        failed.push(t.id); // schema-drift no-op — do NOT report as linked
+      }
+    } catch (e) {
+      if (opts.bestEffort) failed.push(t.id);
+      else throw e;
+    }
+  }
+  return { linked, failed };
+}
+
+/**
+ * Attach the per-lead Note idempotently — a THIN wrapper over the shared note
+ * core (rule 2). Preserves the push_leads contract exactly (A7): forced machine
+ * title `Inbound lead <leadId>`, `leadId` set, person/opp target reconcile, and
+ * the `{noteId,created}` return. Target links are best-effort (A6) so a link
+ * failure never aborts a lead.
  */
 async function ensureNoteForLead(
   cfg: TwentyCfg,
@@ -2816,52 +3066,54 @@ async function ensureNoteForLead(
     opportunityId?: string;
   },
 ): Promise<{ noteId: string; created: boolean }> {
-  const existing = await findNoteByLeadId(cfg, input.leadId);
-  let noteId: string;
-  let created: boolean;
-  if (existing) {
-    noteId = String(existing.id ?? "");
-    created = false;
-  } else {
-    const json = await twentyRequest(cfg, "POST", "/rest/notes", {
-      title: `Inbound lead ${input.leadId}`,
-      bodyV2: { markdown: input.body },
-      leadId: input.leadId,
-    });
-    noteId = String(unwrapRecord(json, "createNote").id ?? "");
-    created = true;
-  }
+  const { noteId, created } = await createOrReuseNote(cfg, {
+    title: `Inbound lead ${input.leadId}`,
+    body: input.body,
+    leadId: input.leadId,
+    dedupByLeadId: true,
+  });
   if (!noteId) return { noteId, created };
-
-  // Ensure the person/opportunity target links exist — idempotently, whether or
-  // not the Note is new. The Note record and its two target links are separate
-  // writes, so a crash between them (Note created + one link, other link fails)
-  // would otherwise orphan the message from a target forever: findNoteByLeadId
-  // would find the Note next run and never repair the missing link. So we always
-  // reconcile the links against what is already there.
-  const targets = unwrapList(
-    await twentyRequest(
-      cfg,
-      "GET",
-      buildFilterPath("/rest/noteTargets", "noteId", noteId),
-    ),
-    "noteTargets",
-  );
-  const hasPerson = targets.some((t) => t.targetPersonId != null);
-  const hasOpportunity = targets.some((t) => t.targetOpportunityId != null);
-  if (input.personId && !hasPerson) {
-    await twentyRequest(cfg, "POST", "/rest/noteTargets", {
-      noteId,
-      targetPersonId: input.personId,
+  const targets: NoteTarget[] = [];
+  if (input.personId) {
+    targets.push({
+      field: "targetPersonId",
+      id: input.personId,
+      kind: "personId",
     });
   }
-  if (input.opportunityId && !hasOpportunity) {
-    await twentyRequest(cfg, "POST", "/rest/noteTargets", {
-      noteId,
-      targetOpportunityId: input.opportunityId,
+  if (input.opportunityId) {
+    targets.push({
+      field: "targetOpportunityId",
+      id: input.opportunityId,
+      kind: "opportunityId",
     });
   }
+  await reconcileNoteTargets(cfg, noteId, targets, { bestEffort: true });
   return { noteId, created };
+}
+
+// Does a markdown-only PATCH of `bodyV2` make Twenty RE-DERIVE the `blocknote`
+// rich-text representation? Settled by the implement step-0 twenty-local probe
+// (design §6). Decision (1): write-both-or-refuse, NO stale-UI caveat. Until this
+// is proven true, updateNote/appendNote REFUSE a body write on a note that
+// already carries a non-empty blocknote (A5/S6: a stale blocknote is a
+// cross-representation lost-update AND a false-redaction). Notes with no/empty
+// blocknote (incl. all model-created notes, which are markdown-only) write freely.
+const BODYV2_MARKDOWN_REDERIVES = false;
+
+/** True if a Note record already carries a non-empty `bodyV2.blocknote`. */
+function noteHasBlocknote(note: Record<string, unknown>): boolean {
+  const bv2 = note.bodyV2 as { blocknote?: unknown } | null | undefined;
+  const bn = bv2?.blocknote;
+  if (bn == null) return false;
+  const s = typeof bn === "string" ? bn : JSON.stringify(bn);
+  return s.trim() !== "" && s.trim() !== "null" && s.trim() !== "[]";
+}
+
+/** The current `bodyV2.markdown` of a Note record, or "" when absent/empty. */
+function noteMarkdown(note: Record<string, unknown>): string {
+  const bv2 = note.bodyV2 as { markdown?: unknown } | null | undefined;
+  return bv2?.markdown != null ? String(bv2.markdown) : "";
 }
 
 /**
@@ -3689,6 +3941,47 @@ const NoteDeleteSchema = z.object({
   at: z.iso.datetime(),
 });
 
+// Result of a note WRITE (createNote/updateNote/appendNote/linkNote/unlinkNote).
+// NEVER carries a note body: only `bodyLength` (S3-bounded free-text `title` is
+// kept for audit but the whole resource is short-TTL, see the noteWrite resource).
+const NoteWriteSchema = z.object({
+  baseUrl: z.string(),
+  op: z.enum(["create", "update", "append", "link", "unlink"]),
+  action: z.enum([
+    "planned-create",
+    "created",
+    "present",
+    "planned-update",
+    "updated",
+    "planned-append",
+    "appended",
+    "planned-link",
+    "linked",
+    "already-linked",
+    "planned-unlink",
+    "unlinked",
+    "not-linked",
+    "not-found",
+    "refused-blocknote",
+  ]),
+  id: z.string().optional(),
+  found: z.boolean().optional(),
+  title: z
+    .string()
+    .optional()
+    .describe("Note title (free text); PII-at-rest bounded by the 3d TTL"),
+  leadId: z.string().optional(),
+  targetsLinked: z.array(z.string()).optional(),
+  targetsFailed: z.array(z.string()).optional(),
+  bodyLength: z
+    .number()
+    .optional()
+    .describe("Length of the resulting body — NEVER the body text"),
+  dryRun: z.boolean(),
+  confirmed: z.boolean(),
+  writtenAt: z.iso.datetime(),
+});
+
 // --- SELECT-option snapshot (TWENTY-STAGE-OPTION) ---------------------------
 
 const StageOptionSchema = z.object({
@@ -4116,7 +4409,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.17.1",
+  version: "2026.09.17.2",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -4229,6 +4522,14 @@ export const model = {
       toVersion: "2026.09.17.1",
       description:
         "Add CRM pipeline analytics (TWENTY-DASHBOARDS): aggregateOpportunities — a read-only fan-out that aggregates all Opportunities into a PII-free oppAggregates snapshot (counts + per-currency sums by stage/lineOfBusiness/sourceChannel, open-pipeline, win/loss + win rate, active customers; isEmergency excluded by default) — plus a folded-in read-only Core-GraphQL transport (twentyGraphQL) and a verify-first GraphQL probe recorded on the snapshot. Additive method + one new resource; globalArguments unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.17.2",
+      description:
+        "Add full Note management (TWENTY-NOTE-MGMT): createNote/updateNote/appendNote/linkNote/unlinkNote — confirm-gated, dryRun-by-default write surface over /rest/notes + /rest/noteTargets (ensureNoteForLead refactored to a thin wrapper over the shared create+link core), plus a short-TTL noteWrite snapshot (no body text). appendNote reads the existing body across the SR-1 boundary only under confirm; body writes refuse on a note with a non-empty blocknote until markdown re-derivation is proven. Also folds in the .17.1 adversarial-review remediation: a string/comment-aware read-only twentyGraphQL guard, redaction of listViews' sample + ensureOpportunityViews' errors. Additive methods + one new resource; globalArguments unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4366,6 +4667,13 @@ export const model = {
       description:
         "Result of a getNoteBody run: ONE note's bodyV2.markdown (the sanctioned, per-id, confirm-gated SR-1 exception). Short-TTL + generous GC so a migration batch of distinct note-body-<id> instances is not truncated; the 3d TTL is the PII-at-rest bound.",
       schema: NoteBodyReadSchema,
+      lifetime: "3d",
+      garbageCollection: 25,
+    },
+    "noteWrite": {
+      description:
+        "Result of a note write (createNote/updateNote/appendNote/linkNote/unlinkNote): note id, action, targets linked/failed, and body LENGTH (never the body text). Short-TTL (3d) + generous GC bounds the free-text `title`'s PII-at-rest (S3).",
+      schema: NoteWriteSchema,
       lifetime: "3d",
       garbageCollection: 25,
     },
@@ -5221,10 +5529,37 @@ export const model = {
           lockFlagObserved,
           filterFields,
           uncoveredStageOptions,
-          sample: JSON.stringify(
-            allViews.find((v) => String(v.objectMetadataId ?? "") === oppOid) ??
-              allViews[0] ?? null,
-          ).slice(0, 1500),
+          // Allowlisted shape sample (CR-.17.1-R3): serialize ONLY known-safe
+          // view-metadata fields + the record's key names — never the raw record
+          // (which could carry createdBy/updatedBy-style PII), and never through
+          // the field-allowlist the opportunityViews array already applies.
+          sample: JSON.stringify((() => {
+            const rep = allViews.find((v) =>
+              String(v.objectMetadataId ?? "") === oppOid
+            ) ?? allViews[0] ?? null;
+            if (!rep) {
+              return null;
+            }
+            const ALLOW = [
+              "id",
+              "name",
+              "type",
+              "key",
+              "isSystemSideEffect",
+              "isCustom",
+              "position",
+              "objectMetadataId",
+            ];
+            const out: Record<string, unknown> = {
+              keys: Object.keys(rep).sort(),
+            };
+            for (const k of ALLOW) {
+              if (rep[k] !== undefined) {
+                out[k] = rep[k];
+              }
+            }
+            return out;
+          })()).slice(0, 1500),
           retrievedAt: new Date().toISOString(),
         });
         return { dataHandles: [handle] };
@@ -5244,221 +5579,231 @@ export const model = {
       ): Promise<ExecuteResult> => {
         const cfg = context.globalArgs;
         const willWrite = args.confirm === true && args.dryRun !== true;
-
-        // Resolve opp object + filter-field metadata (id + live options).
-        const { oppOid, fields: fieldMeta } =
-          await resolveOpportunityFilterFields(cfg);
-
-        // View-endpoint reachability pre-flight (F4): distinguish reachable from
-        // 404 (absent) / 401-403 (forbidden) before any write.
-        let reachable = false;
+        // Redact any thrown error (CR-.17.1-R3): the first call below
+        // (resolveOpportunityFilterFields → fetchObjectsMeta → twentyRequest) can
+        // throw with a raw response body, so wrap the whole body like every other
+        // method rather than letting an un-redacted error escape.
         try {
-          const r = await rawGet(cfg, "/rest/metadata/views?limit=1");
-          reachable = classifyProbe(r.status) === "ok";
-        } catch {
-          reachable = false;
-        }
+          // Resolve opp object + filter-field metadata (id + live options).
+          const { oppOid, fields: fieldMeta } =
+            await resolveOpportunityFilterFields(cfg);
 
-        // Load existing opportunity views + their filters (idempotency source).
-        // If this fails we CANNOT trust "name absent" → creates are fail-closed.
-        let existing: OppViewRef[] = [];
-        let existingLoadOk = false;
-        try {
-          const allViews = await fetchMetadataList(cfg, "views");
-          const allFilters = await fetchMetadataList(cfg, "viewFilters");
-          const byView = new Map<string, OppViewFilterRef[]>();
-          for (const f of allFilters) {
-            const vid = String(f.viewId ?? "");
-            if (!vid) continue;
-            const ref: OppViewFilterRef = {
-              id: f.id ? String(f.id) : undefined,
-              fieldMetadataId: f.fieldMetadataId
-                ? String(f.fieldMetadataId)
-                : undefined,
-              operand: f.operand != null ? String(f.operand) : undefined,
-              value: f.value,
-            };
-            const arr = byView.get(vid);
-            if (arr) arr.push(ref);
-            else byView.set(vid, [ref]);
+          // View-endpoint reachability pre-flight (F4): distinguish reachable from
+          // 404 (absent) / 401-403 (forbidden) before any write.
+          let reachable = false;
+          try {
+            const r = await rawGet(cfg, "/rest/metadata/views?limit=1");
+            reachable = classifyProbe(r.status) === "ok";
+          } catch {
+            reachable = false;
           }
-          existing = allViews
-            .filter((v) =>
-              !oppOid || String(v.objectMetadataId ?? "") === oppOid
-            )
-            .map((v) => {
-              const id = String(v.id ?? "");
-              return {
-                id,
-                name: String(v.name ?? ""),
-                key: v.key === null
-                  ? null
-                  : (v.key != null ? String(v.key) : undefined),
-                isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
-                  ? v.isSystemSideEffect
+
+          // Load existing opportunity views + their filters (idempotency source).
+          // If this fails we CANNOT trust "name absent" → creates are fail-closed.
+          let existing: OppViewRef[] = [];
+          let existingLoadOk = false;
+          try {
+            const allViews = await fetchMetadataList(cfg, "views");
+            const allFilters = await fetchMetadataList(cfg, "viewFilters");
+            const byView = new Map<string, OppViewFilterRef[]>();
+            for (const f of allFilters) {
+              const vid = String(f.viewId ?? "");
+              if (!vid) continue;
+              const ref: OppViewFilterRef = {
+                id: f.id ? String(f.id) : undefined,
+                fieldMetadataId: f.fieldMetadataId
+                  ? String(f.fieldMetadataId)
                   : undefined,
-                isCustom: typeof v.isCustom === "boolean"
-                  ? v.isCustom
-                  : undefined,
-                objectMetadataId: v.objectMetadataId
-                  ? String(v.objectMetadataId)
-                  : undefined,
-                filters: byView.get(id) ?? [],
+                operand: f.operand != null ? String(f.operand) : undefined,
+                value: f.value,
               };
-            });
-          existingLoadOk = true;
-        } catch { /* existingLoadOk stays false — creates fail-closed below */ }
+              const arr = byView.get(vid);
+              if (arr) arr.push(ref);
+              else byView.set(vid, [ref]);
+            }
+            existing = allViews
+              .filter((v) =>
+                !oppOid || String(v.objectMetadataId ?? "") === oppOid
+              )
+              .map((v) => {
+                const id = String(v.id ?? "");
+                return {
+                  id,
+                  name: String(v.name ?? ""),
+                  key: v.key === null
+                    ? null
+                    : (v.key != null ? String(v.key) : undefined),
+                  isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
+                    ? v.isSystemSideEffect
+                    : undefined,
+                  isCustom: typeof v.isCustom === "boolean"
+                    ? v.isCustom
+                    : undefined,
+                  objectMetadataId: v.objectMetadataId
+                    ? String(v.objectMetadataId)
+                    : undefined,
+                  filters: byView.get(id) ?? [],
+                };
+              });
+            existingLoadOk = true;
+          } catch {
+            /* existingLoadOk stays false — creates fail-closed below */
+          }
 
-        // Optional subset filter by name (still allowlist-guarded by the planner).
-        const nameSubset = args.names && args.names.length
-          ? new Set(args.names)
-          : undefined;
-        const targets = OPP_VIEW_TARGETS.filter(
-          (t) => !nameSubset || nameSubset.has(t.name),
-        );
+          // Optional subset filter by name (still allowlist-guarded by the planner).
+          const nameSubset = args.names && args.names.length
+            ? new Set(args.names)
+            : undefined;
+          const targets = OPP_VIEW_TARGETS.filter(
+            (t) => !nameSubset || nameSubset.has(t.name),
+          );
 
-        const results: Array<{
-          target: string;
-          field: string;
-          fieldMetadataId?: string;
-          desiredValues: string[];
-          operand: string;
-          action: "create" | "noop" | "refuse" | "created" | "failed";
-          reason: string;
-          viewId?: string;
-          error?: string;
-        }> = [];
+          const results: Array<{
+            target: string;
+            field: string;
+            fieldMetadataId?: string;
+            desiredValues: string[];
+            operand: string;
+            action: "create" | "noop" | "refuse" | "created" | "failed";
+            reason: string;
+            viewId?: string;
+            error?: string;
+          }> = [];
 
-        for (const t of targets) {
-          const plan = planOpportunityView(t, fieldMeta[t.field], existing);
-          const row = {
-            target: plan.target,
-            field: plan.field,
-            fieldMetadataId: plan.fieldMetadataId,
-            desiredValues: plan.desiredValues,
-            operand: plan.operand as string,
-            action: plan.action as
-              | "create"
-              | "noop"
-              | "refuse"
-              | "created"
-              | "failed",
-            reason: plan.reason,
-            viewId: plan.viewId,
-            error: undefined as string | undefined,
-          };
-          if (plan.action === "create" && willWrite) {
-            if (!existingLoadOk) {
-              row.action = "refuse";
-              row.reason =
-                "existing views could not be loaded — refusing to create (would risk a duplicate); fail-closed";
-            } else if (!reachable) {
-              row.action = "refuse";
-              row.reason =
-                "view endpoint not reachable at confirm time — write refused (F4)";
-            } else if (!oppOid) {
-              row.action = "refuse";
-              row.reason =
-                "opportunity objectMetadataId unresolved — write refused";
-            } else {
-              // Create is TWO non-transactional POSTs (view, then its filter).
-              // Record the view id the instant it exists so the audit names it,
-              // and if the filter write fails, ROLL BACK the just-created view we
-              // own — otherwise an orphaned filterless view is left behind and,
-              // being same-named with no matching filter, would make every future
-              // run refuse ("filter differs") and permanently wedge (H1). The
-              // rollback DELETEs ONLY the id we just minted — never a pre-existing
-              // view, so the non-mutating-of-pre-existing invariant holds.
-              let newViewId = "";
-              let viewCreated = false;
-              try {
-                const viewResp = await twentyRequest(
-                  cfg,
-                  "POST",
-                  "/rest/metadata/views",
-                  {
-                    name: plan.target,
-                    objectMetadataId: oppOid,
-                    icon: "IconTable",
-                    type: "TABLE",
-                  },
-                );
-                const created =
-                  ((viewResp as { data?: { id?: string } }).data ??
-                    viewResp) as { id?: string };
-                newViewId = String(created?.id ?? "");
-                if (!newViewId) throw new Error("create view returned no id");
-                row.viewId = newViewId; // audit-visible before the filter write
-                viewCreated = true;
-              } catch (e) {
-                // F1/F9: a write failure (incl. 400/401/403) is a hard STOP —
-                // report, no retry. Nothing was created, so nothing to roll back.
-                row.action = "failed";
-                row.error = redactError(e, 300, cfg.apiToken);
+          for (const t of targets) {
+            const plan = planOpportunityView(t, fieldMeta[t.field], existing);
+            const row = {
+              target: plan.target,
+              field: plan.field,
+              fieldMetadataId: plan.fieldMetadataId,
+              desiredValues: plan.desiredValues,
+              operand: plan.operand as string,
+              action: plan.action as
+                | "create"
+                | "noop"
+                | "refuse"
+                | "created"
+                | "failed",
+              reason: plan.reason,
+              viewId: plan.viewId,
+              error: undefined as string | undefined,
+            };
+            if (plan.action === "create" && willWrite) {
+              if (!existingLoadOk) {
+                row.action = "refuse";
                 row.reason =
-                  "view create failed — see error (no retry, fail-closed)";
-              }
-              if (viewCreated) {
+                  "existing views could not be loaded — refusing to create (would risk a duplicate); fail-closed";
+              } else if (!reachable) {
+                row.action = "refuse";
+                row.reason =
+                  "view endpoint not reachable at confirm time — write refused (F4)";
+              } else if (!oppOid) {
+                row.action = "refuse";
+                row.reason =
+                  "opportunity objectMetadataId unresolved — write refused";
+              } else {
+                // Create is TWO non-transactional POSTs (view, then its filter).
+                // Record the view id the instant it exists so the audit names it,
+                // and if the filter write fails, ROLL BACK the just-created view we
+                // own — otherwise an orphaned filterless view is left behind and,
+                // being same-named with no matching filter, would make every future
+                // run refuse ("filter differs") and permanently wedge (H1). The
+                // rollback DELETEs ONLY the id we just minted — never a pre-existing
+                // view, so the non-mutating-of-pre-existing invariant holds.
+                let newViewId = "";
+                let viewCreated = false;
                 try {
-                  await twentyRequest(
+                  const viewResp = await twentyRequest(
                     cfg,
                     "POST",
-                    "/rest/metadata/viewFilters",
+                    "/rest/metadata/views",
                     {
-                      viewId: newViewId,
-                      fieldMetadataId: plan.fieldMetadataId,
-                      operand: plan.operand,
-                      value: buildViewFilterValue(plan.desiredValues),
+                      name: plan.target,
+                      objectMetadataId: oppOid,
+                      icon: "IconTable",
+                      type: "TABLE",
                     },
                   );
-                  row.action = "created";
-                  row.reason = "created view + IS-any-of filter";
+                  const created =
+                    ((viewResp as { data?: { id?: string } }).data ??
+                      viewResp) as { id?: string };
+                  newViewId = String(created?.id ?? "");
+                  if (!newViewId) throw new Error("create view returned no id");
+                  row.viewId = newViewId; // audit-visible before the filter write
+                  viewCreated = true;
                 } catch (e) {
+                  // F1/F9: a write failure (incl. 400/401/403) is a hard STOP —
+                  // report, no retry. Nothing was created, so nothing to roll back.
+                  row.action = "failed";
                   row.error = redactError(e, 300, cfg.apiToken);
-                  let rolledBack = false;
+                  row.reason =
+                    "view create failed — see error (no retry, fail-closed)";
+                }
+                if (viewCreated) {
                   try {
                     await twentyRequest(
                       cfg,
-                      "DELETE",
-                      `/rest/metadata/views/${newViewId}`,
+                      "POST",
+                      "/rest/metadata/viewFilters",
+                      {
+                        viewId: newViewId,
+                        fieldMetadataId: plan.fieldMetadataId,
+                        operand: plan.operand,
+                        value: buildViewFilterValue(plan.desiredValues),
+                      },
                     );
-                    rolledBack = true;
-                  } catch {
-                    /* rollback failed — surface the orphan id in reason */
+                    row.action = "created";
+                    row.reason = "created view + IS-any-of filter";
+                  } catch (e) {
+                    row.error = redactError(e, 300, cfg.apiToken);
+                    let rolledBack = false;
+                    try {
+                      await twentyRequest(
+                        cfg,
+                        "DELETE",
+                        `/rest/metadata/views/${newViewId}`,
+                      );
+                      rolledBack = true;
+                    } catch {
+                      /* rollback failed — surface the orphan id in reason */
+                    }
+                    row.action = "failed";
+                    row.reason = rolledBack
+                      ? "filter write failed; created view rolled back (no orphan) — no retry, fail-closed"
+                      : `filter write failed AND rollback failed — ORPHAN view ${newViewId} left; delete it manually before re-running`;
                   }
-                  row.action = "failed";
-                  row.reason = rolledBack
-                    ? "filter write failed; created view rolled back (no orphan) — no retry, fail-closed"
-                    : `filter write failed AND rollback failed — ORPHAN view ${newViewId} left; delete it manually before re-running`;
                 }
               }
             }
+            results.push(row);
           }
-          results.push(row);
+
+          const createdCount = results.filter((r) =>
+            r.action === "created"
+          ).length;
+          const refusedCount = results.filter(
+            (r) => r.action === "refuse" || r.action === "failed",
+          ).length;
+
+          const handle = await context.writeResource(
+            "viewEnsured",
+            "viewEnsured",
+            {
+              baseUrl: cfg.baseUrl,
+              dryRun: !willWrite,
+              confirm: args.confirm === true,
+              reachable,
+              objectMetadataId: oppOid,
+              results,
+              createdCount,
+              refusedCount,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
-
-        const createdCount =
-          results.filter((r) => r.action === "created").length;
-        const refusedCount = results.filter(
-          (r) => r.action === "refuse" || r.action === "failed",
-        ).length;
-
-        const handle = await context.writeResource(
-          "viewEnsured",
-          "viewEnsured",
-          {
-            baseUrl: cfg.baseUrl,
-            dryRun: !willWrite,
-            confirm: args.confirm === true,
-            reachable,
-            objectMetadataId: oppOid,
-            results,
-            createdCount,
-            refusedCount,
-            retrievedAt: new Date().toISOString(),
-          },
-        );
-        return { dataHandles: [handle] };
       },
     },
     aggregateOpportunities: {
@@ -6326,6 +6671,528 @@ export const model = {
               deleted,
               at: new Date().toISOString(),
             },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    createNote: {
+      description:
+        "Create a Note (title + optional markdown body) and link it to opportunity/person/company targets, idempotently. With leadId: dedups on the Note carrying it (reuse + reconcile targets, never duplicate) — the push_leads contract. Without leadId: always creates (caller owns identity; amend via updateNote/appendNote). Body written VERBATIM (untrusted-input callers MUST escapeMarkdown first); title sanitized (≤200). confirm-gated, dryRun-by-default. Records a noteWrite snapshot (no body text). NOTE: leadId dedup needs note.leadId provisioned (ensureLeadFields).",
+      arguments: z.object({
+        title: z.string().describe("Note title (sanitized, ≤200 chars)"),
+        body: z
+          .string()
+          .optional()
+          .describe("Markdown body, written verbatim to bodyV2.markdown"),
+        targets: z
+          .array(
+            z.object({
+              opportunityId: z.string().optional(),
+              personId: z.string().optional(),
+              companyId: z.string().optional(),
+            }),
+          )
+          .optional()
+          .describe("Records to link; each entry carries EXACTLY one id"),
+        leadId: z
+          .string()
+          .optional()
+          .describe("Idempotency marker; when set, dedups on the Note with it"),
+        dryRun: z.boolean().default(false),
+        confirm: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          title: string;
+          body?: string;
+          targets?: Array<
+            { opportunityId?: string; personId?: string; companyId?: string }
+          >;
+          leadId?: string;
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const title = sanitizeText(args.title, 200);
+          if (!title) throw new Error("createNote requires a non-empty title");
+          let leadId: string | undefined;
+          if (args.leadId != null && String(args.leadId).trim() !== "") {
+            const v = validateLeadId(args.leadId);
+            if (!v) throw new Error("createNote: invalid leadId");
+            leadId = v;
+          }
+          const body = args.body != null ? String(args.body) : undefined;
+          const targets = (args.targets ?? []).map(normalizeNoteTarget);
+          // Stable snapshot identity (A2): survives plan→confirm without a note
+          // id — leadId when present, else a content hash.
+          const instance = leadId
+            ? `note-write-lead-${leadId}`
+            : `note-write-${await listInstanceHash({
+              title,
+              body: body ?? null,
+              targets: targets.map((t) => `${t.field}:${t.id}`).sort(),
+            })}`;
+          const willWrite = args.confirm === true && args.dryRun !== true;
+          if (!willWrite) {
+            const handle = await context.writeResource("noteWrite", instance, {
+              baseUrl: cfg.baseUrl,
+              op: "create",
+              action: "planned-create",
+              title,
+              leadId,
+              targetsLinked: [],
+              bodyLength: body?.length,
+              dryRun: args.dryRun === true,
+              confirmed: args.confirm === true,
+              writtenAt: new Date().toISOString(),
+            });
+            return { dataHandles: [handle] };
+          }
+          // Capture the note id BEFORE reconciling targets (A6) so a link
+          // failure never orphans — targets are best-effort, id is returned.
+          const { noteId, created } = await createOrReuseNote(cfg, {
+            title,
+            body,
+            leadId,
+            dedupByLeadId: Boolean(leadId),
+          });
+          const { linked, failed } = await reconcileNoteTargets(
+            cfg,
+            noteId,
+            targets,
+            { bestEffort: true },
+          );
+          const handle = await context.writeResource("noteWrite", instance, {
+            baseUrl: cfg.baseUrl,
+            op: "create",
+            action: created ? "created" : "present",
+            id: noteId,
+            title,
+            leadId,
+            targetsLinked: linked,
+            targetsFailed: failed.length ? failed : undefined,
+            bodyLength: body?.length,
+            dryRun: false,
+            confirmed: true,
+            writtenAt: new Date().toISOString(),
+          });
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    updateNote: {
+      description:
+        "Update a Note's title and/or body (full REPLACE, not append) via PATCH /rest/notes/{id}. Title sanitized; body verbatim. Refuses a body write on a note carrying a non-empty blocknote unless markdown re-derivation is proven (design §6/A5/S6). 404 → not-found. confirm-gated, dryRun-by-default. Records a noteWrite snapshot (no body text).",
+      arguments: z.object({
+        noteId: z.string(),
+        title: z.string().optional().describe("New title (sanitized, ≤200)"),
+        body: z
+          .string()
+          .optional()
+          .describe("New markdown body (full replace of bodyV2.markdown)"),
+        dryRun: z.boolean().default(false),
+        confirm: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          noteId: string;
+          title?: string;
+          body?: string;
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const noteId = validateUuid(args.noteId);
+          if (!noteId) {
+            throw new Error("updateNote: noteId is not a valid UUID");
+          }
+          const hasTitle = args.title != null;
+          const hasBody = args.body != null;
+          if (!hasTitle && !hasBody) {
+            throw new Error("updateNote requires title and/or body");
+          }
+          const title = hasTitle ? sanitizeText(args.title, 200) : undefined;
+          const body = hasBody ? String(args.body) : undefined;
+          const instance = `note-write-${noteId}`;
+          const willWrite = args.confirm === true && args.dryRun !== true;
+          const snap = (
+            action: string,
+            found: boolean,
+          ): Record<string, unknown> => ({
+            baseUrl: cfg.baseUrl,
+            op: "update",
+            action,
+            id: noteId,
+            found,
+            title,
+            bodyLength: body?.length,
+            targetsLinked: [],
+            dryRun: args.dryRun === true,
+            confirmed: args.confirm === true,
+            writtenAt: new Date().toISOString(),
+          });
+          // A body write needs the note (404 + blocknote check); a title-only
+          // write still resolves it to report not-found honestly.
+          const note = await getByIdOrNull(
+            cfg,
+            `/rest/notes/${encodeURIComponent(noteId)}`,
+            "note",
+          );
+          if (!note) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("not-found", false),
+            );
+            return { dataHandles: [handle] };
+          }
+          if (
+            hasBody && !BODYV2_MARKDOWN_REDERIVES && noteHasBlocknote(note)
+          ) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("refused-blocknote", true),
+            );
+            return { dataHandles: [handle] };
+          }
+          if (!willWrite) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("planned-update", true),
+            );
+            return { dataHandles: [handle] };
+          }
+          const patch: Record<string, unknown> = {};
+          if (hasTitle) patch.title = title;
+          if (hasBody) patch.bodyV2 = { markdown: body };
+          await noteWriteRequest(
+            cfg,
+            "PATCH",
+            `/rest/notes/${encodeURIComponent(noteId)}`,
+            patch,
+            "update",
+          );
+          const handle = await context.writeResource(
+            "noteWrite",
+            instance,
+            snap("updated", true),
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    appendNote: {
+      description:
+        "Append markdown to a Note's body (read-modify-write). confirm:true REQUIRED — it acknowledges that this READS the existing note body across the SR-1 privacy boundary; without confirm NO read happens (a dryRun-without-confirm returns a shallow 'would append' plan; a non-dry call refuses). The pre-existing body is NEVER snapshotted, logged, or thrown. Refuses on a note carrying a non-empty blocknote unless markdown re-derivation is proven (design §6/A5/S6). 404 → not-found. dryRun-by-default (with confirm) plans without writing. Records a noteWrite snapshot (bodyLength only).",
+      arguments: z.object({
+        noteId: z.string(),
+        text: z.string().describe("Markdown to append (verbatim)"),
+        dryRun: z.boolean().default(false),
+        confirm: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          noteId: string;
+          text: string;
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const noteId = validateUuid(args.noteId);
+          if (!noteId) {
+            throw new Error("appendNote: noteId is not a valid UUID");
+          }
+          const text = String(args.text ?? "");
+          if (!text) throw new Error("appendNote requires non-empty text");
+          const instance = `note-write-${noteId}`;
+          // S2: refuse BEFORE any GET when confirm is not true, in BOTH dryRun
+          // states — the read itself is the SR-1 crossing that confirm gates.
+          if (args.confirm !== true) {
+            if (args.dryRun === true) {
+              // Shallow plan — no body read, no bodyLength.
+              const handle = await context.writeResource(
+                "noteWrite",
+                instance,
+                {
+                  baseUrl: cfg.baseUrl,
+                  op: "append",
+                  action: "planned-append",
+                  id: noteId,
+                  targetsLinked: [],
+                  dryRun: true,
+                  confirmed: false,
+                  writtenAt: new Date().toISOString(),
+                },
+              );
+              return { dataHandles: [handle] };
+            }
+            throw new Error(
+              "Refusing to appendNote without confirm:true (reads a note body across the SR-1 privacy boundary)",
+            );
+          }
+          // confirm === true: the SR-1 read is acknowledged.
+          const note = await getByIdOrNull(
+            cfg,
+            `/rest/notes/${encodeURIComponent(noteId)}`,
+            "note",
+          );
+          const baseSnap = (
+            action: string,
+            found: boolean,
+            bodyLength?: number,
+          ): Record<string, unknown> => ({
+            baseUrl: cfg.baseUrl,
+            op: "append",
+            action,
+            id: noteId,
+            found,
+            bodyLength,
+            targetsLinked: [],
+            dryRun: args.dryRun === true,
+            confirmed: true,
+            writtenAt: new Date().toISOString(),
+          });
+          if (!note) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              baseSnap("not-found", false),
+            );
+            return { dataHandles: [handle] };
+          }
+          if (!BODYV2_MARKDOWN_REDERIVES && noteHasBlocknote(note)) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              baseSnap("refused-blocknote", true),
+            );
+            return { dataHandles: [handle] };
+          }
+          const existing = noteMarkdown(note);
+          // A10: trim trailing newlines before the \n\n join; empty body → text.
+          const merged = existing
+            ? existing.replace(/\n+$/, "") + "\n\n" + text
+            : text;
+          if (args.dryRun === true) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              baseSnap("planned-append", true, merged.length),
+            );
+            return { dataHandles: [handle] };
+          }
+          await noteWriteRequest(
+            cfg,
+            "PATCH",
+            `/rest/notes/${encodeURIComponent(noteId)}`,
+            { bodyV2: { markdown: merged } },
+            "append",
+          );
+          const handle = await context.writeResource(
+            "noteWrite",
+            instance,
+            baseSnap("appended", true, merged.length),
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    linkNote: {
+      description:
+        "Link a Note to ONE record (opportunity/person/company) via a noteTarget, idempotently. Already linked → already-linked (exact-id match, A4). Verifies the created row carries the intended id (S7). confirm-gated, dryRun-by-default. Records a noteWrite snapshot.",
+      arguments: z.object({
+        noteId: z.string(),
+        target: z.object({
+          opportunityId: z.string().optional(),
+          personId: z.string().optional(),
+          companyId: z.string().optional(),
+        }),
+        dryRun: z.boolean().default(false),
+        confirm: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          noteId: string;
+          target: {
+            opportunityId?: string;
+            personId?: string;
+            companyId?: string;
+          };
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const noteId = validateUuid(args.noteId);
+          if (!noteId) throw new Error("linkNote: noteId is not a valid UUID");
+          const target = normalizeNoteTarget(args.target);
+          const instance = `note-write-${noteId}`;
+          const willWrite = args.confirm === true && args.dryRun !== true;
+          const existing = unwrapList(
+            await twentyRequest(
+              cfg,
+              "GET",
+              buildFilterPath("/rest/noteTargets", "noteId", noteId),
+            ),
+            "noteTargets",
+          );
+          const already = existing.some((r) =>
+            String(r[target.field] ?? "") === target.id
+          );
+          const snap = (
+            action: string,
+            linked: string[],
+          ): Record<string, unknown> => ({
+            baseUrl: cfg.baseUrl,
+            op: "link",
+            action,
+            id: noteId,
+            targetsLinked: linked,
+            dryRun: args.dryRun === true,
+            confirmed: args.confirm === true,
+            writtenAt: new Date().toISOString(),
+          });
+          if (already) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("already-linked", [target.id]),
+            );
+            return { dataHandles: [handle] };
+          }
+          if (!willWrite) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("planned-link", []),
+            );
+            return { dataHandles: [handle] };
+          }
+          const { linked, failed } = await reconcileNoteTargets(
+            cfg,
+            noteId,
+            [target],
+            {},
+          );
+          const handle = await context.writeResource(
+            "noteWrite",
+            instance,
+            {
+              ...snap(linked.length ? "linked" : "not-linked", linked),
+              targetsFailed: failed.length ? failed : undefined,
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    unlinkNote: {
+      description:
+        "Remove ONE noteTarget link (opportunity/person/company) from a Note by exact-id match (A4) — never deletes the Note, never a non-matching target. Absent → not-linked. confirm-gated, dryRun-by-default. Records a noteWrite snapshot.",
+      arguments: z.object({
+        noteId: z.string(),
+        target: z.object({
+          opportunityId: z.string().optional(),
+          personId: z.string().optional(),
+          companyId: z.string().optional(),
+        }),
+        dryRun: z.boolean().default(false),
+        confirm: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          noteId: string;
+          target: {
+            opportunityId?: string;
+            personId?: string;
+            companyId?: string;
+          };
+          dryRun: boolean;
+          confirm: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const noteId = validateUuid(args.noteId);
+          if (!noteId) {
+            throw new Error("unlinkNote: noteId is not a valid UUID");
+          }
+          const target = normalizeNoteTarget(args.target);
+          const instance = `note-write-${noteId}`;
+          const willWrite = args.confirm === true && args.dryRun !== true;
+          const existing = unwrapList(
+            await twentyRequest(
+              cfg,
+              "GET",
+              buildFilterPath("/rest/noteTargets", "noteId", noteId),
+            ),
+            "noteTargets",
+          );
+          const row = existing.find((r) =>
+            String(r[target.field] ?? "") === target.id
+          );
+          const snap = (action: string): Record<string, unknown> => ({
+            baseUrl: cfg.baseUrl,
+            op: "unlink",
+            action,
+            id: noteId,
+            targetsLinked: [],
+            dryRun: args.dryRun === true,
+            confirmed: args.confirm === true,
+            writtenAt: new Date().toISOString(),
+          });
+          if (!row) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("not-linked"),
+            );
+            return { dataHandles: [handle] };
+          }
+          if (!willWrite) {
+            const handle = await context.writeResource(
+              "noteWrite",
+              instance,
+              snap("planned-unlink"),
+            );
+            return { dataHandles: [handle] };
+          }
+          const rowId = validateUuid(row.id);
+          if (!rowId) throw new Error("unlinkNote: noteTarget row id invalid");
+          await twentyRequest(
+            cfg,
+            "DELETE",
+            `/rest/noteTargets/${encodeURIComponent(rowId)}`,
+          );
+          const handle = await context.writeResource(
+            "noteWrite",
+            instance,
+            snap("unlinked"),
           );
           return { dataHandles: [handle] };
         } catch (e) {
