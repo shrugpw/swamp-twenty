@@ -2,6 +2,28 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.16.3
+
+### Added
+
+- **`upsertOpportunity` channelPartner linking** (`TWENTY-OPP-CHANNEL`) — link an
+  Opportunity to a `channelPartner` record (the `opportunity.channelPartner`
+  MANY_TO_ONE relation) for marketplace attribution:
+  - **`channelPartnerId`** — a `channelPartner` UUID, validated early (fails
+    pre-write even under `dryRun`); sets the FK directly like `companyId`. Empty /
+    omitted ⇒ left unchanged (never nulled).
+  - **`channelPartnerName`** — resolve-and-link by name (link-only; `channelPartner`
+    is keyed by `name`, e.g. `Braintrust`/`Upwork`), so `crm-opps-sync` needn't
+    hardcode UUIDs. Used only when `channelPartnerId` is unset; a name with no match
+    records `channelPartnerSkipped` and leaves the link unchanged — never creates a
+    partner.
+  - Both `channelPartnerId` and `channelPartner` added to
+    `OPP_CUSTOMFIELDS_RESERVED`; `channelPartnerId` surfaced in `mapOppView` + the
+    `opportunityUpsert` / `opportunityRef` / `opportunityList` read-back snapshots.
+
+Additive method arguments + optional snapshot fields only; `globalArguments`
+unchanged (no-op attribute migration).
+
 ## 2026.09.16.2
 
 ### Added

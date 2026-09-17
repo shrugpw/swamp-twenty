@@ -660,6 +660,7 @@ Deno.test("upsertOpportunity refuses a real run without confirm:true", async () 
           companyDomain: "",
           pointOfContactName: "",
           pointOfContactEmail: "",
+          channelPartnerName: "",
           noteBody: "",
           confirm: false,
           dryRun: false,
@@ -695,6 +696,7 @@ Deno.test("upsertOpportunity rejects an invalid leadId before any I/O", async ()
           companyDomain: "",
           pointOfContactName: "",
           pointOfContactEmail: "",
+          channelPartnerName: "",
           noteBody: "",
           confirm: true,
           dryRun: true,
@@ -1857,6 +1859,296 @@ Deno.test("OpportunityUpsertSchema/OppViewSchema/OpportunityRefSchema round-trip
   assertEquals(r.offering, "RETAINER");
 });
 
+// --- upsertOpportunity: channelPartner linking (TWENTY-OPP-CHANNEL) ----------
+
+const CP_UUID = "11111111-1111-1111-1111-111111111111";
+
+Deno.test("upsertOpportunity writes channelPartnerId (UUID) on create", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-id-2026",
+        name: "Partner Deal",
+        channelPartnerId: CP_UUID,
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        channelPartnerName: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST");
+    assertEquals(
+      (post!.body as Record<string, unknown>).channelPartnerId,
+      CP_UUID,
+    );
+    // A UUID id must NOT trigger a channelPartners name lookup.
+    assertEquals(
+      calls.some((c) => c.path.startsWith("/rest/channelPartners")),
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity rejects a non-UUID channelPartnerId pre-write (even dryRun)", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "cp-bad-2026",
+            name: "Bad Partner",
+            channelPartnerId: "not-a-uuid",
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            channelPartnerName: "",
+            noteBody: "",
+            confirm: false,
+            dryRun: true,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "Invalid channelPartnerId",
+    );
+    // Fails before any I/O.
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity resolves channelPartnerName -> id (link-only)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/channelPartners")) {
+      return { data: { channelPartners: [{ id: "cp-braintrust" }] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-name-2026",
+        name: "Braintrust Deal",
+        channelPartnerName: "Braintrust",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST");
+    assertEquals(
+      (post!.body as Record<string, unknown>).channelPartnerId,
+      "cp-braintrust",
+    );
+    // Queried the name filter.
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/channelPartners") &&
+        c.path.includes("Braintrust")
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity: channelPartnerName with no match => skipped, no link", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/channelPartners")) {
+      return { data: { channelPartners: [] } }; // no match
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-miss-2026",
+        name: "Unknown Partner",
+        channelPartnerName: "Nonexistent",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assert(post, "expected a POST");
+    // No link written; a skip note recorded — never blind-creates a partner.
+    assertEquals(
+      "channelPartnerId" in (post!.body as Record<string, unknown>),
+      false,
+    );
+    const snap = writes.find((w) => w.type === "opportunityUpsert");
+    assert(snap, "expected snapshot");
+    assert(
+      String(snap!.data.channelPartnerSkipped ?? "").includes("no existing"),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity: channelPartnerId wins over channelPartnerName (no name lookup)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST") {
+      return { data: { createOpportunity: { id: "new1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-both-2026",
+        name: "Both Partner",
+        channelPartnerId: CP_UUID,
+        channelPartnerName: "Braintrust",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const post = calls.find((c) => c.method === "POST");
+    assertEquals(
+      (post!.body as Record<string, unknown>).channelPartnerId,
+      CP_UUID,
+    );
+    // channelPartnerId set => name resolver is never consulted.
+    assertEquals(
+      calls.some((c) => c.path.startsWith("/rest/channelPartners")),
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity: customFields.channelPartnerId is rejected (reserved)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertOpportunity.execute(
+          {
+            leadId: "cp-reserved-2026",
+            name: "Reserved CP",
+            customFields: { channelPartnerId: CP_UUID },
+            closeDate: "",
+            companyName: "",
+            companyDomain: "",
+            pointOfContactName: "",
+            pointOfContactEmail: "",
+            channelPartnerName: "",
+            noteBody: "",
+            confirm: true,
+            dryRun: false,
+          } as never,
+          UPSERT_CTX as never,
+        ),
+      Error,
+      "reserved",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("OpportunityUpsertSchema/OppViewSchema/OpportunityRefSchema round-trip channelPartnerId (no strip)", () => {
+  const u = OpportunityUpsertSchema.parse({
+    baseUrl: "b",
+    action: "created",
+    dryRun: false,
+    leadId: "L1",
+    name: "X",
+    stage: "NEW",
+    channelPartnerId: CP_UUID,
+    companyLinked: false,
+    noteEnsured: false,
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  assertEquals(u.channelPartnerId, CP_UUID);
+  const v = OppViewSchema.parse({
+    id: "o1",
+    name: "X",
+    stage: "NEW",
+    channelPartnerId: CP_UUID,
+  });
+  assertEquals(v.channelPartnerId, CP_UUID);
+  const r = OpportunityRefSchema.parse({
+    baseUrl: "b",
+    found: true,
+    channelPartnerId: CP_UUID,
+    retrievedAt: "2026-09-16T00:00:00.000Z",
+  });
+  assertEquals(r.channelPartnerId, CP_UUID);
+});
+
 // --- Read surface (TWENTY-READ-SURFACE) -------------------------------------
 
 Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
@@ -1893,6 +2185,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     closeDate: "2026-12-31T00:00:00.000Z",
     companyId: "co1",
     pointOfContactId: "poc1",
+    channelPartnerId: "cp1",
     lineOfBusiness: "HOSTING",
     sourceChannel: "REFERRAL",
     asn: "AS64249",
@@ -1910,6 +2203,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   assertEquals(v.asn, "AS64249");
   assertEquals(v.qualStatus, "TECH_QUALIFICATION_NEEDED");
   assertEquals(v.offering, "SUBSTRATE");
+  assertEquals(v.channelPartnerId, "cp1");
   assertEquals(v.isEmergency, false);
   // A record with no amount composite omits amount/currencyCode; unset
   // segmentation SELECTs are omitted; absent isEmergency stays undefined.
@@ -1930,6 +2224,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   assertEquals("asn" in bare, false);
   assertEquals("qualStatus" in bare, false);
   assertEquals("offering" in bare, false);
+  assertEquals("channelPartnerId" in bare, false);
   assertEquals("isEmergency" in bare, false);
 });
 

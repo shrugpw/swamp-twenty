@@ -916,6 +916,8 @@ interface OpportunityWriteFields {
   closeDate?: string;
   pointOfContactId?: string;
   companyId?: string;
+  // channelPartner relation FK (TWENTY-OPP-CHANNEL) — set directly, like companyId.
+  channelPartnerId?: string;
   isEmergency?: boolean;
   lineOfBusiness?: string;
   sourceChannel?: string;
@@ -942,6 +944,7 @@ export function buildOpportunityBody(
   if (f.closeDate !== undefined) body.closeDate = f.closeDate;
   if (f.pointOfContactId) body.pointOfContactId = f.pointOfContactId;
   if (f.companyId) body.companyId = f.companyId;
+  if (f.channelPartnerId) body.channelPartnerId = f.channelPartnerId;
   if (f.isEmergency !== undefined) body.isEmergency = f.isEmergency;
   if (f.lineOfBusiness !== undefined) body.lineOfBusiness = f.lineOfBusiness;
   if (f.sourceChannel !== undefined) body.sourceChannel = f.sourceChannel;
@@ -1057,6 +1060,37 @@ async function findOneCompanyByName(
   }
 }
 
+/**
+ * Find exactly one channelPartner by its `name` natural key (TWENTY-OPP-CHANNEL).
+ * Link-only resolver for upsertOpportunity's channelPartnerName arg — mirrors
+ * {@link findOneCompanyByName}: throws on an ambiguous (>1) match, returns null
+ * on no match or a non-filterable instance.
+ */
+async function findOneChannelPartnerByName(
+  cfg: TwentyCfg,
+  name: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const list = unwrapList(
+      await twentyRequest(
+        cfg,
+        "GET",
+        buildFilterPath("/rest/channelPartners", "name", name),
+      ),
+      "channelPartners",
+    );
+    if (list.length > 1) {
+      throw new Error(
+        `Ambiguous channelPartner name '${name}': ${list.length} matches`,
+      );
+    }
+    return list[0] ?? null;
+  } catch (e) {
+    if (e instanceof Error && /^Ambiguous/.test(e.message)) throw e;
+    return null; // name not filterable on this instance
+  }
+}
+
 /** Find exactly one Person by primary email. Throws on an ambiguous match. */
 async function findOnePersonByEmail(
   cfg: TwentyCfg,
@@ -1124,6 +1158,8 @@ export interface OppView {
   currencyCode?: string;
   closeDate?: string;
   companyId?: string;
+  // channelPartner relation FK (TWENTY-OPP-CHANNEL) — flat id, like companyId.
+  channelPartnerId?: string;
   // Custom/segmentation SELECT fields (flat option-value scalars in Twenty REST)
   // + the emergency marker — surfaced so a reconcile can read back what a write
   // set without dropping to the Twenty UI.
@@ -1151,6 +1187,9 @@ export function mapOppView(rec: Record<string, unknown>): OppView {
   if (currencyCode) v.currencyCode = currencyCode;
   if (rec.closeDate) v.closeDate = String(rec.closeDate);
   if (rec.companyId) v.companyId = String(rec.companyId);
+  if (rec.channelPartnerId) {
+    v.channelPartnerId = String(rec.channelPartnerId);
+  }
   // Segmentation SELECTs are flat option-value strings; empty/unset => omit.
   if (rec.lineOfBusiness != null && rec.lineOfBusiness !== "") {
     v.lineOfBusiness = String(rec.lineOfBusiness);
@@ -1637,6 +1676,8 @@ const OPP_CUSTOMFIELDS_RESERVED = new Set<string>([
   "asn",
   "qualStatus",
   "offering",
+  "channelPartnerId",
+  "channelPartner",
 ]);
 
 /**
@@ -2585,6 +2626,16 @@ export const OpportunityUpsertSchema = z.object({
     .string()
     .optional()
     .describe("Why the point of contact was not linked, if applicable"),
+  channelPartnerId: z
+    .string()
+    .optional()
+    .describe("channelPartner relation id linked, if set/resolved"),
+  channelPartnerSkipped: z
+    .string()
+    .optional()
+    .describe(
+      "Why the channelPartner was not linked (name not found), if applicable",
+    ),
   noteEnsured: z.boolean(),
   retrievedAt: z.iso.datetime(),
 });
@@ -2660,6 +2711,7 @@ export const OpportunityRefSchema = z.object({
   closeDate: z.string().optional(),
   companyId: z.string().optional(),
   pointOfContactId: z.string().optional(),
+  channelPartnerId: z.string().optional(),
   lineOfBusiness: z.string().optional(),
   sourceChannel: z.string().optional(),
   asn: z.string().optional(),
@@ -2678,6 +2730,7 @@ export const OppViewSchema = z.object({
   currencyCode: z.string().optional(),
   closeDate: z.string().optional(),
   companyId: z.string().optional(),
+  channelPartnerId: z.string().optional(),
   lineOfBusiness: z.string().optional(),
   sourceChannel: z.string().optional(),
   asn: z.string().optional(),
@@ -3246,7 +3299,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.16.2",
+  version: "2026.09.16.3",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -3335,6 +3388,14 @@ export const model = {
       toVersion: "2026.09.16.2",
       description:
         "Add the Opportunity `offering` segmentation SELECT (MANAGED/SUBSTRATE/PROJECT/RETAINER/LOCAL_IT/PEERING): provisioned append-safe via OPPORTUNITY_SEGMENTATION_FIELDS/ensureOpportunitySegmentation; a new optional upsertOpportunity offering arg (sanitized + live-enum validated like stage, written on create+update, omitted-not-nulled when unset, added to OPP_CUSTOMFIELDS_RESERVED so customFields cannot shadow it); surfaced in mapOppView + the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method argument + optional snapshot fields + one manifest entry only; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.16.3",
+      description:
+        "Add upsertOpportunity channelPartner linking (TWENTY-OPP-CHANNEL) for marketplace attribution: a channelPartnerId arg (UUID, validated early so it fails pre-write even under dryRun; sets the opportunity.channelPartner MANY_TO_ONE FK like companyId) and a channelPartnerName resolver (link-only find-by-name via the new findOneChannelPartnerByName; channelPartnerId wins; a name with no match records channelPartnerSkipped, never creates a partner). Both channelPartnerId and channelPartner added to OPP_CUSTOMFIELDS_RESERVED; channelPartnerId surfaced in mapOppView + the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method arguments + optional snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4138,7 +4199,7 @@ export const model = {
     },
     getOpportunity: {
       description:
-        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId) plus the segmentation SELECTs (lineOfBusiness, sourceChannel, offering) and isEmergency when set — so a written custom-field value is read-back verifiable; found:false + no fields on a miss. No writes.",
+        "Fetch one Opportunity by leadId OR id (exactly one). Records an `opportunityRef` snapshot carrying the reconcile-critical fields (id, leadId, name, stage, amount in whole units, currencyCode, closeDate, companyId, pointOfContactId, channelPartnerId) plus the segmentation SELECTs (lineOfBusiness, sourceChannel, offering) and isEmergency when set — so a written custom-field value is read-back verifiable; found:false + no fields on a miss. No writes.",
       arguments: z
         .object({
           leadId: z.string().optional().describe(
@@ -4191,6 +4252,9 @@ export const model = {
             if (opp.pointOfContactId) {
               snap.pointOfContactId = String(opp.pointOfContactId);
             }
+            if (view.channelPartnerId) {
+              snap.channelPartnerId = view.channelPartnerId;
+            }
             if (view.lineOfBusiness) snap.lineOfBusiness = view.lineOfBusiness;
             if (view.sourceChannel) snap.sourceChannel = view.sourceChannel;
             if (view.asn) snap.asn = view.asn;
@@ -4219,7 +4283,7 @@ export const model = {
     },
     listOpportunities: {
       description:
-        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views (id/leadId/name/stage/amount/currency/closeDate/companyId + segmentation lineOfBusiness/sourceChannel/offering + isEmergency when set) + a `truncated` flag. No writes, no per-id loop.",
+        "Fan-out read (repo rule 6): list Opportunities filtered by companyId and/or stage (both optional; neither => all, capped). Composes filters with AND, pages through Twenty's cursor pagination up to `limit` (hard-capped at 500), dedups by id, and records an `opportunityList` snapshot of compact views (id/leadId/name/stage/amount/currency/closeDate/companyId/channelPartnerId + segmentation lineOfBusiness/sourceChannel/offering + isEmergency when set) + a `truncated` flag. No writes, no per-id loop.",
       arguments: z.object({
         companyId: z.string().optional().describe("Filter: company UUID"),
         stage: z.string().optional().describe(
@@ -4916,7 +4980,7 @@ export const model = {
     },
     upsertOpportunity: {
       description:
-        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact, and the lineOfBusiness/sourceChannel/offering segmentation SELECTs) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
+        "Generalized, idempotent Opportunity upsert keyed on leadId — the create/update path with the full field set (name, amount, stage, closeDate, company, point of contact, channelPartner, and the lineOfBusiness/sourceChannel/offering segmentation SELECTs) that push_leads' bare createOpportunity omits. Finds any existing Opportunity by leadId: hit => PATCH the provided fields; miss => create. Optionally finds-or-creates and links a Company (by domain, else by exact name) and a point-of-contact Person (by email), and attaches a markdown Note. amount is given in whole currency units (50000 => $50,000) and stored as Twenty currency micros. confirm:true required for a real run; dryRun:true resolves + plans and writes nothing. Snapshots an `opportunityUpsert` resource.",
       arguments: z.object({
         leadId: z
           .string()
@@ -5003,6 +5067,18 @@ export const model = {
           .describe(
             "Point-of-contact email — the find-or-create key for the Person",
           ),
+        channelPartnerId: z
+          .string()
+          .optional()
+          .describe(
+            "channelPartner record UUID to link (the opportunity.channelPartner MANY_TO_ONE relation, for marketplace attribution). Validated as a UUID; empty/omitted => left unchanged (never nulled). Takes precedence over channelPartnerName.",
+          ),
+        channelPartnerName: z
+          .string()
+          .default("")
+          .describe(
+            "channelPartner name to resolve-and-link (link-only; channelPartner is keyed by name, e.g. 'Braintrust'/'Upwork'). Used only when channelPartnerId is unset. A name with no match records channelPartnerSkipped and leaves the link unchanged — never creates a partner.",
+          ),
         isEmergency: z
           .boolean()
           .optional()
@@ -5038,6 +5114,8 @@ export const model = {
           companyDomain: string;
           pointOfContactName: string;
           pointOfContactEmail: string;
+          channelPartnerId?: string;
+          channelPartnerName: string;
           isEmergency?: boolean;
           noteBody: string;
           confirm: boolean;
@@ -5059,6 +5137,20 @@ export const model = {
         }
         const name = sanitizeText(args.name, 200);
         if (!name) throw new Error("name is required");
+        // channelPartnerId (TWENTY-OPP-CHANNEL): validate the UUID format EARLY —
+        // before any metadata fetch or write — so a malformed id fails pre-write
+        // even under dryRun. Empty/omitted => no id (may be resolved by name
+        // below). channelPartnerName is resolved inside the try (needs a GET).
+        let channelPartnerId: string | undefined;
+        if (args.channelPartnerId) {
+          const cp = validateUuid(args.channelPartnerId);
+          if (!cp) {
+            throw new Error(
+              "Invalid channelPartnerId (must be a UUID); or omit it and pass channelPartnerName",
+            );
+          }
+          channelPartnerId = cp;
+        }
         // Live Opportunity metadata: used to validate stage and the two
         // segmentation SELECTs against their enums and to learn the closeDate
         // field type. Best-effort — if metadata is unreadable, skip validation
@@ -5364,6 +5456,33 @@ export const model = {
               "point-of-contact name supplied without a resolvable email; skipped";
           }
 
+          // channelPartner (TWENTY-OPP-CHANNEL): link the marketplace partner.
+          // An explicit channelPartnerId (validated UUID, resolved above) wins;
+          // otherwise resolve channelPartnerName by exact (filter-safe) name —
+          // LINK-ONLY, never create. A name with no match is recorded as a skip
+          // and leaves the link unchanged (mirrors the pointOfContact posture).
+          let channelPartnerSkipped: string | undefined;
+          if (!channelPartnerId) {
+            const cpName = sanitizeText(args.channelPartnerName, 120);
+            if (cpName) {
+              if (isFilterSafe(cpName)) {
+                const existingCp = await findOneChannelPartnerByName(
+                  cfg,
+                  cpName,
+                );
+                if (existingCp) {
+                  channelPartnerId = String(existingCp.id ?? "");
+                } else {
+                  channelPartnerSkipped =
+                    "no existing channelPartner for the given name (link-only; not created)";
+                }
+              } else {
+                channelPartnerSkipped =
+                  "channelPartner name has filter-unsafe characters; skipped";
+              }
+            }
+          }
+
           // Opportunity: upsert on leadId, with a create->conflict->update fallback
           // for the check-then-act race (leadId is not a unique column in Twenty).
           const fields: OpportunityWriteFields = {
@@ -5373,6 +5492,7 @@ export const model = {
             ...(closeDate ? { closeDate } : {}),
             ...(pointOfContactId ? { pointOfContactId } : {}),
             ...(companyId ? { companyId } : {}),
+            ...(channelPartnerId ? { channelPartnerId } : {}),
             ...(args.isEmergency !== undefined
               ? { isEmergency: args.isEmergency }
               : {}),
@@ -5468,6 +5588,8 @@ export const model = {
               ...(companyNote ? { companyNote } : {}),
               ...(pointOfContactId ? { pointOfContactId } : {}),
               ...(pocSkipped ? { pocSkipped } : {}),
+              ...(channelPartnerId ? { channelPartnerId } : {}),
+              ...(channelPartnerSkipped ? { channelPartnerSkipped } : {}),
               noteEnsured,
               retrievedAt: new Date().toISOString(),
             },

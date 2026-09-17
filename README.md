@@ -181,6 +181,8 @@ the live workspace metadata, exactly like `stage`):
 | `asn`            | TEXT   | Autonomous System Number. Guarded to `^AS\d{1,10}$` (AS + 1–10 digits — a 32-bit ASN maxes at 4294967295; case-insensitive input, uppercased on store); a non-empty value that doesn't match is rejected. |
 | `qualStatus`     | SELECT | Technical-qualification state. Validated against the live `opportunity.qualStatus` enum.        |
 | `offering`       | SELECT | Offering segmentation (`MANAGED`/`SUBSTRATE`/`PROJECT`/`RETAINER`/`LOCAL_IT`/`PEERING`). Validated against the live `opportunity.offering` enum; provisioned via `ensureOpportunitySegmentation`. |
+| `channelPartnerId` | RELATION | Link to a `channelPartner` record (marketplace attribution). A UUID, validated early; sets the `opportunity.channelPartner` FK. Takes precedence over `channelPartnerName`. |
+| `channelPartnerName` | (resolver) | Resolve-and-link a `channelPartner` by name (link-only, e.g. `Braintrust`/`Upwork`) when `channelPartnerId` is unset; no match ⇒ recorded as skipped, never created. |
 
 An empty string for any of these means **leave unchanged** (not "clear").
 
