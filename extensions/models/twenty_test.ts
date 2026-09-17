@@ -7639,3 +7639,287 @@ Deno.test("note methods: a non-UUID noteId is rejected pre-I/O", async () => {
     restore();
   }
 });
+
+// ===========================================================================
+// R2 (.17.1 remediation): execute-level tests for aggregateOpportunities +
+// listViews (previously helper-only) and the two ensureOpportunityViews
+// fail-closed branches (existing-views-unloadable, endpoint-unreachable).
+// ===========================================================================
+
+Deno.test("R2 aggregateOpportunities: GraphQL-primary → oppAggregates, crossCheck match, PII-free", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "POST" && path === "/graphql") {
+      return {
+        body: {
+          data: {
+            opportunities: {
+              totalCount: 2,
+              sumAmountAmountMicros: 3000000,
+              edges: [
+                {
+                  node: {
+                    id: "PIIOPPID-AAA",
+                    stage: "NEW",
+                    amount: { amountMicros: 1000000, currencyCode: "USD" },
+                    lineOfBusiness: "CONSULTING",
+                    sourceChannel: "DIRECT",
+                    isEmergency: false,
+                  },
+                },
+                {
+                  node: {
+                    id: "PIIOPPID-BBB",
+                    stage: "CUSTOMER",
+                    amount: { amountMicros: 2000000, currencyCode: "USD" },
+                    lineOfBusiness: "HOSTING",
+                    sourceChannel: "REFERRAL",
+                    isEmergency: false,
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false },
+            },
+          },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.aggregateOpportunities.execute(
+      { includeEmergency: false },
+      ctx as never,
+    );
+    const snap = writes[writes.length - 1];
+    assertEquals(snap.type, "oppAggregates");
+    assertEquals(snap.data.source, "graphql");
+    assertEquals(
+      (snap.data.graphqlProbe as { crossCheck: string }).crossCheck,
+      "match",
+    );
+    // The GraphQL path was used (no REST fallback).
+    assert(calls.some((c) => c.method === "POST" && c.path === "/graphql"));
+    assert(!calls.some((c) => c.path.startsWith("/rest/opportunities")));
+    // PII-free: no per-opportunity id may reach the durable snapshot.
+    const json = JSON.stringify(snap.data);
+    assert(
+      !json.includes("PIIOPPID-AAA") && !json.includes("PIIOPPID-BBB"),
+      "opp ids must never appear in the oppAggregates snapshot",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("R2 aggregateOpportunities: GraphQL failure → REST fallback (source=rest)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "POST" && path === "/graphql") {
+      return { status: 500, body: { errors: [{ message: "graphql down" }] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return {
+        body: {
+          data: {
+            opportunities: [
+              {
+                id: "r1",
+                stage: "NEW",
+                amount: { amountMicros: 1000000, currencyCode: "USD" },
+              },
+            ],
+          },
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    return {};
+  });
+  try {
+    await model.methods.aggregateOpportunities.execute(
+      { includeEmergency: false },
+      ctx as never,
+    );
+    const snap = writes[writes.length - 1];
+    assertEquals(snap.type, "oppAggregates");
+    assertEquals(snap.data.source, "rest");
+    assert(
+      calls.some((c) => c.method === "POST" && c.path === "/graphql"),
+      "GraphQL is attempted first",
+    );
+    assert(
+      calls.some((c) =>
+        c.method === "GET" && c.path.startsWith("/rest/opportunities")
+      ),
+      "falls back to the REST list",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("R2 listViews: viewList snapshot; sample is field-allowlisted, not a raw dump (R3)", async () => {
+  const { writes, ctx } = readCtx();
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        body: {
+          data: [{
+            nameSingular: "opportunity",
+            id: "opp-oid",
+            fields: [
+              { name: "stage", id: "stage-fid", type: "SELECT", options: [] },
+              {
+                name: "lineOfBusiness",
+                id: "lob-fid",
+                type: "SELECT",
+                options: [],
+              },
+            ],
+          }],
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/metadata/views?limit=")) {
+      return {
+        body: {
+          data: [{
+            id: "v1",
+            name: "Sales Pipeline",
+            type: "TABLE",
+            key: "INDEX",
+            objectMetadataId: "opp-oid",
+            // A non-allowlisted field carrying PII — must NOT reach the sample.
+            createdBy: { name: "Jane PII Doe" },
+          }],
+          pageInfo: { hasNextPage: false },
+        },
+      };
+    }
+    if (
+      method === "GET" && path.startsWith("/rest/metadata/viewFilters?limit=")
+    ) {
+      return { body: { data: [], pageInfo: { hasNextPage: false } } };
+    }
+    return { body: { data: [] } }; // reachability probes
+  });
+  try {
+    await model.methods.listViews.execute({}, ctx as never);
+    const snap = writes[writes.length - 1];
+    assertEquals(snap.type, "viewList");
+    const sample = String(snap.data.sample ?? "");
+    assert(
+      !sample.includes("Jane PII Doe"),
+      "the R3 allowlist must keep a non-allowlisted PII value out of the sample",
+    );
+    assert(sample.includes("Sales Pipeline"), "allowlisted name is present");
+    assert(sample.includes("keys"), "sample carries the key-name manifest");
+  } finally {
+    restore();
+  }
+});
+
+// Shared opportunity-object metadata for the ensureOpportunityViews branches.
+function oppMetaBody() {
+  return {
+    data: [{
+      nameSingular: "opportunity",
+      namePlural: "opportunities",
+      id: "opp-oid",
+      fields: [
+        {
+          name: "stage",
+          id: "stage-fid",
+          type: "SELECT",
+          options: [
+            { value: "NEW" },
+            { value: "SCREENING" },
+            { value: "MEETING" },
+            { value: "PROPOSAL" },
+          ],
+        },
+        {
+          name: "lineOfBusiness",
+          id: "lob-fid",
+          type: "SELECT",
+          options: [{ value: "CONSULTING" }],
+        },
+      ],
+    }],
+    pageInfo: { hasNextPage: false },
+  };
+}
+
+Deno.test("R2 ensureOpportunityViews(confirm): existing views unloadable → refuse (fail-closed)", async () => {
+  const { writes, ctx } = readCtx();
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: oppMetaBody() };
+    }
+    // Reachability probe succeeds...
+    if (method === "GET" && path === "/rest/metadata/views?limit=1") {
+      return { body: { data: [], pageInfo: { hasNextPage: false } } };
+    }
+    // ...but the idempotency-source load of existing views FAILS (500 → throws).
+    if (method === "GET" && path.startsWith("/rest/metadata/views")) {
+      return { status: 500, body: { message: "views unavailable" } };
+    }
+    if (method === "GET" && path.startsWith("/rest/metadata/viewFilters")) {
+      return { body: { data: [], pageInfo: { hasNextPage: false } } };
+    }
+    return { body: { data: [] } };
+  });
+  try {
+    await model.methods.ensureOpportunityViews.execute(
+      { confirm: true, names: ["Sales Pipeline"] },
+      ctx as never,
+    );
+    const snap = writes[writes.length - 1];
+    const res = (snap.data.results as Array<Record<string, unknown>>)[0];
+    assertEquals(res.action, "refuse");
+    assert(String(res.reason).includes("existing views could not be loaded"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("R2 ensureOpportunityViews(confirm): endpoint unreachable at confirm → refuse (F4)", async () => {
+  const { writes, ctx } = readCtx();
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: oppMetaBody() };
+    }
+    // Reachability probe FAILS (404) → reachable=false.
+    if (method === "GET" && path === "/rest/metadata/views?limit=1") {
+      return { status: 404, body: {} };
+    }
+    // The existing-view load itself succeeds (empty), so existingLoadOk=true.
+    if (method === "GET" && path.startsWith("/rest/metadata/views")) {
+      return { body: { data: [], pageInfo: { hasNextPage: false } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/metadata/viewFilters")) {
+      return { body: { data: [], pageInfo: { hasNextPage: false } } };
+    }
+    return { body: { data: [] } };
+  });
+  try {
+    await model.methods.ensureOpportunityViews.execute(
+      { confirm: true, names: ["Sales Pipeline"] },
+      ctx as never,
+    );
+    const snap = writes[writes.length - 1];
+    const res = (snap.data.results as Array<Record<string, unknown>>)[0];
+    assertEquals(res.action, "refuse");
+    assert(String(res.reason).includes("not reachable at confirm time"));
+    // Fail-closed: no view POST was ever issued.
+    assert(
+      !calls.some((c) =>
+        c.method === "POST" && c.path === "/rest/metadata/views"
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
