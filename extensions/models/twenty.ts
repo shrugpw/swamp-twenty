@@ -3274,6 +3274,7 @@ export const ViewListSchema = z.object({
     type: z.string().optional(),
     key: z.string().nullable().optional(),
     isSystemSideEffect: z.boolean().optional(),
+    isCustom: z.boolean().optional(),
     position: z.number().optional(),
     objectMetadataId: z.string().optional(),
     filters: z.array(z.object({
@@ -3398,9 +3399,13 @@ export interface OppViewPlan {
 }
 
 function setEq(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
+  // Set-based: duplicate tokens (e.g. malformed live value ["NEW","NEW"]) must
+  // not read as equal to a distinct desired set of the same length (L5).
+  const sa = new Set(a);
   const sb = new Set(b);
-  return a.every((x) => sb.has(x));
+  if (sa.size !== sb.size) return false;
+  for (const x of sa) if (!sb.has(x)) return false;
+  return true;
 }
 
 /**
@@ -3463,7 +3468,7 @@ export function planOpportunityView(
   // F2: never touch a locked / system / default (INDEX) view.
   const locked = matches.find(
     (v) =>
-      (v.key != null && v.key !== "") || v.isSystemSideEffect === true ||
+      v.key != null || v.isSystemSideEffect === true ||
       v.isCustom === false,
   );
   if (locked) {
@@ -5056,7 +5061,7 @@ export const model = {
     },
     listViews: {
       description:
-        "Read-only Phase-0 view probe (TWENTY-VIEW-MGMT): resolve which view endpoint is live (core REST /rest/views, metadata API, or Core GraphQL), classify each candidate (ok/absent/forbidden/error), list the Opportunity views, and capture a raw sample for lock-flag + viewFilter shape discovery. GATES the view-write methods (a forbidden verdict means the token role can't manage views). No writes. Snapshots a `viewList` resource.",
+        "Read-only Phase-0 view probe (TWENTY-VIEW-MGMT): resolve which view endpoint is live (core REST /rest/views vs the metadata REST API /rest/metadata/views — views are metadata objects, not core-REST ones, and Core GraphQL has no views query), classify each candidate (ok/absent/forbidden/error), authoritatively fetch the Opportunity views + their viewFilters, resolve stage/lineOfBusiness field ids + live options, and report the locked default (key==='INDEX') and uncovered stage options. GATES the view-write method. No writes. Snapshots a `viewList` resource.",
       arguments: z.object({}),
       execute: async (
         _args: Record<string, never>,
@@ -5070,10 +5075,17 @@ export const model = {
           count?: number;
           bodySample?: string;
         }> = [];
-        // Cap a raw value to a bounded string so the real envelope / error text
-        // is captured for shape-discovery without unbounded snapshot growth.
+        // Capture a raw value to a bounded string for shape-discovery, routed
+        // through redactError so a bearer token / email / long-digit / filter or
+        // cursor query value in a response body or error text can never land in
+        // the durable snapshot (same defense-in-depth as every other write path
+        // in this file — SR-2/CR-S-1).
         const cap = (v: unknown) =>
-          (typeof v === "string" ? v : JSON.stringify(v ?? null)).slice(0, 600);
+          redactError(
+            typeof v === "string" ? v : JSON.stringify(v ?? null),
+            600,
+            cfg.apiToken,
+          );
         // Resolve the Opportunity objectMetadataId + the filter fields' live
         // metadata (id + options) in one metadata read. The filter fields drive
         // the S1 allowlist and the A5 dependency assert in the write method.
@@ -5161,6 +5173,9 @@ export const model = {
                 : (v.key != null ? String(v.key) : undefined),
               isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
                 ? v.isSystemSideEffect
+                : undefined,
+              isCustom: typeof v.isCustom === "boolean"
+                ? v.isCustom
                 : undefined,
               position: typeof v.position === "number" ? v.position : undefined,
               objectMetadataId: v.objectMetadataId
@@ -5346,6 +5361,16 @@ export const model = {
               row.reason =
                 "opportunity objectMetadataId unresolved — write refused";
             } else {
+              // Create is TWO non-transactional POSTs (view, then its filter).
+              // Record the view id the instant it exists so the audit names it,
+              // and if the filter write fails, ROLL BACK the just-created view we
+              // own — otherwise an orphaned filterless view is left behind and,
+              // being same-named with no matching filter, would make every future
+              // run refuse ("filter differs") and permanently wedge (H1). The
+              // rollback DELETEs ONLY the id we just minted — never a pre-existing
+              // view, so the non-mutating-of-pre-existing invariant holds.
+              let newViewId = "";
+              let viewCreated = false;
               try {
                 const viewResp = await twentyRequest(
                   cfg,
@@ -5361,29 +5386,51 @@ export const model = {
                 const created =
                   ((viewResp as { data?: { id?: string } }).data ??
                     viewResp) as { id?: string };
-                const newViewId = String(created?.id ?? "");
+                newViewId = String(created?.id ?? "");
                 if (!newViewId) throw new Error("create view returned no id");
-                await twentyRequest(
-                  cfg,
-                  "POST",
-                  "/rest/metadata/viewFilters",
-                  {
-                    viewId: newViewId,
-                    fieldMetadataId: plan.fieldMetadataId,
-                    operand: plan.operand,
-                    value: buildViewFilterValue(plan.desiredValues),
-                  },
-                );
-                row.action = "created";
-                row.viewId = newViewId;
-                row.reason = "created view + IS-any-of filter";
+                row.viewId = newViewId; // audit-visible before the filter write
+                viewCreated = true;
               } catch (e) {
-                // F1/F9: a write failure (incl. 400/401/403) is a hard STOP for
-                // this target — report, no retry.
+                // F1/F9: a write failure (incl. 400/401/403) is a hard STOP —
+                // report, no retry. Nothing was created, so nothing to roll back.
                 row.action = "failed";
-                row.error = String(e);
+                row.error = redactError(e, 300, cfg.apiToken);
                 row.reason =
-                  "create failed — see error (no retry, fail-closed)";
+                  "view create failed — see error (no retry, fail-closed)";
+              }
+              if (viewCreated) {
+                try {
+                  await twentyRequest(
+                    cfg,
+                    "POST",
+                    "/rest/metadata/viewFilters",
+                    {
+                      viewId: newViewId,
+                      fieldMetadataId: plan.fieldMetadataId,
+                      operand: plan.operand,
+                      value: buildViewFilterValue(plan.desiredValues),
+                    },
+                  );
+                  row.action = "created";
+                  row.reason = "created view + IS-any-of filter";
+                } catch (e) {
+                  row.error = redactError(e, 300, cfg.apiToken);
+                  let rolledBack = false;
+                  try {
+                    await twentyRequest(
+                      cfg,
+                      "DELETE",
+                      `/rest/metadata/views/${newViewId}`,
+                    );
+                    rolledBack = true;
+                  } catch {
+                    /* rollback failed — surface the orphan id in reason */
+                  }
+                  row.action = "failed";
+                  row.reason = rolledBack
+                    ? "filter write failed; created view rolled back (no orphan) — no retry, fail-closed"
+                    : `filter write failed AND rollback failed — ORPHAN view ${newViewId} left; delete it manually before re-running`;
+                }
               }
             }
           }

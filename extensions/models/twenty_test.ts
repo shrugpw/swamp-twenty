@@ -7008,3 +7008,106 @@ Deno.test("VIEW-MGMT ViewEnsuredSchema round-trips a dryRun plan snapshot", () =
   assertEquals(parsed.results[0].action, "create");
   assertEquals(parsed.dryRun, true);
 });
+
+Deno.test("VIEW-MGMT plan: duplicate-token existing filter is NOT a false noop (L5)", () => {
+  // Degenerate live value with dupes, same length as desired but only 1 distinct
+  // token — must refuse (differs), not noop.
+  const existing = [vmView({
+    filters: [{
+      id: "f1",
+      fieldMetadataId: VM_STAGE_FID,
+      operand: "IS",
+      value: ["NEW", "NEW", "NEW", "NEW"],
+    }],
+  })];
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, existing).action,
+    "refuse",
+  );
+});
+
+Deno.test("VIEW-MGMT plan: empty-string key is treated as locked (L3, fail-closed)", () => {
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, [vmView({ key: "" })])
+      .action,
+    "refuse",
+  );
+});
+
+Deno.test("VIEW-MGMT ensureOpportunityViews(confirm): filter-POST failure rolls back the created view (H1)", async () => {
+  // Simulate the expected first-run failure: the view POST succeeds but the
+  // filter POST (unconfirmed operand) fails. The method must DELETE the orphan
+  // view it just created — never leave a filterless same-named view behind.
+  const NEW_ID = "newview-0000-0000-0000-000000000000";
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return {
+        data: [{
+          nameSingular: "opportunity",
+          namePlural: "opportunities",
+          id: "opp-oid",
+          fields: [
+            {
+              name: "stage",
+              id: "stage-fid",
+              type: "SELECT",
+              options: [
+                { value: "NEW" },
+                { value: "SCREENING" },
+                { value: "MEETING" },
+                { value: "PROPOSAL" },
+              ],
+            },
+            {
+              name: "lineOfBusiness",
+              id: "lob-fid",
+              type: "SELECT",
+              options: [{ value: "CONSULTING" }],
+            },
+          ],
+        }],
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    if (method === "GET") {
+      // reachability probe + fetchMetadataList(views|viewFilters): empty.
+      return { data: [], pageInfo: { hasNextPage: false } };
+    }
+    if (method === "POST" && path === "/rest/metadata/views") {
+      return { data: { id: NEW_ID } };
+    }
+    if (method === "POST" && path === "/rest/metadata/viewFilters") {
+      throw new Error("400 operand IS rejected"); // filter write fails
+    }
+    if (method === "DELETE") return {}; // rollback succeeds
+    return {};
+  });
+  const written: Array<Record<string, unknown>> = [];
+  const ctx = {
+    globalArgs: { baseUrl: "https://crm.example.com", apiToken: "tok" },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: (_s: string, _n: string, data: Record<string, unknown>) => {
+      written.push(data);
+      return Promise.resolve({ name: "n" });
+    },
+    // deno-lint-ignore no-explicit-any
+  } as any;
+  try {
+    await model.methods.ensureOpportunityViews.execute(
+      { confirm: true, names: ["Sales Pipeline"] },
+      ctx,
+    );
+    // The view was created, then rolled back via DELETE on its exact id.
+    const del = calls.find((c) => c.method === "DELETE");
+    assert(del, "expected a rollback DELETE");
+    assertEquals(del!.path, `/rest/metadata/views/${NEW_ID}`);
+    const res = (written[0].results as Array<Record<string, unknown>>)[0];
+    assertEquals(res.action, "failed");
+    assertEquals(res.viewId, NEW_ID); // audit names the view even on failure
+    assert(String(res.reason).includes("rolled back"));
+    // Token never leaks into the persisted error (redactError).
+    assert(!String(res.error ?? "").includes("tok"));
+  } finally {
+    restore();
+  }
+});
