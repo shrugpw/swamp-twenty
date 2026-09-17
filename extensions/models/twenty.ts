@@ -2856,8 +2856,32 @@ const NoteListSchema = z.object({
   stopReason: ListStopReasonSchema,
   filter: z.object({
     leadId: z.string().optional(),
+    // listNotesByOpportunity (TWENTY-NOTE-BODY-READ) reuses this snapshot with an
+    // opportunityId filter (still body-free — views come from mapNoteView).
+    opportunityId: z.string().optional(),
   }),
   items: z.array(NoteViewSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+// Gated note-BODY read (TWENTY-NOTE-BODY-READ): the sanctioned, per-id,
+// confirm-gated exception to the SR-1 body-withholding. Short-TTL resource (see
+// registration) — the body markdown IS persisted here (bounded PII-at-rest).
+const NoteBodyReadSchema = z.object({
+  baseUrl: z.string(),
+  found: z.boolean(),
+  id: z.string().optional(),
+  leadId: z.string().optional(),
+  title: z.string().optional(),
+  body: z.string().optional().describe("Note bodyV2.markdown, verbatim"),
+  bodyMissing: z
+    .boolean()
+    .optional()
+    .describe(
+      "found:true but the note has no markdown body (blocknote-only/empty)",
+    ),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
   retrievedAt: z.iso.datetime(),
 });
 
@@ -3299,7 +3323,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.16.3",
+  version: "2026.09.16.4",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -3396,6 +3420,14 @@ export const model = {
       toVersion: "2026.09.16.3",
       description:
         "Add upsertOpportunity channelPartner linking (TWENTY-OPP-CHANNEL) for marketplace attribution: a channelPartnerId arg (UUID, validated early so it fails pre-write even under dryRun; sets the opportunity.channelPartner MANY_TO_ONE FK like companyId) and a channelPartnerName resolver (link-only find-by-name via the new findOneChannelPartnerByName; channelPartnerId wins; a name with no match records channelPartnerSkipped, never creates a partner). Both channelPartnerId and channelPartner added to OPP_CUSTOMFIELDS_RESERVED; channelPartnerId surfaced in mapOppView + the opportunityUpsert/opportunityRef/opportunityList read-back snapshots. Additive method arguments + optional snapshot fields only; globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.16.4",
+      description:
+        "Add note-body access (TWENTY-NOTE-BODY-READ): getNoteBody(noteId, confirm=true) — the sanctioned, per-id, confirm-gated SR-1 exception that returns ONE note's bodyV2.markdown to a short-TTL (3d) noteBodyRead snapshot (found:false on 404; bodyMissing:true when found with no markdown; title verbatim on this gated method only) — and listNotesByOpportunity(opportunityId), a body-FREE discovery read over the noteTargets join returning mapNoteView views into a note-list-opp-<id> noteList snapshot. listNotes/mapNoteView/NoteView are UNCHANGED (still body-free + title-guarded). Additive methods + one new resource + a NoteListSchema.filter.opportunityId; globalArguments unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -3506,6 +3538,13 @@ export const model = {
       schema: NoteDeleteSchema,
       lifetime: "infinite",
       garbageCollection: 100,
+    },
+    "noteBodyRead": {
+      description:
+        "Result of a getNoteBody run: ONE note's bodyV2.markdown (the sanctioned, per-id, confirm-gated SR-1 exception). Short-TTL + generous GC so a migration batch of distinct note-body-<id> instances is not truncated; the 3d TTL is the PII-at-rest bound.",
+      schema: NoteBodyReadSchema,
+      lifetime: "3d",
+      garbageCollection: 25,
     },
     "stageOption": {
       description:
@@ -4731,6 +4770,152 @@ export const model = {
           const handle = await context.writeResource(
             "noteList",
             instanceName,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    listNotesByOpportunity: {
+      description:
+        "Fan-out read (repo rule 6): discover the Notes linked to an Opportunity via noteTargets (targetOpportunityId), returning body-FREE compact views (mapNoteView — SR-1 preserved: id/leadId/machine-'Inbound lead' title/dates, NEVER a body). Resolves the opp's noteTargets page, then reads each linked Note. Records a `noteList` snapshot (instance note-list-opp-<id>). Primary use: find noteIds for getNoteBody when a note is NOT leadId-tagged (so listNotes can't find it). No writes.",
+      arguments: z.object({
+        opportunityId: z
+          .string()
+          .describe("Opportunity UUID to list linked notes for"),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(
+            `Soft per-call floor (1..${MAX_LIST_CAP}) for the noteTargets page`,
+          ),
+      }),
+      execute: async (
+        args: { opportunityId: string; limit: number },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const opportunityId = validateUuid(args.opportunityId);
+        if (!opportunityId) {
+          throw new Error("Invalid opportunityId (must be a UUID)");
+        }
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          // Resolve the opp's note links via the noteTargets join.
+          const page = await listFiltered(
+            cfg,
+            "noteTargets",
+            [`targetOpportunityId[eq]:${encodeURIComponent(opportunityId)}`],
+            cap,
+            LIST_ORDER,
+          );
+          // Collect + dedup the linked note ids from the join records.
+          const noteIds: string[] = [];
+          const seen = new Set<string>();
+          for (const t of page.items) {
+            const nid = t.noteId != null ? String(t.noteId) : "";
+            if (nid && !seen.has(nid)) {
+              seen.add(nid);
+              noteIds.push(nid);
+            }
+          }
+          // Read each linked Note, mapped body-FREE (mapNoteView, SR-1). A
+          // deleted/absent note is skipped (getByIdOrNull => null).
+          const items = [];
+          for (const nid of noteIds) {
+            const note = await getByIdOrNull(cfg, `/rest/notes/${nid}`, "note");
+            if (note) items.push(mapNoteView(note));
+          }
+          const retrievedAt = new Date().toISOString();
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            count: items.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            filter: { opportunityId },
+            items,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "noteList",
+            `note-list-opp-${opportunityId}`,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    getNoteBody: {
+      description:
+        "SR-1 EXCEPTION — reads ONE Note's body (bodyV2.markdown) across the privacy boundary that listNotes/mapNoteView deliberately withhold. confirm:true REQUIRED as an explicit acknowledgement that this crosses the note-body privacy boundary (NOT a mutation gate). noteId must be a UUID. Result is delivered via a SHORT-TTL (3d) noteBodyRead snapshot — read data.latest('noteBodyRead','note-body-<id>').attributes.body; the body is PII-at-rest bounded by that TTL. 404 => found:false. found:true with no markdown (blocknote-only/empty) => bodyMissing:true, no body. Title is emitted verbatim here (the listNotes title guard does not apply to this gated method). Discover the noteId first via listNotes (leadId-tagged) or listNotesByOpportunity.",
+      arguments: z.object({
+        noteId: z.string().describe("Note UUID to read the body of"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Must be true — explicit acknowledgement that this READS a note body across the SR-1 privacy boundary (note bodies are withheld everywhere else). Not a mutation gate.",
+          ),
+      }),
+      execute: async (
+        args: { noteId: string; confirm: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to read a note body without confirm:true — this crosses the SR-1 privacy boundary (note bodies are withheld by default); pass confirm:true to acknowledge the deliberate cross-boundary read",
+          );
+        }
+        const noteId = validateUuid(args.noteId);
+        if (!noteId) throw new Error("Invalid noteId (must be a UUID)");
+        try {
+          const note = await getByIdOrNull(
+            cfg,
+            `/rest/notes/${noteId}`,
+            "note",
+          );
+          const retrievedAt = new Date().toISOString();
+          // Explicit field-by-field allowlist (never a raw-record spread) so no
+          // future Note custom field rides into the persisted body snapshot.
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            found: Boolean(note),
+            retrievedAt,
+          };
+          if (note) {
+            snap.id = String(note.id ?? noteId);
+            if (note.leadId != null && note.leadId !== "") {
+              snap.leadId = String(note.leadId);
+            }
+            if (note.title != null && note.title !== "") {
+              snap.title = String(note.title);
+            }
+            const md =
+              (note.bodyV2 as { markdown?: unknown } | null | undefined)
+                ?.markdown;
+            if (typeof md === "string" && md.length) snap.body = md;
+            else snap.bodyMissing = true;
+            if (note.createdAt) snap.createdAt = String(note.createdAt);
+            if (note.updatedAt) snap.updatedAt = String(note.updatedAt);
+          }
+          const handle = await context.writeResource(
+            "noteBodyRead",
+            `note-body-${noteId}`,
             snap,
           );
           return { dataHandles: [handle] };

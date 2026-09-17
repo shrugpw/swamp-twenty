@@ -2,6 +2,31 @@
 
 All notable changes to `@shrug/twenty`. Versions are CalVer (`YYYY.MM.DD.micro`).
 
+## 2026.09.16.4
+
+### Added
+
+- **`getNoteBody(noteId, confirm=true)`** (`TWENTY-NOTE-BODY-READ`) — a **narrow,
+  sanctioned exception to the SR-1 note-body privacy boundary**. `listNotes` /
+  `mapNoteView` still NEVER return a body; this is the *only* body path, and it is
+  deliberately gated:
+  - `confirm:true` is REQUIRED — an explicit acknowledgement that the call reads a
+    note body across the privacy boundary (NOT a mutation gate). Without it, the
+    call refuses.
+  - `noteId` must be a UUID (validated pre-I/O). `404 ⇒ found:false`; found with no
+    markdown (blocknote-only/empty) ⇒ `bodyMissing:true`, no body.
+  - The body (`bodyV2.markdown`, verbatim) is delivered via a **short-TTL (`3d`)**
+    `noteBodyRead` snapshot (`data.latest("noteBodyRead", "note-body-<id>")`) — the
+    TTL is the PII-at-rest bound. The note title is emitted verbatim on this gated
+    method only (the `listNotes` title guard is unaffected).
+- **`listNotesByOpportunity(opportunityId)`** — a **body-free** discovery read over
+  the `noteTargets` join, returning compact `mapNoteView` views (SR-1 preserved) so
+  callers can find a `noteId` to feed `getNoteBody` even when a note isn't
+  `leadId`-tagged. Records a `noteList` snapshot (`note-list-opp-<id>`).
+
+Additive methods + one new short-TTL resource + a `NoteListSchema.filter.opportunityId`;
+`globalArguments` unchanged (no-op attribute migration).
+
 ## 2026.09.16.3
 
 ### Added

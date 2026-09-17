@@ -160,10 +160,19 @@ make an API call.
 | `push_leads`             | write¹  | The fan-out lead sink (see above).                                         |
 | `upsertOpportunity`      | write¹  | Idempotent (on `leadId`) Opportunity create-or-update with the full field set — see [upsertOpportunity fields](#upsertopportunity-fields). |
 | `upsertRecord`           | write¹  | Generic idempotent create-or-update for an allowlisted custom object (`subscription`, `channelPartner`), keyed on a scalar natural-key field. |
+| `listNotesByOpportunity` | read    | Body-free discovery of the Notes linked to an Opportunity (via `noteTargets`) — compact views only, NO body (SR-1 preserved). Finds a `noteId` for `getNoteBody`. |
+| `getNoteBody`            | read²   | **SR-1 exception** — reads ONE Note's body (`bodyV2.markdown`) across the privacy boundary that every other method withholds. Per-id, `confirm=true`-gated, short-TTL snapshot. |
 
 ¹ Confirm-gated (`confirm=true`), and guarded by a live reachability pre-flight
 check. `push_leads`, `upsertOpportunity`, and `upsertRecord` also support
 `dryRun=true` for a no-write plan.
+
+² `getNoteBody` is a **read**, but requires `confirm=true` as an explicit
+acknowledgement that it crosses the SR-1 note-body privacy boundary (bodies are
+withheld by every other method). It returns the body to a **short-TTL (`3d`)**
+`noteBodyRead` snapshot. Per-id gating bounds a single call — not a scripted
+`listNotes`→`getNoteBody` loop, which can still reconstruct a bulk read one
+audited call at a time.
 
 ### upsertOpportunity fields
 

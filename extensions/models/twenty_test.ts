@@ -2234,6 +2234,209 @@ Deno.test("OpportunityUpsertSchema/OppViewSchema/OpportunityRefSchema round-trip
   assertEquals(r.channelPartnerId, CP_UUID);
 });
 
+// --- getNoteBody + listNotesByOpportunity (TWENTY-NOTE-BODY-READ) -----------
+
+const NOTE_UUID = "22222222-2222-2222-2222-222222222222";
+const OPP_UUID = "33333333-3333-3333-3333-333333333333";
+
+Deno.test("getNoteBody refuses without confirm:true (SR-1 boundary, before any I/O)", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.getNoteBody.execute(
+          { noteId: NOTE_UUID, confirm: false } as never,
+          ctx as never,
+        ),
+      Error,
+      "confirm:true",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getNoteBody rejects a non-UUID noteId (with confirm) before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.getNoteBody.execute(
+          { noteId: "not-a-uuid", confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid noteId",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getNoteBody returns the body + title (verbatim) on a hit", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/notes/")) {
+      return {
+        data: {
+          note: {
+            id: NOTE_UUID,
+            leadId: "L1",
+            title: "My private note",
+            bodyV2: { markdown: "secret **body** text" },
+            createdAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getNoteBody.execute(
+      { noteId: NOTE_UUID, confirm: true } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "noteBodyRead");
+    assert(snap, "expected a noteBodyRead snapshot");
+    assertEquals(snap!.name, `note-body-${NOTE_UUID}`);
+    assertEquals(snap!.data.found, true);
+    assertEquals(snap!.data.body, "secret **body** text");
+    // Title is verbatim here (the SR-1 listNotes title guard does NOT apply).
+    assertEquals(snap!.data.title, "My private note");
+    assertEquals(snap!.data.leadId, "L1");
+    assertEquals("bodyMissing" in snap!.data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getNoteBody: found but no markdown => bodyMissing, no body", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/notes/")) {
+      return { data: { note: { id: NOTE_UUID, bodyV2: null } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getNoteBody.execute(
+      { noteId: NOTE_UUID, confirm: true } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "noteBodyRead");
+    assert(snap, "expected snapshot");
+    assertEquals(snap!.data.found, true);
+    assertEquals(snap!.data.bodyMissing, true);
+    assertEquals("body" in snap!.data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getNoteBody: 404 => found:false, no body, no throw", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/notes/")) {
+      return { status: 404, body: { messages: ["not found"] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getNoteBody.execute(
+      { noteId: NOTE_UUID, confirm: true } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "noteBodyRead");
+    assert(snap, "expected snapshot");
+    assertEquals(snap!.data.found, false);
+    assertEquals("body" in snap!.data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listNotesByOpportunity resolves noteTargets => body-free note views", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return {
+        data: {
+          noteTargets: [
+            { id: "nt1", noteId: "n1" },
+            { id: "nt2", noteId: "n2" },
+          ],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/notes/n1")) {
+      return {
+        data: {
+          note: {
+            id: "n1",
+            leadId: "L1",
+            title: "Inbound lead L1",
+            bodyV2: { markdown: "should NOT surface" },
+          },
+        },
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/notes/n2")) {
+      return { data: { note: { id: "n2", title: "hand-authored" } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listNotesByOpportunity.execute(
+      { opportunityId: OPP_UUID, limit: 60 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "noteList");
+    assert(snap, "expected a noteList snapshot");
+    assertEquals(snap!.name, `note-list-opp-${OPP_UUID}`);
+    assertEquals(snap!.data.count, 2);
+    const items = snap!.data.items as Array<Record<string, unknown>>;
+    // Body-free (SR-1): no item carries a body.
+    assert(items.every((it) => !("body" in it)));
+    assertEquals(items.map((it) => it.id), ["n1", "n2"]);
+    // mapNoteView title guard applies here: only the machine 'Inbound lead' title surfaces.
+    assertEquals(items[0].title, "Inbound lead L1");
+    assertEquals("title" in items[1], false);
+    // Queried noteTargets by the opportunity FK.
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/noteTargets") &&
+        c.path.includes("targetOpportunityId")
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listNotesByOpportunity rejects a non-UUID opportunityId before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.listNotesByOpportunity.execute(
+          { opportunityId: "nope", limit: 60 } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid opportunityId",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
 // --- Read surface (TWENTY-READ-SURFACE) -------------------------------------
 
 Deno.test("validateUuid accepts a UUID, rejects junk / path-injection", () => {
