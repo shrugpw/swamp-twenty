@@ -191,7 +191,7 @@ the live workspace metadata, exactly like `stage`):
 | `qualStatus`     | SELECT | Technical-qualification state. Validated against the live `opportunity.qualStatus` enum.        |
 | `offering`       | SELECT | Offering segmentation (`MANAGED`/`SUBSTRATE`/`PROJECT`/`RETAINER`/`LOCAL_IT`/`PEERING`). Validated against the live `opportunity.offering` enum; provisioned via `ensureOpportunitySegmentation`. |
 | `channelPartnerId` | RELATION | Link to a `channelPartner` record (marketplace attribution). A UUID, validated early; sets the `opportunity.channelPartner` FK. Takes precedence over `channelPartnerName`. |
-| `channelPartnerName` | (resolver) | Resolve-and-link a `channelPartner` by name (link-only, e.g. `Braintrust`/`Upwork`) when `channelPartnerId` is unset; no match ⇒ recorded as skipped, never created. |
+| `channelPartnerName` | (resolver) | Resolve-and-link a `channelPartner` by name (link-only, e.g. `Globex`/`Initech`) when `channelPartnerId` is unset; no match ⇒ recorded as skipped, never created. |
 
 An empty string for any of these means **leave unchanged** (not "clear").
 

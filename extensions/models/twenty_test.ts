@@ -1106,7 +1106,7 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on create", as
       {
         leadId: "shrug-net-example-2026",
         name: "Provider Deal",
-        asn: "as64249", // lowercase input => uppercased on store
+        asn: "as64496", // lowercase input => uppercased on store
         qualStatus: "TECH_QUALIFICATION_NEEDED",
         closeDate: "",
         companyName: "",
@@ -1122,7 +1122,7 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on create", as
     const post = calls.find((c) => c.method === "POST");
     assert(post, "expected a POST to create the opportunity");
     const body = post!.body as Record<string, unknown>;
-    assertEquals(body.asn, "AS64249");
+    assertEquals(body.asn, "AS64496");
     assertEquals(body.qualStatus, "TECH_QUALIFICATION_NEEDED");
   } finally {
     restore();
@@ -1179,7 +1179,7 @@ Deno.test("upsertOpportunity rejects a malformed asn (^AS<digits>$ guard)", asyn
     for (
       const bad of [
         "64249",
-        "AS64249; DROP",
+        "AS64496; DROP",
         "ASN-64249",
         "AS",
         "AS12345678901",
@@ -1465,7 +1465,7 @@ Deno.test("OpportunityUpsertSchema round-trips asn/qualStatus/customFields (F6 n
     leadId: "L1",
     name: "X",
     stage: "NEW",
-    asn: "AS64249",
+    asn: "AS64496",
     qualStatus: "FUTURE",
     customFields: { region: "us-east", tier: "PRIORITY" },
     companyLinked: false,
@@ -1474,7 +1474,7 @@ Deno.test("OpportunityUpsertSchema round-trips asn/qualStatus/customFields (F6 n
   });
   // If a field had been omitted from the schema, zod would strip it here and
   // read-back verification would silently pass on a value that never persisted.
-  assertEquals(parsed.asn, "AS64249");
+  assertEquals(parsed.asn, "AS64496");
   assertEquals(parsed.qualStatus, "FUTURE");
   assertEquals(parsed.customFields, { region: "us-east", tier: "PRIORITY" });
 });
@@ -1517,7 +1517,7 @@ Deno.test("upsertOpportunity opportunityUpsert snapshot carries asn/qualStatus/c
       {
         leadId: "snap-2026",
         name: "Snap",
-        asn: "AS64249",
+        asn: "AS64496",
         qualStatus: "FUTURE",
         customFields: { region: "us-east" },
         closeDate: "",
@@ -1533,7 +1533,7 @@ Deno.test("upsertOpportunity opportunityUpsert snapshot carries asn/qualStatus/c
     );
     const snap = writes.find((w) => w.type === "opportunityUpsert");
     assert(snap, "expected an opportunityUpsert snapshot write");
-    assertEquals(snap!.data.asn, "AS64249");
+    assertEquals(snap!.data.asn, "AS64496");
     assertEquals(snap!.data.qualStatus, "FUTURE");
     assertEquals(snap!.data.customFields, { region: "us-east" });
   } finally {
@@ -1557,7 +1557,7 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on the UPDATE 
       {
         leadId: "asn-update-2026",
         name: "Upd",
-        asn: "as64249",
+        asn: "as64496",
         qualStatus: "CONTACT_IDENTIFIED",
         closeDate: "",
         companyName: "",
@@ -1573,7 +1573,7 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on the UPDATE 
     const patch = calls.find((c) => c.method === "PATCH");
     assert(patch, "expected a PATCH");
     const body = patch!.body as Record<string, unknown>;
-    assertEquals(body.asn, "AS64249");
+    assertEquals(body.asn, "AS64496");
     assertEquals(body.qualStatus, "CONTACT_IDENTIFIED");
   } finally {
     restore();
@@ -1944,7 +1944,7 @@ Deno.test("upsertOpportunity resolves channelPartnerName -> id (link-only)", asy
   const { calls, restore } = stubTwentyFetch((method, path) => {
     if (path.startsWith("/rest/metadata/objects")) return OPP_META;
     if (method === "GET" && path.startsWith("/rest/channelPartners")) {
-      return { data: { channelPartners: [{ id: "cp-braintrust" }] } };
+      return { data: { channelPartners: [{ id: "cp-globex" }] } };
     }
     if (method === "GET" && path.startsWith("/rest/opportunities")) {
       return { data: { opportunities: [] } };
@@ -1958,8 +1958,8 @@ Deno.test("upsertOpportunity resolves channelPartnerName -> id (link-only)", asy
     await model.methods.upsertOpportunity.execute(
       {
         leadId: "cp-name-2026",
-        name: "Braintrust Deal",
-        channelPartnerName: "Braintrust",
+        name: "Globex Deal",
+        channelPartnerName: "Globex",
         closeDate: "",
         companyName: "",
         companyDomain: "",
@@ -1975,13 +1975,13 @@ Deno.test("upsertOpportunity resolves channelPartnerName -> id (link-only)", asy
     assert(post, "expected a POST");
     assertEquals(
       (post!.body as Record<string, unknown>).channelPartnerId,
-      "cp-braintrust",
+      "cp-globex",
     );
     // Queried the name filter.
     assert(
       calls.some((c) =>
         c.path.startsWith("/rest/channelPartners") &&
-        c.path.includes("Braintrust")
+        c.path.includes("Globex")
       ),
     );
   } finally {
@@ -2055,7 +2055,7 @@ Deno.test("upsertOpportunity: channelPartnerId wins over channelPartnerName (no 
         leadId: "cp-both-2026",
         name: "Both Partner",
         channelPartnerId: CP_UUID,
-        channelPartnerName: "Braintrust",
+        channelPartnerName: "Globex",
         closeDate: "",
         companyName: "",
         companyDomain: "",
@@ -2476,7 +2476,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
     channelPartnerId: "cp1",
     lineOfBusiness: "HOSTING",
     sourceChannel: "REFERRAL",
-    asn: "AS64249",
+    asn: "AS64496",
     qualStatus: "TECH_QUALIFICATION_NEEDED",
     offering: "SUBSTRATE",
     isEmergency: false,
@@ -2488,7 +2488,7 @@ Deno.test("mapOppView extracts the compact view incl. micros->units", () => {
   // Custom/segmentation SELECTs surfaced from flat scalars; isEmergency even when false.
   assertEquals(v.lineOfBusiness, "HOSTING");
   assertEquals(v.sourceChannel, "REFERRAL");
-  assertEquals(v.asn, "AS64249");
+  assertEquals(v.asn, "AS64496");
   assertEquals(v.qualStatus, "TECH_QUALIFICATION_NEEDED");
   assertEquals(v.offering, "SUBSTRATE");
   assertEquals(v.channelPartnerId, "cp1");

@@ -5208,7 +5208,7 @@ export const model = {
           .string()
           .optional()
           .describe(
-            "Autonomous System Number (TEXT), e.g. AS64249. Format-guarded to ^AS<digits>$ (case-insensitive input, uppercased on store); a non-empty value not matching is rejected. Omitted / empty => left unchanged on both create and update (never nulled).",
+            "Autonomous System Number (TEXT), e.g. AS64496. Format-guarded to ^AS<digits>$ (case-insensitive input, uppercased on store); a non-empty value not matching is rejected. Omitted / empty => left unchanged on both create and update (never nulled).",
           ),
         qualStatus: z
           .string()
@@ -5262,7 +5262,7 @@ export const model = {
           .string()
           .default("")
           .describe(
-            "channelPartner name to resolve-and-link (link-only; channelPartner is keyed by name, e.g. 'Braintrust'/'Upwork'). Used only when channelPartnerId is unset. A name with no match records channelPartnerSkipped and leaves the link unchanged — never creates a partner.",
+            "channelPartner name to resolve-and-link (link-only; channelPartner is keyed by name, e.g. 'Globex'/'Initech'). Used only when channelPartnerId is unset. A name with no match records channelPartnerSkipped and leaves the link unchanged — never creates a partner.",
           ),
         isEmergency: z
           .boolean()
@@ -5479,7 +5479,7 @@ export const model = {
               const up = rawAsn.toUpperCase();
               if (!/^AS\d{1,10}$/.test(up)) {
                 throw new Error(
-                  `Invalid asn '${rawAsn}': expected AS followed by 1-10 digits (e.g. AS64249), or empty to leave unchanged`,
+                  `Invalid asn '${rawAsn}': expected AS followed by 1-10 digits (e.g. AS64496), or empty to leave unchanged`,
                 );
               }
               asn = up;

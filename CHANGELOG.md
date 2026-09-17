@@ -38,7 +38,7 @@ Additive methods + one new short-TTL resource + a `NoteListSchema.filter.opportu
     pre-write even under `dryRun`); sets the FK directly like `companyId`. Empty /
     omitted ⇒ left unchanged (never nulled).
   - **`channelPartnerName`** — resolve-and-link by name (link-only; `channelPartner`
-    is keyed by `name`, e.g. `Braintrust`/`Upwork`), so `crm-opps-sync` needn't
+    is keyed by `name`, e.g. `Globex`/`Initech`), so `crm-opps-sync` needn't
     hardcode UUIDs. Used only when `channelPartnerId` is unset; a name with no match
     records `channelPartnerSkipped` and leaves the link unchanged — never creates a
     partner.
