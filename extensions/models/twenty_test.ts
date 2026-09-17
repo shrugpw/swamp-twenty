@@ -2119,6 +2119,91 @@ Deno.test("upsertOpportunity: customFields.channelPartnerId is rejected (reserve
   }
 });
 
+Deno.test("upsertOpportunity writes channelPartnerId on the UPDATE (PATCH) path", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-update-2026",
+        name: "Partner Update",
+        channelPartnerId: CP_UUID,
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        channelPartnerName: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    assertEquals(
+      (patch!.body as Record<string, unknown>).channelPartnerId,
+      CP_UUID,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertOpportunity: empty channelPartnerId/Name omitted from body (never nulled), update path", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return OPP_META;
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [{ id: "opp1", stage: "PROPOSAL" }] } };
+    }
+    if (method === "PATCH") {
+      return { data: { updateOpportunity: { id: "opp1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.upsertOpportunity.execute(
+      {
+        leadId: "cp-empty-2026",
+        name: "Empty Partner",
+        channelPartnerId: "",
+        channelPartnerName: "",
+        closeDate: "",
+        companyName: "",
+        companyDomain: "",
+        pointOfContactName: "",
+        pointOfContactEmail: "",
+        noteBody: "",
+        confirm: true,
+        dryRun: false,
+      } as never,
+      UPSERT_CTX as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    assertEquals(
+      "channelPartnerId" in (patch!.body as Record<string, unknown>),
+      false,
+    );
+    // Empty name => no channelPartners lookup either.
+    assertEquals(
+      calls.some((c) => c.path.startsWith("/rest/channelPartners")),
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
 Deno.test("OpportunityUpsertSchema/OppViewSchema/OpportunityRefSchema round-trip channelPartnerId (no strip)", () => {
   const u = OpportunityUpsertSchema.parse({
     baseUrl: "b",
