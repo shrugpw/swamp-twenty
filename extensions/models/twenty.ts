@@ -215,6 +215,44 @@ export async function twentyGraphQL(
   return json.data ?? {};
 }
 
+/**
+ * Raw authed GET that never throws — returns the status + parsed body so a probe
+ * can CLASSIFY the outcome (2xx reachable / 404 endpoint-absent / 401-403
+ * forbidden / 4xx other), which twentyRequest's throw-on-non-2xx can't express.
+ * Used by listViews (TWENTY-VIEW-MGMT) to resolve which view endpoint is live and
+ * whether the token's role can even see views. Read-only.
+ */
+export async function rawGet(
+  cfg: TwentyCfg,
+  path: string,
+): Promise<{ status: number; ok: boolean; body: unknown }> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const resp = await fetch(`${base}${path}`, {
+    headers: {
+      "Authorization": `Bearer ${cfg.apiToken}`,
+      "Accept": "application/json",
+    },
+  });
+  const text = await resp.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text.slice(0, 200);
+  }
+  return { status: resp.status, ok: resp.ok, body };
+}
+
+/** Classify a probe status into a coarse reachability verdict. */
+export function classifyProbe(
+  status: number,
+): "ok" | "absent" | "forbidden" | "error" {
+  if (status >= 200 && status < 300) return "ok";
+  if (status === 404) return "absent";
+  if (status === 401 || status === 403) return "forbidden";
+  return "error";
+}
+
 /** Extract a list from a Twenty REST list response (`{data:{<plural>:[...]}}`). */
 function unwrapList(
   json: unknown,
@@ -2447,6 +2485,89 @@ export async function fetchObjectsMeta(
 }
 
 /**
+ * Page a metadata collection (`/rest/metadata/<object>`) fully — envelope is
+ * `{data:[...], pageInfo}`, cursor-paginated exactly like /rest/metadata/objects.
+ * Used for views + viewFilters (TWENTY-VIEW-MGMT). Read-only; throws on a non-2xx
+ * (a caller that wants classification should rawGet-probe first).
+ */
+export async function fetchMetadataList(
+  cfg: TwentyCfg,
+  object: string,
+): Promise<Array<Record<string, unknown>>> {
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 50; page++) {
+    const pageCursor = cursor;
+    const path = `/rest/metadata/${object}?limit=${PAGE_SIZE}` +
+      (pageCursor ? `&starting_after=${encodeURIComponent(pageCursor)}` : "");
+    const json = await twentyRequest(cfg, "GET", path);
+    const batch = ((json as { data?: unknown }).data ?? []) as Array<
+      Record<string, unknown>
+    >;
+    let fresh = 0;
+    for (const rec of Array.isArray(batch) ? batch : []) {
+      const id = String(rec.id ?? "");
+      if (id && seen.has(id)) continue;
+      if (id) seen.add(id);
+      fresh++;
+      out.push(rec);
+    }
+    const pageInfo = (json as {
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    }).pageInfo;
+    if (!pageInfo?.hasNextPage) break;
+    const endCursor = pageInfo.endCursor;
+    if (!endCursor || endCursor === pageCursor || fresh === 0) break;
+    cursor = endCursor;
+  }
+  return out;
+}
+
+/**
+ * Resolve the Opportunity objectMetadataId and the live metadata (id + option
+ * tokens) for the fields the target views filter on. Shared by listViews (probe)
+ * and ensureOpportunityViews (write): both bind filters to a live fieldMetadataId
+ * (F6) and rebuild the value allowlist from the live options (S1). Best-effort —
+ * returns whatever resolves; callers fail-closed per field on a missing id.
+ */
+export async function resolveOpportunityFilterFields(
+  cfg: TwentyCfg,
+  fieldNames: string[] = ["stage", "lineOfBusiness"],
+): Promise<{
+  oppOid?: string;
+  fields: Record<
+    string,
+    { fieldMetadataId?: string; type?: string; options: string[] }
+  >;
+}> {
+  const fields: Record<
+    string,
+    { fieldMetadataId?: string; type?: string; options: string[] }
+  > = {};
+  let oppOid: string | undefined;
+  const objs = await fetchObjectsMeta(cfg);
+  const opp = objs.find((o) => String(o.nameSingular) === "opportunity");
+  if (opp?.id) oppOid = String(opp.id);
+  const fieldList = (opp?.fields ?? []) as Array<Record<string, unknown>>;
+  for (const fname of fieldNames) {
+    const f = (Array.isArray(fieldList) ? fieldList : []).find(
+      (x) => String(x.name ?? "") === fname,
+    );
+    if (!f) continue;
+    const opts = (f.options ?? []) as Array<Record<string, unknown>>;
+    fields[fname] = {
+      fieldMetadataId: f.id ? String(f.id) : undefined,
+      type: f.type != null ? String(f.type) : undefined,
+      options: Array.isArray(opts)
+        ? opts.map((o) => String(o.value ?? "")).filter(Boolean)
+        : [],
+    };
+  }
+  return { oppOid, fields };
+}
+
+/**
  * Idempotently ensure ONE field exists on an object via the metadata API — the
  * shared core behind both ensureField (single, throws) and ensureLeadFields
  * (fan-out, swallows per-field errors into a report). Non-destructive:
@@ -3123,6 +3244,300 @@ export const OppAggregatesSchema = z.object({
       .describe("Server micros sum vs in-extension raw micros sum"),
     detail: z.string().optional(),
   }),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- View listing / probe snapshot (TWENTY-VIEW-MGMT Phase 0) ---------------
+
+/**
+ * Snapshot from listViews: the read-only Phase-0 probe. Records which view
+ * endpoint answered (and how each candidate classified), the opportunity views
+ * found, and a capped raw sample for live shape-discovery (lock flag +
+ * viewFilter shape) before any write method is authored.
+ */
+export const ViewListSchema = z.object({
+  baseUrl: z.string(),
+  probes: z.array(z.object({
+    path: z.string(),
+    status: z.number(),
+    verdict: z.enum(["ok", "absent", "forbidden", "error"]),
+    count: z.number().optional(),
+    bodySample: z.string().optional(),
+  })),
+  readPath: z.string().optional(),
+  writeEndpointCandidate: z.string().optional(),
+  opportunityObjectMetadataId: z.string().optional(),
+  viewCount: z.number(),
+  opportunityViews: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    type: z.string().optional(),
+    key: z.string().nullable().optional(),
+    isSystemSideEffect: z.boolean().optional(),
+    position: z.number().optional(),
+    objectMetadataId: z.string().optional(),
+    filters: z.array(z.object({
+      id: z.string(),
+      fieldMetadataId: z.string().optional(),
+      operand: z.string().optional(),
+      value: z.unknown().optional(),
+      subFieldName: z.string().nullable().optional(),
+      viewFilterGroupId: z.string().nullable().optional(),
+    })).optional(),
+  })),
+  /** Human-readable note on which field marks the locked/default index view. */
+  lockFlagObserved: z.string().optional(),
+  /**
+   * Live field metadata for the fields the target views filter on (stage,
+   * lineOfBusiness): resolved fieldMetadataId + the current option token set
+   * (S1 allowlist source) + which target options are covered (A5 dependency
+   * assert). Absent if the field metadata read failed.
+   */
+  filterFields: z.record(
+    z.string(),
+    z.object({
+      fieldMetadataId: z.string().optional(),
+      type: z.string().optional(),
+      options: z.array(z.string()),
+    }),
+  ).optional(),
+  /** Live stage options NOT covered by the Sales-pipeline open-stage set (A5 drift). */
+  uncoveredStageOptions: z.array(z.string()).optional(),
+  sample: z.string().optional(),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Opportunity view management (TWENTY-VIEW-MGMT) --------------------------
+
+/**
+ * Target opportunity view set (re-scoped spec 2026-09-17). Each is a single
+ * `IS`-any-of filter on one SELECT field, binding only to live enum tokens
+ * (asserted present per run — A5). Sales Pipeline enumerates the OPEN stages
+ * positively (A1/A2) so won/terminal/parked/legacy stages are structurally
+ * excluded. `field` resolves to a live fieldMetadataId per run (F6); the value
+ * allowlist is intersected with the live option set each run (S1).
+ */
+export const OPP_VIEW_TARGETS: ReadonlyArray<
+  { name: string; field: "stage" | "lineOfBusiness"; values: readonly string[] }
+> = [
+  {
+    name: "Sales Pipeline",
+    field: "stage",
+    values: ["NEW", "SCREENING", "MEETING", "PROPOSAL"],
+  },
+  { name: "Consulting", field: "lineOfBusiness", values: ["CONSULTING"] },
+  { name: "Hosting", field: "lineOfBusiness", values: ["HOSTING"] },
+  { name: "Local IT", field: "lineOfBusiness", values: ["LOCAL_IT"] },
+];
+
+// Only the known target names may ever be minted — a typo/injection can't create
+// an arbitrary view (F10). Rebuilt from the target set, never appended live.
+const OPP_VIEW_NAME_ALLOWLIST: ReadonlySet<string> = new Set(
+  OPP_VIEW_TARGETS.map((t) => t.name),
+);
+
+/**
+ * Stored form of a Twenty viewFilter `value` for an `IS`-any-of SELECT filter: a
+ * JSON array of option tokens (matches the UI-created reference filter captured
+ * in Phase 0, e.g. `["CUSTOMER"]`). Centralised so the write form is ONE point of
+ * control if the confirm-gated first write shows Twenty wants the stringified
+ * variant `"[\"CUSTOMER\"]"` instead (the other form also observed live — F5/A4).
+ */
+export function buildViewFilterValue(values: readonly string[]): string[] {
+  return [...values];
+}
+
+/**
+ * Normalise a viewFilter `value` — observed live as EITHER a real JSON array
+ * (`["CUSTOMER"]`) OR a stringified array (`"[\"NETWORK_PROVIDER\"]"`) — to a
+ * token array, so an existing filter can be compared to the desired set
+ * regardless of how it was stored.
+ */
+export function normalizeFilterValueTokens(value: unknown): string[] {
+  let v = value;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (s.startsWith("[")) {
+      try {
+        v = JSON.parse(s);
+      } catch {
+        return s ? [s] : [];
+      }
+    } else {
+      return s ? [s] : [];
+    }
+  }
+  if (Array.isArray(v)) return v.map((x) => String(x)).filter(Boolean);
+  return v == null ? [] : [String(v)];
+}
+
+export interface OppViewFilterRef {
+  id?: string;
+  fieldMetadataId?: string;
+  operand?: string;
+  value?: unknown;
+}
+export interface OppViewRef {
+  id: string;
+  name: string;
+  key?: string | null;
+  isSystemSideEffect?: boolean;
+  isCustom?: boolean;
+  objectMetadataId?: string;
+  filters?: OppViewFilterRef[];
+}
+export interface OppViewPlan {
+  target: string;
+  field: string;
+  fieldMetadataId?: string;
+  desiredValues: string[];
+  operand: "IS";
+  action: "create" | "noop" | "refuse";
+  reason: string;
+  viewId?: string;
+}
+
+function setEq(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sb = new Set(b);
+  return a.every((x) => sb.has(x));
+}
+
+/**
+ * Pure planner for ONE target opportunity view. Fail-closed and NON-MUTATING by
+ * construction: it only ever plans a CREATE (name absent) or a NO-OP (present +
+ * filter already matches desired); every other case is a REFUSE with a reason. It
+ * never plans a mutation of a pre-existing view — this API surface exposes no
+ * writable swamp-authorship marker on a view, and a method cannot read prior
+ * swamp state to prove it authored one, so reconciling a same-named drifted view
+ * cannot be done without risking a user's view (F3/A6). Callers surface refusals
+ * for a human to resolve.
+ */
+export function planOpportunityView(
+  target: { name: string; field: string; values: readonly string[] },
+  fieldMeta: { fieldMetadataId?: string; options: string[] } | undefined,
+  existingViews: OppViewRef[],
+): OppViewPlan {
+  const base = {
+    target: target.name,
+    field: target.field,
+    desiredValues: [] as string[],
+    operand: "IS" as const,
+  };
+  // Defense-in-depth: only known target names may be minted (F10).
+  if (!OPP_VIEW_NAME_ALLOWLIST.has(target.name)) {
+    return {
+      ...base,
+      action: "refuse",
+      reason: `view name '${target.name}' is not in the target allowlist`,
+    };
+  }
+  const fieldMetadataId = fieldMeta?.fieldMetadataId;
+  if (!fieldMetadataId) {
+    return {
+      ...base,
+      action: "refuse",
+      reason:
+        `field '${target.field}' has no resolvable fieldMetadataId in live schema (F6)`,
+    };
+  }
+  // S1: allowlist rebuilt from live options each run; A5: every target option
+  // must be present live — fail-closed on any absent/invalid token.
+  const liveOpts = new Set(fieldMeta?.options ?? []);
+  const missing = target.values.filter(
+    (v) => !STAGE_OPTION_VALUE_RE.test(v) || !liveOpts.has(v),
+  );
+  if (missing.length) {
+    return {
+      ...base,
+      fieldMetadataId,
+      action: "refuse",
+      reason: `target option(s) [${
+        missing.join(", ")
+      }] absent from live '${target.field}' schema — fail-closed (A5/S1)`,
+    };
+  }
+  const desiredValues = [...target.values];
+  const withFilter = { ...base, fieldMetadataId, desiredValues };
+  const matches = existingViews.filter((v) => v.name === target.name);
+  // F2: never touch a locked / system / default (INDEX) view.
+  const locked = matches.find(
+    (v) =>
+      (v.key != null && v.key !== "") || v.isSystemSideEffect === true ||
+      v.isCustom === false,
+  );
+  if (locked) {
+    return {
+      ...withFilter,
+      action: "refuse",
+      reason: `a view named '${target.name}' is locked/system (key=${
+        JSON.stringify(locked.key)
+      }, isSystemSideEffect=${locked.isSystemSideEffect}, isCustom=${locked.isCustom}) — never mutate (F2)`,
+      viewId: locked.id,
+    };
+  }
+  if (matches.length === 0) {
+    return {
+      ...withFilter,
+      action: "create",
+      reason: "no opportunity view with this name — create",
+    };
+  }
+  if (matches.length > 1) {
+    return {
+      ...withFilter,
+      action: "refuse",
+      reason:
+        `${matches.length} opportunity views named '${target.name}' — ambiguous, fail-closed (A6)`,
+      viewId: matches[0].id,
+    };
+  }
+  const view = matches[0];
+  const filters = view.filters ?? [];
+  const alreadyDesired = filters.length === 1 &&
+    filters[0].fieldMetadataId === fieldMetadataId &&
+    String(filters[0].operand ?? "") === "IS" &&
+    setEq(normalizeFilterValueTokens(filters[0].value), desiredValues);
+  if (alreadyDesired) {
+    return {
+      ...withFilter,
+      action: "noop",
+      reason: "view exists with the desired filter — no change",
+      viewId: view.id,
+    };
+  }
+  return {
+    ...withFilter,
+    action: "refuse",
+    reason:
+      `view '${target.name}' exists but its filter differs from desired; not mutating a pre-existing view (no swamp-authorship marker on this API surface — F3/A6). Rename or delete it, or adopt manually.`,
+    viewId: view.id,
+  };
+}
+
+/**
+ * Snapshot from ensureOpportunityViews: the per-target plan/outcome for the
+ * gated view-write. dryRun (default) records the plan; confirm executes creates.
+ */
+export const ViewEnsuredSchema = z.object({
+  baseUrl: z.string(),
+  dryRun: z.boolean(),
+  confirm: z.boolean(),
+  reachable: z.boolean(),
+  objectMetadataId: z.string().optional(),
+  results: z.array(z.object({
+    target: z.string(),
+    field: z.string(),
+    fieldMetadataId: z.string().optional(),
+    desiredValues: z.array(z.string()),
+    operand: z.string(),
+    action: z.enum(["create", "noop", "refuse", "created", "failed"]),
+    reason: z.string(),
+    viewId: z.string().optional(),
+    error: z.string().optional(),
+  })),
+  createdCount: z.number(),
+  refusedCount: z.number(),
   retrievedAt: z.iso.datetime(),
 });
 
@@ -3890,6 +4305,20 @@ export const model = {
       lifetime: "infinite",
       garbageCollection: 100,
     },
+    "viewList": {
+      description:
+        "Snapshot from listViews: the Phase-0 view probe — endpoint verdicts, opportunity views, and a raw sample for lock-flag/viewFilter shape discovery.",
+      schema: ViewListSchema,
+      lifetime: "3d",
+      garbageCollection: 5,
+    },
+    "viewEnsured": {
+      description:
+        "Snapshot from ensureOpportunityViews: per-target plan/outcome for the gated Opportunity view creates (action create/noop/refuse in dryRun; created/failed under confirm) + reachability. Audit trail of what swamp created.",
+      schema: ViewEnsuredSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
     "oppAggregates": {
       description:
         "Snapshot from aggregateOpportunities: PII-free CRM pipeline analytics (counts + per-currency sums by stage/lineOfBusiness/sourceChannel, open-pipeline, win/loss, active customers) + the read-only GraphQL verification probe. No opp names/ids/contacts.",
@@ -4623,6 +5052,366 @@ export const model = {
         } catch (e) {
           throw new Error(redactError(e));
         }
+      },
+    },
+    listViews: {
+      description:
+        "Read-only Phase-0 view probe (TWENTY-VIEW-MGMT): resolve which view endpoint is live (core REST /rest/views, metadata API, or Core GraphQL), classify each candidate (ok/absent/forbidden/error), list the Opportunity views, and capture a raw sample for lock-flag + viewFilter shape discovery. GATES the view-write methods (a forbidden verdict means the token role can't manage views). No writes. Snapshots a `viewList` resource.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const probes: Array<{
+          path: string;
+          status: number;
+          verdict: "ok" | "absent" | "forbidden" | "error";
+          count?: number;
+          bodySample?: string;
+        }> = [];
+        // Cap a raw value to a bounded string so the real envelope / error text
+        // is captured for shape-discovery without unbounded snapshot growth.
+        const cap = (v: unknown) =>
+          (typeof v === "string" ? v : JSON.stringify(v ?? null)).slice(0, 600);
+        // Resolve the Opportunity objectMetadataId + the filter fields' live
+        // metadata (id + options) in one metadata read. The filter fields drive
+        // the S1 allowlist and the A5 dependency assert in the write method.
+        let oppOid: string | undefined;
+        let filterFields: Record<
+          string,
+          { fieldMetadataId?: string; type?: string; options: string[] }
+        > = {};
+        try {
+          const resolved = await resolveOpportunityFilterFields(cfg);
+          oppOid = resolved.oppOid;
+          filterFields = resolved.fields;
+        } catch { /* non-fatal — probe still runs */ }
+        const OPEN_STAGES = ["NEW", "SCREENING", "MEETING", "PROPOSAL"];
+        const uncoveredStageOptions = (filterFields.stage?.options ?? [])
+          .filter(
+            (o) => !OPEN_STAGES.includes(o),
+          );
+
+        // REACHABILITY PROBES: classify each candidate endpoint and capture the
+        // raw envelope (Twenty's 4xx bodies name the reason; a 200 body reveals
+        // the real list key) so the true shape is discoverable, not guessed
+        // (spec F1/F5). These CLASSIFY only — the authoritative fetch below reads
+        // the resolved metadata endpoint.
+        const restProbe = async (path: string) => {
+          try {
+            const r = await rawGet(cfg, path);
+            probes.push({
+              path,
+              status: r.status,
+              verdict: classifyProbe(r.status),
+              bodySample: cap(r.body),
+            });
+          } catch (e) {
+            probes.push({
+              path,
+              status: 0,
+              verdict: "error",
+              bodySample: cap(String(e)),
+            });
+          }
+        };
+        for (
+          const path of [
+            "/rest/views?limit=200", // core REST: 400 (views is not a core object)
+            "/rest/metadata/views", // metadata REST: the live endpoint
+            "/rest/viewFilters?limit=50",
+            "/rest/metadata/viewFilters",
+          ]
+        ) {
+          await restProbe(path);
+        }
+
+        // AUTHORITATIVE FETCH: page the resolved metadata endpoint and join views
+        // to their viewFilters. Produces the full-shape opportunity view records
+        // that gate the write methods (F2 lock-flag / F5 filter shape).
+        let allViews: Array<Record<string, unknown>> = [];
+        let allFilters: Array<Record<string, unknown>> = [];
+        try {
+          allViews = await fetchMetadataList(cfg, "views");
+        } catch { /* reachability already captured in probes */ }
+        try {
+          allFilters = await fetchMetadataList(cfg, "viewFilters");
+        } catch { /* non-fatal — filters simply unavailable */ }
+
+        const filtersByView = new Map<string, Array<Record<string, unknown>>>();
+        for (const f of allFilters) {
+          const vid = String(f.viewId ?? "");
+          if (!vid) continue;
+          const arr = filtersByView.get(vid);
+          if (arr) arr.push(f);
+          else filtersByView.set(vid, [f]);
+        }
+
+        const opportunityViews = allViews
+          .filter((v) => !oppOid || String(v.objectMetadataId ?? "") === oppOid)
+          .map((v) => {
+            const id = String(v.id ?? "");
+            return {
+              id,
+              name: String(v.name ?? ""),
+              type: v.type != null ? String(v.type) : undefined,
+              key: v.key === null
+                ? null
+                : (v.key != null ? String(v.key) : undefined),
+              isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
+                ? v.isSystemSideEffect
+                : undefined,
+              position: typeof v.position === "number" ? v.position : undefined,
+              objectMetadataId: v.objectMetadataId
+                ? String(v.objectMetadataId)
+                : undefined,
+              filters: (filtersByView.get(id) ?? []).map((f) => ({
+                id: String(f.id ?? ""),
+                fieldMetadataId: f.fieldMetadataId
+                  ? String(f.fieldMetadataId)
+                  : undefined,
+                operand: f.operand != null ? String(f.operand) : undefined,
+                value: f.value,
+                subFieldName: f.subFieldName === null
+                  ? null
+                  : (f.subFieldName != null
+                    ? String(f.subFieldName)
+                    : undefined),
+                viewFilterGroupId: f.viewFilterGroupId === null
+                  ? null
+                  : (f.viewFilterGroupId != null
+                    ? String(f.viewFilterGroupId)
+                    : undefined),
+              })),
+            };
+          });
+
+        // F2: identify the locked/default index view. Twenty's per-object default
+        // view carries key === "INDEX"; that is the view that must never be mutated.
+        const indexView = opportunityViews.find((v) => v.key === "INDEX");
+        const lockFlagObserved = indexView
+          ? `default/locked index view detected via key==="INDEX" (view '${indexView.name}', id ${indexView.id})`
+          : "no key==='INDEX' opportunity view observed";
+
+        const handle = await context.writeResource("viewList", "viewList", {
+          baseUrl: cfg.baseUrl,
+          probes,
+          readPath: "/rest/metadata/views",
+          writeEndpointCandidate:
+            "POST /rest/metadata/views + POST /rest/metadata/viewFilters",
+          opportunityObjectMetadataId: oppOid,
+          viewCount: allViews.length,
+          opportunityViews,
+          lockFlagObserved,
+          filterFields,
+          uncoveredStageOptions,
+          sample: JSON.stringify(
+            allViews.find((v) => String(v.objectMetadataId ?? "") === oppOid) ??
+              allViews[0] ?? null,
+          ).slice(0, 1500),
+          retrievedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    ensureOpportunityViews: {
+      description:
+        "Gated write (TWENTY-VIEW-MGMT): idempotently CREATE the target Opportunity saved views (Sales Pipeline = stage IS [NEW,SCREENING,MEETING,PROPOSAL]; Consulting/Hosting/Local IT = lineOfBusiness IS [<LOB>]), each with a single `IS`-any-of viewFilter via the metadata API. NON-MUTATING by construction: creates a view only when its name is absent, no-ops when it already carries the desired filter, and REFUSES (never mutates) any pre-existing / locked / ambiguous view (F2/F3). Binds filters to a live fieldMetadataId (F6) and asserts every target enum option is present in the live schema (A5/S1). dryRun (default) plans; confirm=true executes creates after a view-endpoint reachability pre-flight (F4). Snapshots a `viewEnsured` resource. Run listViews first.",
+      arguments: z.object({
+        confirm: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        names: z.array(z.string()).optional(),
+      }),
+      execute: async (
+        args: { confirm?: boolean; dryRun?: boolean; names?: string[] },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const willWrite = args.confirm === true && args.dryRun !== true;
+
+        // Resolve opp object + filter-field metadata (id + live options).
+        const { oppOid, fields: fieldMeta } =
+          await resolveOpportunityFilterFields(cfg);
+
+        // View-endpoint reachability pre-flight (F4): distinguish reachable from
+        // 404 (absent) / 401-403 (forbidden) before any write.
+        let reachable = false;
+        try {
+          const r = await rawGet(cfg, "/rest/metadata/views?limit=1");
+          reachable = classifyProbe(r.status) === "ok";
+        } catch {
+          reachable = false;
+        }
+
+        // Load existing opportunity views + their filters (idempotency source).
+        // If this fails we CANNOT trust "name absent" → creates are fail-closed.
+        let existing: OppViewRef[] = [];
+        let existingLoadOk = false;
+        try {
+          const allViews = await fetchMetadataList(cfg, "views");
+          const allFilters = await fetchMetadataList(cfg, "viewFilters");
+          const byView = new Map<string, OppViewFilterRef[]>();
+          for (const f of allFilters) {
+            const vid = String(f.viewId ?? "");
+            if (!vid) continue;
+            const ref: OppViewFilterRef = {
+              id: f.id ? String(f.id) : undefined,
+              fieldMetadataId: f.fieldMetadataId
+                ? String(f.fieldMetadataId)
+                : undefined,
+              operand: f.operand != null ? String(f.operand) : undefined,
+              value: f.value,
+            };
+            const arr = byView.get(vid);
+            if (arr) arr.push(ref);
+            else byView.set(vid, [ref]);
+          }
+          existing = allViews
+            .filter((v) =>
+              !oppOid || String(v.objectMetadataId ?? "") === oppOid
+            )
+            .map((v) => {
+              const id = String(v.id ?? "");
+              return {
+                id,
+                name: String(v.name ?? ""),
+                key: v.key === null
+                  ? null
+                  : (v.key != null ? String(v.key) : undefined),
+                isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
+                  ? v.isSystemSideEffect
+                  : undefined,
+                isCustom: typeof v.isCustom === "boolean"
+                  ? v.isCustom
+                  : undefined,
+                objectMetadataId: v.objectMetadataId
+                  ? String(v.objectMetadataId)
+                  : undefined,
+                filters: byView.get(id) ?? [],
+              };
+            });
+          existingLoadOk = true;
+        } catch { /* existingLoadOk stays false — creates fail-closed below */ }
+
+        // Optional subset filter by name (still allowlist-guarded by the planner).
+        const nameSubset = args.names && args.names.length
+          ? new Set(args.names)
+          : undefined;
+        const targets = OPP_VIEW_TARGETS.filter(
+          (t) => !nameSubset || nameSubset.has(t.name),
+        );
+
+        const results: Array<{
+          target: string;
+          field: string;
+          fieldMetadataId?: string;
+          desiredValues: string[];
+          operand: string;
+          action: "create" | "noop" | "refuse" | "created" | "failed";
+          reason: string;
+          viewId?: string;
+          error?: string;
+        }> = [];
+
+        for (const t of targets) {
+          const plan = planOpportunityView(t, fieldMeta[t.field], existing);
+          const row = {
+            target: plan.target,
+            field: plan.field,
+            fieldMetadataId: plan.fieldMetadataId,
+            desiredValues: plan.desiredValues,
+            operand: plan.operand as string,
+            action: plan.action as
+              | "create"
+              | "noop"
+              | "refuse"
+              | "created"
+              | "failed",
+            reason: plan.reason,
+            viewId: plan.viewId,
+            error: undefined as string | undefined,
+          };
+          if (plan.action === "create" && willWrite) {
+            if (!existingLoadOk) {
+              row.action = "refuse";
+              row.reason =
+                "existing views could not be loaded — refusing to create (would risk a duplicate); fail-closed";
+            } else if (!reachable) {
+              row.action = "refuse";
+              row.reason =
+                "view endpoint not reachable at confirm time — write refused (F4)";
+            } else if (!oppOid) {
+              row.action = "refuse";
+              row.reason =
+                "opportunity objectMetadataId unresolved — write refused";
+            } else {
+              try {
+                const viewResp = await twentyRequest(
+                  cfg,
+                  "POST",
+                  "/rest/metadata/views",
+                  {
+                    name: plan.target,
+                    objectMetadataId: oppOid,
+                    icon: "IconTable",
+                    type: "TABLE",
+                  },
+                );
+                const created =
+                  ((viewResp as { data?: { id?: string } }).data ??
+                    viewResp) as { id?: string };
+                const newViewId = String(created?.id ?? "");
+                if (!newViewId) throw new Error("create view returned no id");
+                await twentyRequest(
+                  cfg,
+                  "POST",
+                  "/rest/metadata/viewFilters",
+                  {
+                    viewId: newViewId,
+                    fieldMetadataId: plan.fieldMetadataId,
+                    operand: plan.operand,
+                    value: buildViewFilterValue(plan.desiredValues),
+                  },
+                );
+                row.action = "created";
+                row.viewId = newViewId;
+                row.reason = "created view + IS-any-of filter";
+              } catch (e) {
+                // F1/F9: a write failure (incl. 400/401/403) is a hard STOP for
+                // this target — report, no retry.
+                row.action = "failed";
+                row.error = String(e);
+                row.reason =
+                  "create failed — see error (no retry, fail-closed)";
+              }
+            }
+          }
+          results.push(row);
+        }
+
+        const createdCount =
+          results.filter((r) => r.action === "created").length;
+        const refusedCount = results.filter(
+          (r) => r.action === "refuse" || r.action === "failed",
+        ).length;
+
+        const handle = await context.writeResource(
+          "viewEnsured",
+          "viewEnsured",
+          {
+            baseUrl: cfg.baseUrl,
+            dryRun: !willWrite,
+            confirm: args.confirm === true,
+            reachable,
+            objectMetadataId: oppOid,
+            results,
+            createdCount,
+            refusedCount,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
     aggregateOpportunities: {
@@ -7724,6 +8513,7 @@ export const model = {
         "ensureOpportunitySegmentation",
         "ensureObject",
         "ensureRelation",
+        "ensureOpportunityViews",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger?: MethodLogger },

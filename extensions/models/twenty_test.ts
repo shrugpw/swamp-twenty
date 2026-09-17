@@ -20,6 +20,8 @@ import {
   buildFilterPath,
   buildLeadNoteBody,
   buildOpportunityBody,
+  // TWENTY-VIEW-MGMT
+  buildViewFilterValue,
   canonicalJson,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
@@ -39,8 +41,10 @@ import {
   model,
   normalizeCloseDate,
   normalizeDomainHost,
+  normalizeFilterValueTokens,
   normalizePhone,
   normalizeRequestedOption,
+  OPP_VIEW_TARGETS,
   OppAggregatesSchema,
   OPPORTUNITY_SEGMENTATION_FIELDS,
   OpportunityRefSchema,
@@ -48,6 +52,7 @@ import {
   OppViewSchema,
   parseMicros,
   planLead,
+  planOpportunityView,
   planSelectOptions,
   redactError,
   sanitizeText,
@@ -60,6 +65,8 @@ import {
   validateEmail,
   validateLeadId,
   validateUuid,
+  ViewEnsuredSchema,
+  ViewListSchema,
 } from "./twenty.ts";
 
 // --- validateEmail ----------------------------------------------------------
@@ -6700,4 +6707,304 @@ Deno.test("acquireOppRowsGraphQL: full sweep reports truncated=false; tolerant m
   } finally {
     restore();
   }
+});
+
+// ===========================================================================
+// TWENTY-VIEW-MGMT — opportunity view management (pure logic)
+//
+// Fixtures are depersonalized: fabricated UUIDs (never the live workspace ids),
+// generic view names, and the product taxonomy enum tokens (stage / LOB) which
+// are not counterparty data. The viewFilter shapes mirror the two forms observed
+// live in Phase 0: a real JSON array value AND a stringified-array value.
+// ===========================================================================
+
+const VM_STAGE_FID = "11111111-1111-1111-1111-111111111111";
+const VM_LOB_FID = "22222222-2222-2222-2222-222222222222";
+const VM_STAGE_META = {
+  fieldMetadataId: VM_STAGE_FID,
+  options: [
+    "NEW",
+    "SCREENING",
+    "MEETING",
+    "PROPOSAL",
+    "CUSTOMER",
+    "CLOSED_WON",
+    "CLOSED_LOST",
+    "ON_HOLD",
+  ],
+};
+const VM_LOB_META = {
+  fieldMetadataId: VM_LOB_FID,
+  options: ["CONSULTING", "HOSTING", "GAMES", "NETWORK_PROVIDER", "LOCAL_IT"],
+};
+const vmSalesTarget = OPP_VIEW_TARGETS.find((t) =>
+  t.name === "Sales Pipeline"
+)!;
+const vmConsultingTarget = OPP_VIEW_TARGETS.find((t) =>
+  t.name === "Consulting"
+)!;
+
+// deno-lint-ignore no-explicit-any
+function vmView(over: Record<string, unknown>): any {
+  return {
+    id: "aaaaaaaa-0000-0000-0000-000000000000",
+    name: "Sales Pipeline",
+    key: null,
+    isSystemSideEffect: false,
+    isCustom: true,
+    objectMetadataId: "9b39e87c-0000-0000-0000-000000000000",
+    filters: [],
+    ...over,
+  };
+}
+
+Deno.test("VIEW-MGMT OPP_VIEW_TARGETS: Sales Pipeline enumerates open stages positively", () => {
+  assertEquals(vmSalesTarget.field, "stage");
+  assertEquals([...vmSalesTarget.values], [
+    "NEW",
+    "SCREENING",
+    "MEETING",
+    "PROPOSAL",
+  ]);
+  // No terminal / won / parked stage leaks into the pipeline board (A1/A2).
+  for (
+    const t of ["CUSTOMER", "CLOSED_WON", "CLOSED_LOST", "ON_HOLD", "CLOSED"]
+  ) {
+    assert(!vmSalesTarget.values.includes(t), `open set must exclude ${t}`);
+  }
+  // Exactly the four re-scoped views; no provider view (F7 void).
+  assertEquals(OPP_VIEW_TARGETS.map((t) => t.name), [
+    "Sales Pipeline",
+    "Consulting",
+    "Hosting",
+    "Local IT",
+  ]);
+  assert(!OPP_VIEW_TARGETS.some((t) => t.values.includes("NETWORK_PROVIDER")));
+});
+
+Deno.test("VIEW-MGMT buildViewFilterValue: returns a fresh token array (single point of control)", () => {
+  const v = buildViewFilterValue(["NEW", "SCREENING"]);
+  assertEquals(v, ["NEW", "SCREENING"]);
+  // A copy, not the caller's array.
+  const src = ["A", "B"];
+  assert(buildViewFilterValue(src) !== src);
+});
+
+Deno.test("VIEW-MGMT normalizeFilterValueTokens: handles both live-observed value forms", () => {
+  // Real JSON array (UI-created reference filter).
+  assertEquals(normalizeFilterValueTokens(["CUSTOMER"]), ["CUSTOMER"]);
+  // Stringified array (the other live form).
+  assertEquals(normalizeFilterValueTokens('["NETWORK_PROVIDER"]'), [
+    "NETWORK_PROVIDER",
+  ]);
+  assertEquals(
+    normalizeFilterValueTokens('["NEW","SCREENING","MEETING","PROPOSAL"]'),
+    ["NEW", "SCREENING", "MEETING", "PROPOSAL"],
+  );
+  // Bare scalar string / empties.
+  assertEquals(normalizeFilterValueTokens("CUSTOMER"), ["CUSTOMER"]);
+  assertEquals(normalizeFilterValueTokens(""), []);
+  assertEquals(normalizeFilterValueTokens(null), []);
+  assertEquals(normalizeFilterValueTokens(undefined), []);
+  // Malformed stringified array falls back to the raw string, not a throw.
+  assertEquals(normalizeFilterValueTokens("[oops"), ["[oops"]);
+});
+
+Deno.test("VIEW-MGMT plan: absent name → create with resolved id + IS operand", () => {
+  const p = planOpportunityView(vmSalesTarget, VM_STAGE_META, []);
+  assertEquals(p.action, "create");
+  assertEquals(p.fieldMetadataId, VM_STAGE_FID);
+  assertEquals(p.operand, "IS");
+  assertEquals(p.desiredValues, ["NEW", "SCREENING", "MEETING", "PROPOSAL"]);
+});
+
+Deno.test("VIEW-MGMT plan: present with matching filter (array form) → noop", () => {
+  const existing = [vmView({
+    filters: [{
+      id: "f1",
+      fieldMetadataId: VM_STAGE_FID,
+      operand: "IS",
+      value: ["NEW", "SCREENING", "MEETING", "PROPOSAL"],
+    }],
+  })];
+  const p = planOpportunityView(vmSalesTarget, VM_STAGE_META, existing);
+  assertEquals(p.action, "noop");
+  assertEquals(p.viewId, "aaaaaaaa-0000-0000-0000-000000000000");
+});
+
+Deno.test("VIEW-MGMT plan: present with matching filter (stringified + reordered) → noop", () => {
+  const existing = [vmView({
+    filters: [{
+      id: "f1",
+      fieldMetadataId: VM_STAGE_FID,
+      operand: "IS",
+      // stringified AND out of order — set-equality is order-independent.
+      value: '["PROPOSAL","NEW","MEETING","SCREENING"]',
+    }],
+  })];
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, existing).action,
+    "noop",
+  );
+});
+
+Deno.test("VIEW-MGMT plan: present with DIFFERENT filter → refuse, never mutate (F3/A6)", () => {
+  const existing = [vmView({
+    filters: [{
+      id: "f1",
+      fieldMetadataId: VM_STAGE_FID,
+      operand: "IS",
+      value: ["NEW"], // drifted / narrower
+    }],
+  })];
+  const p = planOpportunityView(vmSalesTarget, VM_STAGE_META, existing);
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("not mutating a pre-existing view"));
+});
+
+Deno.test("VIEW-MGMT plan: locked/system views are refused (F2)", () => {
+  // key === "INDEX" (default view marker).
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, [
+      vmView({ key: "INDEX", isSystemSideEffect: true, isCustom: false }),
+    ]).action,
+    "refuse",
+  );
+  // isSystemSideEffect === true alone.
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, [
+      vmView({ isSystemSideEffect: true }),
+    ]).action,
+    "refuse",
+  );
+  // isCustom === false alone.
+  assertEquals(
+    planOpportunityView(vmSalesTarget, VM_STAGE_META, [
+      vmView({ isCustom: false }),
+    ]).action,
+    "refuse",
+  );
+});
+
+Deno.test("VIEW-MGMT plan: >1 same-named view → refuse (ambiguous)", () => {
+  const p = planOpportunityView(vmSalesTarget, VM_STAGE_META, [
+    vmView({ id: "v1" }),
+    vmView({ id: "v2" }),
+  ]);
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("ambiguous"));
+});
+
+Deno.test("VIEW-MGMT plan: unresolved fieldMetadataId → refuse (F6)", () => {
+  assertEquals(
+    planOpportunityView(vmSalesTarget, { options: VM_STAGE_META.options }, [])
+      .action,
+    "refuse",
+  );
+  assertEquals(
+    planOpportunityView(vmSalesTarget, undefined, []).action,
+    "refuse",
+  );
+});
+
+Deno.test("VIEW-MGMT plan: target option absent from live schema → refuse (A5/S1)", () => {
+  // stage schema missing PROPOSAL → fail-closed.
+  const p = planOpportunityView(vmSalesTarget, {
+    fieldMetadataId: VM_STAGE_FID,
+    options: ["NEW", "SCREENING", "MEETING"],
+  }, []);
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("PROPOSAL"));
+  assert(p.reason.includes("A5/S1"));
+});
+
+Deno.test("VIEW-MGMT plan: LOB targets resolve against live LOB options", () => {
+  const p = planOpportunityView(vmConsultingTarget, VM_LOB_META, []);
+  assertEquals(p.action, "create");
+  assertEquals(p.desiredValues, ["CONSULTING"]);
+  assertEquals(p.fieldMetadataId, VM_LOB_FID);
+});
+
+Deno.test("VIEW-MGMT plan: name outside target allowlist → refuse (F10)", () => {
+  const p = planOpportunityView(
+    { name: "Evil View", field: "stage", values: ["NEW"] },
+    VM_STAGE_META,
+    [],
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("allowlist"));
+});
+
+Deno.test("VIEW-MGMT ViewListSchema round-trips a depersonalized Phase-0 snapshot", () => {
+  const snap = {
+    baseUrl: "https://crm.example.test",
+    probes: [{
+      path: "/rest/metadata/views",
+      status: 200,
+      verdict: "ok" as const,
+      count: 1,
+      bodySample: "{...}",
+    }],
+    readPath: "/rest/metadata/views",
+    writeEndpointCandidate:
+      "POST /rest/metadata/views + POST /rest/metadata/viewFilters",
+    opportunityObjectMetadataId: "9b39e87c-0000-0000-0000-000000000000",
+    viewCount: 1,
+    opportunityViews: [{
+      id: "aaaaaaaa-0000-0000-0000-000000000000",
+      name: "Open Pipeline",
+      type: "TABLE",
+      key: null,
+      isSystemSideEffect: false,
+      position: 0,
+      objectMetadataId: "9b39e87c-0000-0000-0000-000000000000",
+      filters: [{
+        id: "f1",
+        fieldMetadataId: VM_LOB_FID,
+        operand: "IS_NOT",
+        value: '["NETWORK_PROVIDER"]',
+        subFieldName: null,
+        viewFilterGroupId: null,
+      }],
+    }],
+    lockFlagObserved: 'default/locked index view detected via key==="INDEX"',
+    filterFields: {
+      stage: {
+        fieldMetadataId: VM_STAGE_FID,
+        type: "SELECT",
+        options: VM_STAGE_META.options,
+      },
+    },
+    uncoveredStageOptions: ["CUSTOMER", "CLOSED_WON", "CLOSED_LOST", "ON_HOLD"],
+    sample: "{...}",
+    retrievedAt: "2026-09-17T07:00:00.000Z",
+  };
+  const parsed = ViewListSchema.parse(snap);
+  assertEquals(parsed.readPath, "/rest/metadata/views");
+  assertEquals(parsed.opportunityViews[0].filters?.[0].operand, "IS_NOT");
+});
+
+Deno.test("VIEW-MGMT ViewEnsuredSchema round-trips a dryRun plan snapshot", () => {
+  const snap = {
+    baseUrl: "https://crm.example.test",
+    dryRun: true,
+    confirm: false,
+    reachable: true,
+    objectMetadataId: "9b39e87c-0000-0000-0000-000000000000",
+    results: [{
+      target: "Sales Pipeline",
+      field: "stage",
+      fieldMetadataId: VM_STAGE_FID,
+      desiredValues: ["NEW", "SCREENING", "MEETING", "PROPOSAL"],
+      operand: "IS",
+      action: "create" as const,
+      reason: "no opportunity view with this name — create",
+    }],
+    createdCount: 0,
+    refusedCount: 0,
+    retrievedAt: "2026-09-17T07:00:00.000Z",
+  };
+  const parsed = ViewEnsuredSchema.parse(snap);
+  assertEquals(parsed.results[0].action, "create");
+  assertEquals(parsed.dryRun, true);
 });
