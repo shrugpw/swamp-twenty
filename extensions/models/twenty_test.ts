@@ -7317,7 +7317,13 @@ Deno.test("updateNote: 404 → not-found, no PATCH", async () => {
   }
 });
 
-Deno.test("updateNote: refuses a body write on a note carrying blocknote (A5/S6)", async () => {
+// Probe (twenty-local, 2026-09-17): Twenty v2.38.1 RE-DERIVES bodyV2.blocknote
+// from a markdown-only write on BOTH create and PATCH, so BODYV2_MARKDOWN_REDERIVES
+// is true and updateNote/appendNote write the body even on a note that already
+// carries a blocknote (no stale-blocknote lost-update). The refused-blocknote
+// branch is a dormant fallback, re-armed only if a future Twenty version regresses
+// (flip the flag to false).
+Deno.test("updateNote: writes the body on a note carrying blocknote — Twenty re-derives (probe 2026-09-17)", async () => {
   const { writes, ctx } = readCtx();
   const { calls, restore } = stubFetchStatus((method) => {
     if (method === "GET") {
@@ -7332,6 +7338,9 @@ Deno.test("updateNote: refuses a body write on a note carrying blocknote (A5/S6)
         },
       };
     }
+    if (method === "PATCH") {
+      return { body: { data: { updateNote: { id: NM_NOTE } } } };
+    }
     return {};
   });
   try {
@@ -7339,8 +7348,11 @@ Deno.test("updateNote: refuses a body write on a note carrying blocknote (A5/S6)
       { noteId: NM_NOTE, body: "new", dryRun: false, confirm: true },
       ctx as never,
     );
-    assertEquals(writes[writes.length - 1].data.action, "refused-blocknote");
-    assert(!calls.some((c) => c.method === "PATCH"), "must not PATCH");
+    assertEquals(writes[writes.length - 1].data.action, "updated");
+    assert(
+      calls.some((c) => c.method === "PATCH"),
+      "must PATCH the body (Twenty re-derives blocknote)",
+    );
   } finally {
     restore();
   }

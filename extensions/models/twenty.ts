@@ -3094,12 +3094,15 @@ async function ensureNoteForLead(
 
 // Does a markdown-only PATCH of `bodyV2` make Twenty RE-DERIVE the `blocknote`
 // rich-text representation? Settled by the implement step-0 twenty-local probe
-// (design §6). Decision (1): write-both-or-refuse, NO stale-UI caveat. Until this
-// is proven true, updateNote/appendNote REFUSE a body write on a note that
-// already carries a non-empty blocknote (A5/S6: a stale blocknote is a
-// cross-representation lost-update AND a false-redaction). Notes with no/empty
-// blocknote (incl. all model-created notes, which are markdown-only) write freely.
-const BODYV2_MARKDOWN_REDERIVES = false;
+// (design §6). Decision (1): write-both-or-refuse, NO stale-UI caveat.
+// PROBE OUTCOME (twenty-local, Twenty v2.38.1, 2026-09-17): a markdown-only write
+// RE-DERIVES bodyV2.blocknote on BOTH create and PATCH (verified by reading the
+// note.bodyV2Blocknote column before/after — it tracked the new markdown, never
+// went stale). So this is TRUE and updateNote/appendNote write the body freely.
+// The refuse-blocknote branch below is a DORMANT fallback: flip to false to re-arm
+// it if a future Twenty version stops re-deriving (A5/S6: a stale blocknote would
+// be a cross-representation lost-update AND a false-redaction).
+const BODYV2_MARKDOWN_REDERIVES = true;
 
 /** True if a Note record already carries a non-empty `bodyV2.blocknote`. */
 function noteHasBlocknote(note: Record<string, unknown>): boolean {
