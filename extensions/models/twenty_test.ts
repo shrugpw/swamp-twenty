@@ -14,6 +14,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  acquireOppRowsGraphQL,
   aggregateOppViews,
   amountFromMicros,
   buildFilterPath,
@@ -45,6 +46,7 @@ import {
   OpportunityRefSchema,
   OpportunityUpsertSchema,
   OppViewSchema,
+  parseMicros,
   planLead,
   planSelectOptions,
   redactError,
@@ -6591,4 +6593,111 @@ Deno.test("twentyGraphQL refuses mutation/subscription operations (read-only)", 
     Error,
     "read-only",
   );
+});
+
+Deno.test("twentyGraphQL refuses a mutation in a multi-op document (CR-A-L2)", async () => {
+  const cfg = { baseUrl: "https://crm.example.com", apiToken: "t" };
+  await assertRejects(
+    () =>
+      twentyGraphQL(
+        cfg,
+        "query Q { opportunities { totalCount } } mutation M { deleteAll { id } }",
+      ),
+    Error,
+    "read-only",
+  );
+});
+
+Deno.test("parseMicros: number, bigint-string, and bad values (CR-A-L3)", () => {
+  assertEquals(parseMicros(214470210000), 214470210000);
+  assertEquals(parseMicros("214470210000"), 214470210000);
+  assertEquals(parseMicros("-5"), -5);
+  assertEquals(parseMicros("1.5"), null);
+  assertEquals(parseMicros("abc"), null);
+  assertEquals(parseMicros(Infinity), null);
+  assertEquals(parseMicros(null), null);
+});
+
+Deno.test("aggregateOppViews: amount without currency -> UNKNOWN bucket, listed in currencies (CR-A-L4)", () => {
+  const agg = aggregateOppViews([ov("NEW", { amount: 100 })]); // no currencyCode
+  assert(agg.currencies.includes("UNKNOWN"));
+  assertEquals(
+    agg.openPipeline.amounts.find((a) => a.currency === "UNKNOWN")?.amount,
+    100,
+  );
+});
+
+Deno.test("acquireOppRowsGraphQL: dedups across pages + truncates on a repeat cursor (CR-A-H1/M1)", async () => {
+  const { restore } = stubTwentyFetch((_m, _p, body) => {
+    const after =
+      (body as { variables?: { after?: string | null } })?.variables?.after ??
+        null;
+    if (after === null) {
+      return {
+        data: {
+          opportunities: {
+            totalCount: 3,
+            sumAmountAmountMicros: 0,
+            edges: [
+              { node: { id: "a", stage: "NEW" } },
+              { node: { id: "b", stage: "NEW" } },
+            ],
+            pageInfo: { hasNextPage: true, endCursor: "c1" },
+          },
+        },
+      };
+    }
+    // Second page REPEATS endCursor c1 (broken cursor) and re-emits b.
+    return {
+      data: {
+        opportunities: {
+          totalCount: 3,
+          sumAmountAmountMicros: 0,
+          edges: [
+            { node: { id: "b", stage: "NEW" } },
+            { node: { id: "c", stage: "NEW" } },
+          ],
+          pageInfo: { hasNextPage: true, endCursor: "c1" },
+        },
+      },
+    };
+  });
+  try {
+    const r = await acquireOppRowsGraphQL({
+      baseUrl: "https://crm.example.com",
+      apiToken: "t",
+    });
+    assertEquals(r.rows.map((x) => x.id), ["a", "b", "c"]); // b deduped
+    assertEquals(r.truncated, true); // stopped w/ hasNextPage still true
+    assertEquals(r.serverTotalCount, 3);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("acquireOppRowsGraphQL: full sweep reports truncated=false; tolerant micros (CR-A-H1/L3)", async () => {
+  const { restore } = stubTwentyFetch(() => ({
+    data: {
+      opportunities: {
+        totalCount: 2,
+        sumAmountAmountMicros: "5", // BIGINT-as-string
+        edges: [
+          { node: { id: "a", stage: "NEW" } },
+          { node: { id: "b", stage: "CUSTOMER" } },
+        ],
+        pageInfo: { hasNextPage: false },
+      },
+    },
+  }));
+  try {
+    const r = await acquireOppRowsGraphQL({
+      baseUrl: "https://crm.example.com",
+      apiToken: "t",
+    });
+    assertEquals(r.rows.length, 2);
+    assertEquals(r.truncated, false);
+    assertEquals(r.serverSumMicros, 5);
+  } finally {
+    restore();
+  }
 });

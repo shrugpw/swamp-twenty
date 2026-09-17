@@ -178,7 +178,10 @@ export async function twentyGraphQL(
     .replace(/#[^\n]*(?:\n|$)/g, " ")
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .trimStart();
-  if (/^(mutation|subscription)\b/i.test(head)) {
+  // Reject a mutation/subscription as the FIRST operation or as a later
+  // operation in a multi-op document (after a `}`) — not just the leading token
+  // (CR-A-L2). All call sites pin single-op query docs; this is defense in depth.
+  if (/(^|\})\s*(mutation|subscription)\b/i.test(head)) {
     throw new Error(
       "twentyGraphQL refuses a non-query operation (read-only transport)",
     );
@@ -1188,6 +1191,17 @@ export function amountFromMicros(micros: number): number {
   return micros / 1_000_000;
 }
 
+/**
+ * Parse a micros value that a GraphQL aggregate may serialize as a JS number OR
+ * a BIGINT string (CR-A-L3). Returns null for anything non-integer, so a caller
+ * degrades to "no server sum" rather than trusting a bad value.
+ */
+export function parseMicros(v: unknown): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && /^-?\d+$/.test(v)) return Number(v);
+  return null;
+}
+
 /** Pull {amount (whole units), currencyCode} out of a Twenty CURRENCY composite. */
 function extractAmount(
   rec: Record<string, unknown>,
@@ -1371,6 +1385,7 @@ export function aggregateOppViews(
     }
     total++;
     if (v.currencyCode) currencies.add(v.currencyCode);
+    else if (v.amount !== undefined) currencies.add(UNKNOWN_CURRENCY); // A-L4
 
     const sKey = v.stage || "UNSET";
     const sb = stage.get(sKey) ?? { count: 0, amt: {} };
@@ -1784,44 +1799,63 @@ const OPP_AGG_NODE_FIELDS =
  * REST opportunity record for the fields we read, so callers map with mapOppView.
  * Throws (caller-redacts) on any GraphQL failure so acquisition can fall back to
  * REST. Verified live on v2.38.1 (sumAmountAmountMicros == in-extension sum).
+ *
+ * `truncated` is honest: it is true whenever the loop stops while the server
+ * still reports more pages — a page-count backstop OR a broken/repeat cursor
+ * (never a false "complete", CR-A-H1). Rows are deduped by id across page
+ * boundaries (CR-A-M1). Pages until hasNextPage is false (a full aggregate up to
+ * the ~MAX_AGG_PAGES*60 backstop), not an artificial record cap (CR-A-M2).
  */
-async function acquireOppRowsGraphQL(cfg: TwentyCfg): Promise<{
+export async function acquireOppRowsGraphQL(cfg: TwentyCfg): Promise<{
   rows: Array<Record<string, unknown>>;
   truncated: boolean;
   serverTotalCount: number | null;
   serverSumMicros: number | null;
 }> {
   const rows: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
   let after: string | null = null;
   let serverTotalCount: number | null = null;
   let serverSumMicros: number | null = null;
   let pages = 0;
   const PAGE = 60; // Twenty caps a page at 60.
+  const MAX_AGG_PAGES = 200; // backstop: ~12k opps before we bail as truncated.
   const query =
     `query($first:Int,$after:String){ opportunities(first:$first, after:$after){ totalCount sumAmountAmountMicros edges { node { ${OPP_AGG_NODE_FIELDS} } } pageInfo { hasNextPage endCursor } } }`;
   for (;;) {
     const data = await twentyGraphQL(cfg, query, { first: PAGE, after });
     const conn = data.opportunities as {
       totalCount?: number;
-      sumAmountAmountMicros?: number;
+      sumAmountAmountMicros?: number | string;
       edges?: Array<{ node?: Record<string, unknown> }>;
       pageInfo?: { hasNextPage?: boolean; endCursor?: string };
     } | undefined;
     if (!conn) throw new Error("GraphQL opportunities returned no connection");
     if (typeof conn.totalCount === "number") serverTotalCount = conn.totalCount;
-    if (typeof conn.sumAmountAmountMicros === "number") {
-      serverSumMicros = conn.sumAmountAmountMicros;
+    // amountMicros can serialize as a BIGINT string; accept both (CR-A-L3).
+    const sm = parseMicros(conn.sumAmountAmountMicros);
+    if (sm !== null) serverSumMicros = sm;
+    for (const e of conn.edges ?? []) {
+      const node = e?.node;
+      if (!node) continue;
+      const id = typeof node.id === "string" ? node.id : "";
+      if (id) {
+        if (seen.has(id)) continue; // cross-page overlap dedup (CR-A-M1)
+        seen.add(id);
+      }
+      rows.push(node);
     }
-    for (const e of conn.edges ?? []) if (e?.node) rows.push(e.node);
     pages++;
+    const more = Boolean(conn.pageInfo?.hasNextPage);
+    if (!more) {
+      return { rows, truncated: false, serverTotalCount, serverSumMicros };
+    }
+    // The server says there is more. If the cursor is unusable (absent/repeat)
+    // or we hit the page backstop, stop but report truncated=true — never a
+    // silent partial claiming completeness (CR-A-H1).
     const next = conn.pageInfo?.endCursor;
-    if (
-      !conn.pageInfo?.hasNextPage || rows.length >= MAX_LIST_CAP ||
-      !next || next === after || pages > 100
-    ) {
-      const truncated = Boolean(conn.pageInfo?.hasNextPage) &&
-        rows.length >= MAX_LIST_CAP;
-      return { rows, truncated, serverTotalCount, serverSumMicros };
+    if (!next || next === after || pages >= MAX_AGG_PAGES) {
+      return { rows, truncated: true, serverTotalCount, serverSumMicros };
     }
     after = next;
   }
@@ -4652,13 +4686,17 @@ export const model = {
 
           // Cross-check the server's all-currency micros sum against the local
           // raw-micros sum over the SAME (unfiltered) rows — an integrity signal
-          // that GraphQL aggregation and our acquisition agree.
+          // that GraphQL aggregation and our acquisition agree. SKIP when
+          // truncated: the server sum is over ALL opps but our local rows are a
+          // partial set, so a "mismatch" would just re-signal truncation, not an
+          // integrity failure (CR-A-L1). Left "na" in that case.
           probe.serverSumMicros = serverSumMicros;
-          if (serverSumMicros !== null) {
+          if (serverSumMicros !== null && !truncated) {
             const localMicros = rows.reduce((s, r) => {
-              const a = (r.amount as { amountMicros?: unknown } | null)
-                ?.amountMicros;
-              return s + (typeof a === "number" ? a : 0);
+              const a = parseMicros(
+                (r.amount as { amountMicros?: unknown } | null)?.amountMicros,
+              );
+              return s + (a ?? 0);
             }, 0);
             probe.crossCheck = localMicros === serverSumMicros
               ? "match"
