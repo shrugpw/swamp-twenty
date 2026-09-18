@@ -3,6 +3,55 @@
 All notable changes to `@shrug/twenty`. Versions are CalVer
 (`YYYY.MM.DD.micro`).
 
+## 2026.09.18.1
+
+### Added -- note reconciliation, extension scope A+B (`TWENTY-NOTE-RECONCILE`)
+
+- **`ensureNoteFields`** -- a confirm-gated, idempotent wrapper (paralleling
+  `ensureLeadFields`) that provisions a **`noteHash` (TEXT)** custom field on
+  `Note` via `POST /rest/metadata/fields`. Already-present is a no-op; a
+  wrong-type field is reported, never mutated. Snapshots a `fieldsEnsured`
+  resource (instance `fieldsEnsured-note`).
+- **Keyed content hash on notes.** `createNote` and `updateNote` now stamp
+  `noteHash` -- a **keyed HMAC-SHA256** (hex) over a canonical `{title, body}`
+  serialization -- in the same write, and record it as `noteWrite.bodyHash`.
+  `listNotes` / `mapNoteView` / `NoteView` surface `noteHash` **body-free**
+  (leadId + noteHash, never a body), giving the reconciler a single body-free
+  match surface inside the SR-1 note-body boundary. The hash covers **title AND
+  body**, so title drift is captured without ever surfacing the guarded title.
+- **New OPTIONAL, SENSITIVE global `noteHashHmacKey`** -- resolve from a vault
+  via CEL (e.g. `vault.get("twenty", "note-hash-hmac-key")`). Treated like
+  `apiToken`: length-only logging, never snapshotted, redacted in errors
+  (SEC-6). The repo-side notes-drift report reads the **same** vault key so both
+  sides HMAC byte-identically.
+
+### Security / behavior
+
+- **A keyed HMAC, not a plain digest** (SEC-1/SEC-2): surfacing `noteHash`
+  body-free is not a brute-force/confirmation oracle even for low-entropy
+  templated lead-note bodies.
+- **FAIL CLOSED on an empty key** (SEC-5/ADV-10): provisioning `note.noteHash`
+  ENABLES population, and once it is provisioned `createNote`/`updateNote`
+  **refuse** (throw) if `noteHashHmacKey` is empty, rather than store a
+  zero-confidentiality empty-keyed hash. A missing field, by contrast, simply
+  skips the hash and **never breaks the write** (ADV-2). **Note the blast
+  radius:** after `ensureNoteFields`, `createNote`/`updateNote` require the key
+  for **every** caller, not just the reconciler.
+- **`push_leads` is UNCHANGED.** The shared `ensureNoteForLead` lead-sink
+  note-write path never hashes (it does not pass a hash through the shared
+  core), so the lead sink needs no key and behaves identically even when
+  `note.noteHash` is provisioned (pushLeadsContract). `appendNote` also does not
+  maintain `noteHash` (it is a manual op outside the reconcile loop, ADV-4).
+- **Scope boundary (ADV-1/ADV-8, accepted).** The reconciler detects YAML-side
+  drift only; a Twenty UI / out-of-band body edit does not touch the write-time
+  `noteHash`, so it is invisible to (and not flagged by) the reconciler, and not
+  clobbered so long as the note YAML stays static -- a CONDITIONAL, not
+  absolute, non-clobber property. Repo-side reconcile (report C + update-leg D)
+  is built as ops work, out of this extension's scope.
+
+- `globalArguments` gains one OPTIONAL field (`noteHashHmacKey`, default `""`),
+  so this is a no-op attribute migration.
+
 ## 2026.09.17.2
 
 ### Added — full Note management (`TWENTY-NOTE-MGMT`)

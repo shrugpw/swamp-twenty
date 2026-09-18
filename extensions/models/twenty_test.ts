@@ -14,6 +14,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  __clearNoteFieldCache,
   acquireOppRowsGraphQL,
   aggregateOppViews,
   amountFromMicros,
@@ -23,11 +24,14 @@ import {
   // TWENTY-VIEW-MGMT
   buildViewFilterValue,
   canonicalJson,
+  // TWENTY-NOTE-RECONCILE
+  canonicalNote,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
   domainOfEmail,
   escapeMarkdown,
   fetchObjectsMeta,
+  hashNote,
   isBlockedDomain,
   isFilterSafe,
   isReadOnlyGraphQL,
@@ -8602,6 +8606,671 @@ Deno.test("R2 ensureOpportunityViews(confirm): endpoint unreachable at confirm �
         c.method === "POST" && c.path === "/rest/metadata/views"
       ),
     );
+  } finally {
+    restore();
+  }
+});
+
+// --- TWENTY-NOTE-RECONCILE: noteHash keyed-HMAC field + surface --------------
+
+// A DEDICATED NON-PRODUCTION test key (SEC-8): the real vault key is never
+// embedded in tests/fixtures. The frozen vector below asserts ext<->report
+// byte-identity under THIS key, not the prod key.
+const NOTE_TEST_KEY = "test-key-not-prod";
+
+/** Object metadata GET payload; note.noteHash present iff `withNoteHash`. */
+function noteMeta(withNoteHash: boolean) {
+  const noteFields: Array<Record<string, unknown>> = [
+    { name: "leadId", type: "TEXT" },
+  ];
+  if (withNoteHash) noteFields.push({ name: "noteHash", type: "TEXT" });
+  return {
+    data: [
+      {
+        id: "note-oid",
+        nameSingular: "note",
+        namePlural: "notes",
+        fields: noteFields,
+      },
+      {
+        id: "person-oid",
+        nameSingular: "person",
+        namePlural: "people",
+        fields: [
+          { name: "leadId", type: "TEXT" },
+          { name: "isEmergency", type: "BOOLEAN" },
+        ],
+      },
+      {
+        id: "opp-oid",
+        nameSingular: "opportunity",
+        namePlural: "opportunities",
+        fields: [
+          { name: "leadId", type: "TEXT" },
+          { name: "isEmergency", type: "BOOLEAN" },
+        ],
+      },
+      {
+        id: "company-oid",
+        nameSingular: "company",
+        namePlural: "companies",
+        fields: [],
+      },
+    ],
+  };
+}
+
+/** Capturing execute-context whose globalArgs carry a chosen HMAC key. */
+function noteWriteCtx(hmacKey: string) {
+  const writes: Array<
+    { type: string; name: string; data: Record<string, unknown> }
+  > = [];
+  const ctx = {
+    globalArgs: {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      opportunityStage: "NEW",
+      emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+      emergencyRestrictedRole: "",
+      noteHashHmacKey: hmacKey,
+    },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: (
+      type: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      writes.push({ type, name, data });
+      return Promise.resolve({ name });
+    },
+  };
+  return { writes, ctx };
+}
+
+// --- canonicalNote / hashNote (pure) ---------------------------------------
+
+Deno.test("canonicalNote: stable sorted-key form; title/body not interchangeable", () => {
+  assertEquals(canonicalNote("T", "B"), '{"body":"B","title":"T"}');
+  assert(canonicalNote("A", "B") !== canonicalNote("B", "A"));
+});
+
+Deno.test("hashNote: frozen fixture vector under the test key (ext<->report byte-identity, SEC-8)", async () => {
+  const v = await hashNote(
+    NOTE_TEST_KEY,
+    "Inbound lead L1",
+    "Name: Ada\nMessage: hello world\n",
+  );
+  assertEquals(
+    v,
+    "b379851ad2ccd0c5f31b10e6e9345f7553a55fe400fbc27cfd9c4ea8d2b6bcb4",
+  );
+  assertEquals(v.length, 64); // hex SHA-256
+});
+
+Deno.test("hashNote: deterministic, keyed, and covers title AND body (ADV-3)", async () => {
+  const a = await hashNote("k1", "T", "B");
+  assertEquals(a, await hashNote("k1", "T", "B")); // deterministic
+  assert(a !== (await hashNote("k2", "T", "B"))); // keyed
+  assert(a !== (await hashNote("k1", "T2", "B"))); // title drift
+  assert(a !== (await hashNote("k1", "T", "B2"))); // body drift
+});
+
+Deno.test("hashNote: FAILS CLOSED on an empty key (SEC-5)", async () => {
+  await assertRejects(() => hashNote("", "T", "B"), Error, "empty HMAC key");
+});
+
+// --- mapNoteView surfacing --------------------------------------------------
+
+Deno.test("mapNoteView surfaces noteHash body-free; omits when empty/absent; never a body", () => {
+  const v = mapNoteView({
+    id: "n1",
+    leadId: "L1",
+    noteHash: "abc123",
+    bodyV2: { markdown: "secret body" },
+  });
+  assertEquals(v.noteHash, "abc123");
+  assertEquals(v.leadId, "L1");
+  assertEquals("body" in v, false);
+  assertEquals("bodyV2" in v, false);
+  assertEquals(JSON.stringify(v).includes("secret body"), false);
+  assertEquals("noteHash" in mapNoteView({ id: "n2", noteHash: "" }), false);
+  assertEquals("noteHash" in mapNoteView({ id: "n3" }), false);
+});
+
+// --- ensureNoteFields -------------------------------------------------------
+
+Deno.test("ensureNoteFields refuses without confirm:true", async () => {
+  const { ctx } = noteWriteCtx("");
+  await assertRejects(
+    () =>
+      model.methods.ensureNoteFields.execute(
+        { confirm: false } as never,
+        ctx as never,
+      ),
+    Error,
+    "confirm:true",
+  );
+});
+
+Deno.test("ensureNoteFields creates note.noteHash when absent; idempotent when present", async () => {
+  __clearNoteFieldCache();
+  {
+    const { writes, ctx } = noteWriteCtx("");
+    const { calls, restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return noteMeta(false);
+      if (method === "POST" && path === "/rest/metadata/fields") return {};
+      return {};
+    });
+    try {
+      await model.methods.ensureNoteFields.execute(
+        { confirm: true } as never,
+        ctx as never,
+      );
+      assertEquals(writes[writes.length - 1].data.created, ["note.noteHash"]);
+      assert(
+        calls.some((c) =>
+          c.method === "POST" && c.path === "/rest/metadata/fields" &&
+          (c.body as Record<string, unknown>).name === "noteHash"
+        ),
+      );
+    } finally {
+      restore();
+    }
+  }
+  {
+    const { writes, ctx } = noteWriteCtx("");
+    const { calls, restore } = stubTwentyFetch((_m, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+      return {};
+    });
+    try {
+      await model.methods.ensureNoteFields.execute(
+        { confirm: true } as never,
+        ctx as never,
+      );
+      assertEquals(writes[writes.length - 1].data.alreadyPresent, [
+        "note.noteHash",
+      ]);
+      assert(
+        !calls.some((c) =>
+          c.method === "POST" && c.path === "/rest/metadata/fields"
+        ),
+      );
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("ensureNoteFields refreshes the provisioned-ness memo even when the field is alreadyPresent (ADV-1)", async () => {
+  __clearNoteFieldCache();
+  // Phase 1: metadata WITHOUT noteHash — a createNote caches present:false.
+  {
+    const { ctx } = noteWriteCtx(NOTE_TEST_KEY);
+    const { restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return noteMeta(false);
+      if (method === "POST" && path === "/rest/notes") {
+        return { data: { createNote: { id: "n0" } } };
+      }
+      return {};
+    });
+    try {
+      await model.methods.createNote.execute(
+        { title: "pre", body: "x", dryRun: false, confirm: true } as never,
+        ctx as never,
+      );
+    } finally {
+      restore();
+    }
+  }
+  // Phase 2: the field is provisioned out-of-band; ensureNoteFields finds it
+  // alreadyPresent (created:[]) yet MUST still clear the stale memo.
+  {
+    const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+    const { restore } = stubTwentyFetch((_m, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+      return {};
+    });
+    try {
+      await model.methods.ensureNoteFields.execute(
+        { confirm: true } as never,
+        ctx as never,
+      );
+      assertEquals(writes[writes.length - 1].data.alreadyPresent, [
+        "note.noteHash",
+      ]);
+    } finally {
+      restore();
+    }
+  }
+  // Phase 3: the next createNote must SEE the now-provisioned field and hash
+  // (without the ADV-1 fix it would read the stale present:false and skip it).
+  {
+    const { ctx } = noteWriteCtx(NOTE_TEST_KEY);
+    const { calls, restore } = stubTwentyFetch((method, path) => {
+      if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+      if (method === "POST" && path === "/rest/notes") {
+        return { data: { createNote: { id: "n1" } } };
+      }
+      return {};
+    });
+    try {
+      await model.methods.createNote.execute(
+        { title: "post", body: "y", dryRun: false, confirm: true } as never,
+        ctx as never,
+      );
+      const post = calls.find((c) =>
+        c.method === "POST" && c.path === "/rest/notes"
+      )!;
+      assertEquals(
+        (post.body as Record<string, unknown>).noteHash,
+        await hashNote(NOTE_TEST_KEY, "post", "y"),
+      );
+    } finally {
+      restore();
+    }
+  }
+});
+
+// --- createNote population ---------------------------------------------------
+
+Deno.test("createNote: noteHash field ABSENT => write succeeds, no noteHash, no bodyHash (ADV-2)", async () => {
+  __clearNoteFieldCache();
+  const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return noteMeta(false);
+    if (method === "POST" && path === "/rest/notes") {
+      return { data: { createNote: { id: "n1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.createNote.execute(
+      { title: "Hi", body: "Body", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    const post = calls.find((c) =>
+      c.method === "POST" && c.path === "/rest/notes"
+    )!;
+    assertEquals("noteHash" in (post.body as Record<string, unknown>), false);
+    assertEquals(writes[writes.length - 1].data.action, "created");
+    assertEquals("bodyHash" in writes[writes.length - 1].data, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote: field PROVISIONED + key => stamps keyed noteHash on the POST + bodyHash snapshot", async () => {
+  __clearNoteFieldCache();
+  const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+    if (method === "POST" && path === "/rest/notes") {
+      return { data: { createNote: { id: "n1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.createNote.execute(
+      { title: "Hi", body: "Body", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    const post = calls.find((c) =>
+      c.method === "POST" && c.path === "/rest/notes"
+    )!;
+    const expected = await hashNote(NOTE_TEST_KEY, "Hi", "Body");
+    assertEquals((post.body as Record<string, unknown>).noteHash, expected);
+    assertEquals(writes[writes.length - 1].data.bodyHash, expected);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote: field PROVISIONED + EMPTY key => FAILS CLOSED, no note POST (SEC-5)", async () => {
+  __clearNoteFieldCache();
+  const { ctx } = noteWriteCtx("");
+  const { calls, restore } = stubTwentyFetch((_m, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+    return {};
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.createNote.execute(
+          { title: "Hi", body: "Body", dryRun: false, confirm: true } as never,
+          ctx as never,
+        ),
+      Error,
+      "empty",
+    );
+    assert(!calls.some((c) => c.method === "POST" && c.path === "/rest/notes"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("createNote dryRun: plans with no metadata read and no hash", async () => {
+  __clearNoteFieldCache();
+  const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  try {
+    await model.methods.createNote.execute(
+      { title: "Hi", body: "Body", dryRun: true, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[writes.length - 1].data.action, "planned-create");
+    assertEquals("bodyHash" in writes[writes.length - 1].data, false);
+    assert(!calls.some((c) => c.path.startsWith("/rest/metadata/objects")));
+  } finally {
+    restore();
+  }
+});
+
+// --- updateNote population ---------------------------------------------------
+
+const U_NOTE = "11111111-1111-1111-1111-111111111111";
+
+Deno.test("updateNote: provisioned + key, title+body => PATCH carries keyed noteHash + bodyHash snapshot", async () => {
+  __clearNoteFieldCache();
+  const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      return { body: noteMeta(true) };
+    }
+    if (method === "GET") {
+      return {
+        body: {
+          data: {
+            note: { id: U_NOTE, title: "old", bodyV2: { markdown: "oldbody" } },
+          },
+        },
+      };
+    }
+    return { body: {} };
+  });
+  try {
+    await model.methods.updateNote.execute(
+      {
+        noteId: U_NOTE,
+        title: "New",
+        body: "NewBody",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH")!;
+    const expected = await hashNote(NOTE_TEST_KEY, "New", "NewBody");
+    assertEquals((patch.body as Record<string, unknown>).noteHash, expected);
+    assertEquals(writes[writes.length - 1].data.bodyHash, expected);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote body-only: hash covers EXISTING title + new body; title not PATCHed", async () => {
+  __clearNoteFieldCache();
+  const { ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      return { body: noteMeta(true) };
+    }
+    if (method === "GET") {
+      return {
+        body: {
+          data: {
+            note: {
+              id: U_NOTE,
+              title: "Existing Title",
+              bodyV2: { markdown: "oldbody" },
+            },
+          },
+        },
+      };
+    }
+    return { body: {} };
+  });
+  try {
+    await model.methods.updateNote.execute(
+      {
+        noteId: U_NOTE,
+        body: "NewBody",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH")!;
+    assertEquals(
+      (patch.body as Record<string, unknown>).noteHash,
+      await hashNote(NOTE_TEST_KEY, "Existing Title", "NewBody"),
+    );
+    assertEquals("title" in (patch.body as Record<string, unknown>), false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote title-only: hash covers new title + EXISTING body; body never leaves the fetch", async () => {
+  __clearNoteFieldCache();
+  const { writes, ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      return { body: noteMeta(true) };
+    }
+    if (method === "GET") {
+      return {
+        body: {
+          data: {
+            note: {
+              id: U_NOTE,
+              title: "old",
+              bodyV2: { markdown: "SECRET-BODY" },
+            },
+          },
+        },
+      };
+    }
+    return { body: {} };
+  });
+  try {
+    await model.methods.updateNote.execute(
+      {
+        noteId: U_NOTE,
+        title: "New Title",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH")!;
+    assertEquals(
+      (patch.body as Record<string, unknown>).noteHash,
+      await hashNote(NOTE_TEST_KEY, "New Title", "SECRET-BODY"),
+    );
+    assertEquals("bodyV2" in (patch.body as Record<string, unknown>), false);
+    // The SR-1 body is used only to hash — never snapshotted.
+    for (const w of writes) {
+      assertEquals(JSON.stringify(w.data).includes("SECRET-BODY"), false);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote: provisioned + EMPTY key => FAILS CLOSED, no PATCH (SEC-5)", async () => {
+  __clearNoteFieldCache();
+  const { ctx } = noteWriteCtx("");
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      return { body: noteMeta(true) };
+    }
+    if (method === "GET") {
+      return {
+        body: {
+          data: { note: { id: U_NOTE, title: "t", bodyV2: { markdown: "b" } } },
+        },
+      };
+    }
+    return { body: {} };
+  });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.updateNote.execute(
+          {
+            noteId: U_NOTE,
+            title: "New",
+            body: "B",
+            dryRun: false,
+            confirm: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "empty",
+    );
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("updateNote: field ABSENT => PATCH has no noteHash (never breaks the write)", async () => {
+  __clearNoteFieldCache();
+  const { ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      return { body: noteMeta(false) };
+    }
+    if (method === "GET") {
+      return {
+        body: {
+          data: { note: { id: U_NOTE, title: "t", bodyV2: { markdown: "b" } } },
+        },
+      };
+    }
+    return { body: {} };
+  });
+  try {
+    await model.methods.updateNote.execute(
+      {
+        noteId: U_NOTE,
+        title: "New",
+        body: "B",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const patch = calls.find((c) => c.method === "PATCH")!;
+    assertEquals("noteHash" in (patch.body as Record<string, unknown>), false);
+  } finally {
+    restore();
+  }
+});
+
+// --- provisioned-ness cache -------------------------------------------------
+
+Deno.test("noteHash provisioned-ness is memoized per baseUrl; __clearNoteFieldCache forces a re-read", async () => {
+  __clearNoteFieldCache();
+  const { ctx } = noteWriteCtx(NOTE_TEST_KEY);
+  let metaReads = 0;
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      metaReads++;
+      return noteMeta(true);
+    }
+    if (method === "POST" && path === "/rest/notes") {
+      return { data: { createNote: { id: "n1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.createNote.execute(
+      { title: "A", body: "1", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    await model.methods.createNote.execute(
+      { title: "B", body: "2", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(metaReads, 1); // 2nd write served from the memo
+    __clearNoteFieldCache();
+    await model.methods.createNote.execute(
+      { title: "C", body: "3", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(metaReads, 2); // re-read after clear
+  } finally {
+    restore();
+  }
+});
+
+// --- pushLeadsContract: the lead sink never hashes --------------------------
+
+Deno.test("pushLeadsContract: push_leads note-write carries NO noteHash even when provisioned + key set", async () => {
+  __clearNoteFieldCache();
+  const ctx = {
+    ...gateCtx,
+    globalArgs: { ...gateCtx.globalArgs, noteHashHmacKey: NOTE_TEST_KEY },
+  };
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (path.startsWith("/rest/metadata/objects")) return noteMeta(true);
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      return { data: { people: [] } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      return { data: { createPerson: { id: "p1" } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      return { data: { companies: [] } };
+    }
+    if (method === "POST" && path === "/rest/companies") {
+      return { data: { createCompany: { id: "c1" } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "POST" && path === "/rest/opportunities") {
+      return { data: { createOpportunity: { id: "o1" } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/noteTargets")) {
+      return { data: { noteTargets: [] } };
+    }
+    if (method === "POST" && path === "/rest/noteTargets") {
+      return {
+        data: {
+          createNoteTarget: { targetPersonId: "p1", targetOpportunityId: "o1" },
+        },
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/notes")) {
+      return { data: { notes: [] } };
+    }
+    if (method === "POST" && path === "/rest/notes") {
+      return { data: { createNote: { id: "n1" } } };
+    }
+    return {};
+  });
+  try {
+    await model.methods.push_leads.execute(
+      {
+        leads: [baseLead],
+        kvEntries: [],
+        confirm: true,
+        dryRun: false,
+        maxBatch: 200,
+      } as never,
+      ctx as never,
+    );
+    const notePosts = calls.filter((c) =>
+      c.method === "POST" && c.path === "/rest/notes"
+    );
+    assert(notePosts.length >= 1, "expected at least one note POST");
+    for (const p of notePosts) {
+      assertEquals("noteHash" in (p.body as Record<string, unknown>), false);
+    }
   } finally {
     restore();
   }

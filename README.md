@@ -47,13 +47,14 @@ swamp model create @shrug/twenty crm \
 
 ### Global arguments
 
-| Argument                  | Default                   | Purpose                                                                                              |
-| ------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `baseUrl`                 | `https://crm.example.com` | Twenty base URL (no trailing slash).                                                                 |
-| `apiToken`                | — (required, sensitive)   | Twenty REST bearer token. Vault-resolved; never logged (length-only).                                |
-| `opportunityStage`        | `NEW`                     | Stage for new Opportunities. Twenty defaults: `NEW`, `SCREENING`, `MEETING`, `PROPOSAL`, `CUSTOMER`. |
-| `emailDomainBlocklist`    | consumer/free providers   | Domains that never get a Company created/linked. Replaces the built-in default when set.             |
-| `emergencyRestrictedRole` | `""`                      | Informational only (see [Emergency handling](#emergency-handling)).                                  |
+| Argument                  | Default                    | Purpose                                                                                                                                                     |
+| ------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`                 | `https://crm.example.com`  | Twenty base URL (no trailing slash).                                                                                                                        |
+| `apiToken`                | — (required, sensitive)    | Twenty REST bearer token. Vault-resolved; never logged (length-only).                                                                                       |
+| `opportunityStage`        | `NEW`                      | Stage for new Opportunities. Twenty defaults: `NEW`, `SCREENING`, `MEETING`, `PROPOSAL`, `CUSTOMER`.                                                        |
+| `emailDomainBlocklist`    | consumer/free providers    | Domains that never get a Company created/linked. Replaces the built-in default when set.                                                                    |
+| `emergencyRestrictedRole` | `""`                       | Informational only (see [Emergency handling](#emergency-handling)).                                                                                         |
+| `noteHashHmacKey`         | `""` (optional, sensitive) | Keyed-HMAC secret for note reconciliation (see [Note reconciliation](#note-reconciliation)). Vault-resolved; never logged (length-only), never snapshotted. |
 
 ## First-run setup
 
@@ -161,6 +162,7 @@ make an API call.
 | `ping`                    | read   | Reachability + auth probe (authed `GET /rest/people?limit=1`).                                                                                                                  |
 | `introspectSchema`        | read   | Objects, Opportunity stage enum, required-field presence.                                                                                                                       |
 | `ensureLeadFields`        | write¹ | Idempotently provision the `leadId` / `isEmergency` custom fields.                                                                                                              |
+| `ensureNoteFields`        | write¹ | Idempotently provision the `noteHash` (TEXT) field on **Note** — enables [Note reconciliation](#note-reconciliation).                                                           |
 | `findPersonByLeadId`      | read   | Look up a Person by the `leadId` marker.                                                                                                                                        |
 | `findOpportunityByLeadId` | read   | Look up an Opportunity by the `leadId` marker (the primary idempotency check).                                                                                                  |
 | `push_leads`              | write¹ | The fan-out lead sink (see above).                                                                                                                                              |
@@ -186,6 +188,56 @@ existing body ONLY under `confirm` (a `dryRun` without `confirm` makes no read
 at all) and never persists it. Per-id gating bounds a single call — not a
 scripted `listNotes`→`getNoteBody` loop, which can still reconstruct a bulk read
 one audited call at a time.
+
+### Note reconciliation
+
+`@shrug/twenty` can bring managed Notes toward parity with the opportunities
+reconciler (YAML = truth, drift-aware) **without** crossing the note-body
+privacy boundary on the hot path. It does this with a content hash carried on
+the Note record:
+
+- Run `ensureNoteFields --input confirm=true` once to provision `noteHash`
+  (TEXT) on **Note**. Provisioning it **enables population**.
+- Set the `noteHashHmacKey` global from a vault, e.g.
+  `--global-arg 'noteHashHmacKey=${{ vault.get("twenty", "note-hash-hmac-key") }}'`.
+- With the field provisioned, `createNote` / `updateNote` stamp `noteHash` — a
+  **keyed HMAC-SHA256** over a canonical `{title, body}` serialization — in the
+  same write. `listNotes` / `mapNoteView` surface it **body-free** (`leadId` +
+  `noteHash`, never a body), so a reconciler resolves managed notes and detects
+  YAML-side drift by matching hashes, never by reading a body.
+
+Why a **keyed** HMAC and not a plain digest: surfacing the hash body-free must
+not become a brute-force/confirmation oracle for low-entropy templated lead-note
+bodies. The key is **sensitive** — logged length-only, never snapshotted,
+redacted in errors — exactly like `apiToken`. The same vault key is read by the
+repo-side notes-drift report so both sides hash byte-identically.
+
+Use a **high-entropy** secret (e.g. `openssl rand -hex 32`). The fail-closed
+guard rejects only an _empty_ key, not a weak one — a short/guessable value
+technically passes but undermines SEC-1/SEC-2 (a keyed HMAC only resists an
+offline oracle when the key is unguessable). Do not set a placeholder value "to
+fill in later": provisioning `note.noteHash` makes the key mandatory, so
+provision the field and set a real key together.
+
+**Fail closed (important):** once `note.noteHash` is provisioned, `createNote` /
+`updateNote` **refuse** (throw) when `noteHashHmacKey` is empty, rather than
+store a zero-confidentiality empty-keyed hash — so if you provision the field
+you must also set the key. This applies to **every** caller of those two
+methods, not just a reconciler. A note whose `noteHash` field is **not**
+provisioned simply skips the hash and the write is never broken.
+
+`push_leads` (and its internal `ensureNoteForLead`) **never** hashes — the lead
+sink is unaffected and needs no key even when `note.noteHash` is provisioned.
+`appendNote` also does not maintain `noteHash` (it is a manual op outside the
+reconcile loop).
+
+**Scope boundary:** the hash is a **write-time** value, so a Twenty UI /
+out-of-band body edit does not change it and is therefore invisible to a
+reconciler — consistent with the "manage Twenty solely via swamp" model. Such an
+edit is not flagged and not clobbered **so long as the note YAML stays static**;
+it can be overwritten if the YAML later changes (the next full-replace cannot
+see the invisible UI edit). This non-clobber property is **conditional**, not
+absolute.
 
 ### upsertOpportunity fields
 

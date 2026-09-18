@@ -112,6 +112,13 @@ const GlobalArgsSchema = z.object({
     .describe(
       "Source Channel SELECT option (UPPER_SNAKE, e.g. DIRECT) stamped on Opportunities that push_leads CREATES, for analytics segmentation. Empty (default) = do not set the field — leave empty until the opportunity.sourceChannel SELECT is provisioned (ensureOpportunitySegmentation / ensureField), since writing an unprovisioned field fails the create. Contact-form leads are inbound-direct, so DIRECT is the natural value once the field exists.",
     ),
+  noteHashHmacKey: z
+    .string()
+    .default("")
+    .meta({ sensitive: true })
+    .describe(
+      'OPTIONAL keyed-HMAC secret for note reconciliation (TWENTY-NOTE-RECONCILE). Resolve from a vault via CEL (e.g. vault.get("twenty", "note-hash-hmac-key")); NEVER hard-code. The repo-side notes-drift report reads the SAME vault key so both sides HMAC byte-identically (SEC-1, the sole ext<->report coupling). Empty (default) = note-hash surfacing still works (listNotes returns any already-stored hash — no key needed), but POPULATION is gated: population is ENABLED by provisioning the note.noteHash field, and when that field IS provisioned createNote/updateNote FAIL CLOSED on an empty key (refuse the write) rather than store a zero-confidentiality empty-keyed hash (SEC-5/ADV-10). SENSITIVE: logged length-only, never snapshotted, redacted in errors — same discipline as apiToken (SEC-6). push_leads/ensureNoteForLead never hash, so the lead sink is unaffected by this key.',
+    ),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
@@ -1634,17 +1641,29 @@ export interface NoteView {
   id: string;
   title?: string;
   leadId?: string;
+  noteHash?: string;
   createdAt?: string;
   updatedAt?: string;
 }
 
-/** Map a raw Note REST record to the compact {@link NoteView} (no body). */
+/**
+ * Map a raw Note REST record to the compact {@link NoteView} (no body). Surfaces
+ * `noteHash` — the stored KEYED HMAC of title+body (TWENTY-NOTE-RECONCILE) — when
+ * present, still body-FREE: it is the reconciler's single read surface
+ * (leadId + noteHash per note, never a body). The hash is a keyed HMAC (SEC-1),
+ * so surfacing it is not an oracle; omitted when the note.noteHash field is
+ * unprovisioned or empty (legacy notes read as "hash-unknown" on the report side,
+ * ADV-6). Surfacing needs no HMAC key (returns the already-stored value, OQ3).
+ */
 export function mapNoteView(rec: Record<string, unknown>): NoteView {
   const v: NoteView = { id: String(rec.id ?? "") };
   const title = rec.title != null ? String(rec.title) : "";
   const m = title.match(INBOUND_LEAD_TITLE_RE); // SR-1 / CR-A-5
   if (m && validateLeadId(m[1])) v.title = title;
   if (rec.leadId != null && rec.leadId !== "") v.leadId = String(rec.leadId);
+  if (rec.noteHash != null && rec.noteHash !== "") {
+    v.noteHash = String(rec.noteHash);
+  }
   if (rec.createdAt) v.createdAt = String(rec.createdAt);
   if (rec.updatedAt) v.updatedAt = String(rec.updatedAt);
   return v;
@@ -1677,6 +1696,60 @@ export async function listInstanceHash(obj: unknown): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("")
     .slice(0, 16);
+}
+
+/**
+ * Canonical serialization of a Note's {title, body} for hashing (TWENTY-NOTE-
+ * RECONCILE, OQ2/ADV-3). Pinned ONCE here and MUST be mirrored BYTE-IDENTICALLY
+ * by the repo-side notes-drift report — this canonical form + the keyed-HMAC in
+ * {@link hashNote} are the sole ext<->report coupling, and a shared fixture
+ * vector under a NON-PRODUCTION test key is the regression guard (SEC-8: never
+ * commit a real-key vector). Deterministic sorted-key JSON via canonicalJson;
+ * title and body are serialized VERBATIM (NO newline normalization — note bodies
+ * are stored verbatim markdown, so normalizing here would diverge the stored
+ * hash from the byte content). Covering title+body folds title drift into the
+ * hash so the reconciler never needs the SR-1-guarded title surfaced (ADV-3).
+ */
+export function canonicalNote(title: string, body: string): string {
+  return canonicalJson({ title, body });
+}
+
+/**
+ * Keyed HMAC-SHA256 (lowercase hex) over {@link canonicalNote} using the vault-
+ * held note-hash key (TWENTY-NOTE-RECONCILE). SEC-1/SEC-2: a KEYED HMAC, NOT a
+ * plain digest — so the value stored on note.noteHash and surfaced body-free on
+ * listNotes is not a brute-force/confirmation oracle for low-entropy templated
+ * lead-note bodies. ADV-3: covers TITLE+BODY. SEC-5 FAIL CLOSED: refuses an
+ * empty key rather than hashing with an empty (public) key, which would silently
+ * collapse the SEC-1/SEC-2 confidentiality. The same fail-closed guard binds the
+ * repo-side report's mirrored hashNote (SEC-7).
+ */
+export async function hashNote(
+  key: string,
+  title: string,
+  body: string,
+): Promise<string> {
+  if (!key) {
+    throw new Error(
+      "hashNote: refusing to compute a note hash with an empty HMAC key " +
+        "(SEC-5 fail-closed) — an empty key is zero-confidentiality",
+    );
+  }
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    new TextEncoder().encode(canonicalNote(title, body)),
+  );
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /**
@@ -2962,6 +3035,74 @@ async function findNoteByLeadId(
   return unwrapList(json, "notes")[0] ?? null;
 }
 
+// --- noteHash provisioned-ness (TWENTY-NOTE-RECONCILE, ADV-2/OQ8) -----------
+
+/**
+ * Memo of whether note.noteHash is provisioned, keyed by baseUrl with a short
+ * TTL, so the createNote/updateNote population guard determines provisioned-ness
+ * "from the schema (introspect / a cached check), not by assuming" (ADV-2)
+ * WITHOUT a full metadata read on every write (OQ8). A serve process reuses the
+ * cached answer across writes; a one-shot CLI reads once. Cleared by
+ * {@link __clearNoteFieldCache} in tests (module state would otherwise leak
+ * across cases sharing a baseUrl).
+ */
+const noteHashFieldCache = new Map<
+  string,
+  { expires: number; present: boolean }
+>();
+const NOTE_FIELD_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Test hook: drop the noteHash provisioned-ness memo. */
+export function __clearNoteFieldCache(): void {
+  noteHashFieldCache.clear();
+}
+
+/**
+ * True iff the workspace has provisioned the note.noteHash TEXT field
+ * (ensureNoteFields). Memoized per baseUrl (see {@link noteHashFieldCache}).
+ */
+async function noteHashFieldProvisioned(cfg: TwentyCfg): Promise<boolean> {
+  const now = Date.now();
+  const cached = noteHashFieldCache.get(cfg.baseUrl);
+  if (cached && cached.expires > now) return cached.present;
+  const objs = await fetchObjectsMeta(cfg);
+  const note = objs.find((o) => String(o.nameSingular ?? "") === "note");
+  const fields = (note?.fields ?? []) as Array<Record<string, unknown>>;
+  const present = (Array.isArray(fields) ? fields : []).some(
+    (f) => String(f.name ?? "") === "noteHash",
+  );
+  noteHashFieldCache.set(cfg.baseUrl, {
+    expires: now + NOTE_FIELD_CACHE_TTL_MS,
+    present,
+  });
+  return present;
+}
+
+/**
+ * The population decision for the opted-in reconcile writers (createNote/
+ * updateNote): compute the keyed noteHash for `title`+`body` when note.noteHash
+ * is provisioned, else return undefined (field absent ⇒ skip the hash, NEVER
+ * break the write — ADV-2). FAIL CLOSED (SEC-5): when the field IS provisioned
+ * but the HMAC key is empty/unset, THROW rather than store an empty-keyed hash.
+ * push_leads/ensureNoteForLead do NOT call this — the lead sink never hashes.
+ */
+async function computeNoteHashForWrite(
+  cfg: GlobalArgs,
+  title: string,
+  body: string,
+): Promise<string | undefined> {
+  if (!(await noteHashFieldProvisioned(cfg))) return undefined;
+  const key = cfg.noteHashHmacKey ?? "";
+  if (!key) {
+    throw new Error(
+      "note.noteHash is provisioned but noteHashHmacKey is empty — refusing " +
+        "to write an empty-keyed (zero-confidentiality) note hash (SEC-5 fail " +
+        "closed). Set the vault-held HMAC key, or unprovision note.noteHash.",
+    );
+  }
+  return await hashNote(key, title, body);
+}
+
 // --- Note write core (TWENTY-NOTE-MGMT) -------------------------------------
 
 /**
@@ -3051,6 +3192,12 @@ async function createOrReuseNote(
     body?: string;
     leadId?: string;
     dedupByLeadId?: boolean;
+    // Pre-computed keyed HMAC of title+body (TWENTY-NOTE-RECONCILE). Set ONLY by
+    // the opted-in createNote reconcile writer; ensureNoteForLead (push_leads)
+    // NEVER passes it, so the shared lead-sink note-write path never stores a
+    // noteHash and stays UNCHANGED (pushLeadsContract). Written only on a real
+    // CREATE — the leadId dedup-reuse path leaves the existing note untouched.
+    noteHash?: string;
   },
 ): Promise<{ noteId: string; created: boolean }> {
   if (input.dedupByLeadId && input.leadId) {
@@ -3061,6 +3208,9 @@ async function createOrReuseNote(
   if (input.body != null) bodyRec.bodyV2 = { markdown: input.body };
   if (input.leadId != null && input.leadId !== "") {
     bodyRec.leadId = input.leadId;
+  }
+  if (input.noteHash != null && input.noteHash !== "") {
+    bodyRec.noteHash = input.noteHash;
   }
   const json = await noteWriteRequest(
     cfg,
@@ -3245,6 +3395,19 @@ const REQUIRED_FIELDS: ReadonlyArray<
     label: "Is Emergency",
     type: "BOOLEAN",
   },
+];
+
+/**
+ * The custom fields note reconciliation depends on (TWENTY-NOTE-RECONCILE),
+ * provisioned by the thin ensureNoteFields wrapper (parallels ensureLeadFields
+ * over REQUIRED_FIELDS). `noteHash` (TEXT) stores the keyed HMAC of title+body;
+ * provisioning it ENABLES population (createNote/updateNote then require the
+ * HMAC key, SEC-5). note.leadId is already covered by REQUIRED_FIELDS.
+ */
+const NOTE_FIELDS: ReadonlyArray<
+  { object: string; name: string; label: string; type: string }
+> = [
+  { object: "note", name: "noteHash", label: "Note Hash", type: "TEXT" },
 ];
 
 // --- Resource schemas -------------------------------------------------------
@@ -3911,6 +4074,12 @@ const NoteViewSchema = z.object({
   id: z.string(),
   title: z.string().optional(),
   leadId: z.string().optional(),
+  noteHash: z
+    .string()
+    .optional()
+    .describe(
+      "Stored KEYED HMAC of the note's title+body (TWENTY-NOTE-RECONCILE) — body-FREE; the reconciler's match key alongside leadId. Absent for legacy/unprovisioned notes (hash-unknown).",
+    ),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
 });
@@ -4057,6 +4226,12 @@ const NoteWriteSchema = z.object({
     .number()
     .optional()
     .describe("Length of the resulting body — NEVER the body text"),
+  bodyHash: z
+    .string()
+    .optional()
+    .describe(
+      "The KEYED HMAC-SHA256 (hex) of the note's TITLE+BODY just written — i.e. the value stored on note.noteHash (TWENTY-NOTE-RECONCILE). A KEYED HMAC (SEC-2), never a plain digest, so not an oracle at rest; covers title+body, NOT body-only (ADV-11). Present only when the noteHash field is provisioned and a real create/update stored it; absent otherwise.",
+    ),
   dryRun: z.boolean(),
   confirmed: z.boolean(),
   writtenAt: z.iso.datetime(),
@@ -4541,7 +4716,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.17.3",
+  version: "2026.09.18.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -4670,6 +4845,14 @@ export const model = {
       toVersion: "2026.09.17.3",
       description:
         "Add removeSelectOption (TWENTY-OPTION-REMOVE): confirm-gated, allowlisted, fail-closed retirement of a SELECT option from an opportunity picklist (stage/sourceChannel/lineOfBusiness/offering) — the reverse of ensureStageOption. Reads the full option set + normalized defaultValue, refuses when the value is the field default / still referenced by any opportunity (authoritative server-side totalCount, fail-closed on no-total) / on a concurrent option-array edit; force overrides the in-use refusal only with a matching expectedInUseCount ack. Adds the selectOptionRemoval snapshot (folded refCount, no PII). globalArguments unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.18.1",
+      description:
+        'Add note reconciliation (TWENTY-NOTE-RECONCILE), extension scope A+B: ensureNoteFields provisions a noteHash (TEXT) field on Note; a keyed HMAC-SHA256 hashNote helper (canonical title+body serialization) stamps noteHash on createNote/updateNote when the field is provisioned (fail-closed on an empty key, SEC-5), surfaced body-free on listNotes/mapNoteView/NoteView and recorded as noteWrite.bodyHash. push_leads/ensureNoteForLead are UNCHANGED — the lead sink never hashes. globalArguments gains one OPTIONAL SENSITIVE field, noteHashHmacKey (default "", length-only logging, never snapshotted), so this is a no-op attribute migration — existing instances lazily acquire the empty default and behave identically until it is set (and until note.noteHash is provisioned).',
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -5011,6 +5194,82 @@ export const model = {
         const handle = await context.writeResource(
           "fieldsEnsured",
           "fieldsEnsured",
+          {
+            baseUrl: cfg.baseUrl,
+            created,
+            alreadyPresent,
+            failed,
+            retrievedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    ensureNoteFields: {
+      description:
+        "Idempotently provision the note-reconciliation custom fields (TWENTY-NOTE-RECONCILE): noteHash (TEXT) on Note, via POST /rest/metadata/fields. A thin wrapper over the shared ensureFieldOnce core, paralleling ensureLeadFields. Already-present fields are skipped (a wrong-type field is reported, never mutated). Confirm-gated (mutates workspace metadata). Provisioning noteHash ENABLES population: createNote/updateNote then populate noteHash and REQUIRE the noteHashHmacKey global (SEC-5 fail-closed on an empty key). Snapshots a `fieldsEnsured` resource (instance fieldsEnsured-note).",
+      arguments: z.object({
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Must be true to apply — mutates workspace object metadata",
+          ),
+      }),
+      execute: async (
+        args: { confirm: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.confirm) {
+          throw new Error(
+            "Refusing to ensure fields without confirm:true (mutates workspace metadata)",
+          );
+        }
+        const objs = await fetchObjectsMeta(cfg);
+        const created: string[] = [];
+        const alreadyPresent: string[] = [];
+        const failed: Array<{ field: string; error: string }> = [];
+        for (const nf of NOTE_FIELDS) {
+          const key = `${nf.object}.${nf.name}`;
+          try {
+            const outcome = await ensureFieldOnce(
+              cfg,
+              {
+                objectNameSingular: nf.object,
+                name: nf.name,
+                label: nf.label,
+                type: nf.type as EnsureFieldType,
+              },
+              false,
+              objs,
+            );
+            if (outcome.action === "created") created.push(key);
+            else if (outcome.typeMismatch) {
+              failed.push({ field: key, error: outcome.typeMismatch });
+            } else alreadyPresent.push(key);
+          } catch (e) {
+            failed.push({ field: key, error: redactError(e) });
+          }
+        }
+        // Drop the memoized provisioned-ness UNCONDITIONALLY so the very next
+        // write re-reads truth. Clearing only on created.length would miss the
+        // case where the field was provisioned out-of-band while a stale
+        // `present:false` memo is live: this run would find it alreadyPresent
+        // (created:[]), leave the stale memo, and subsequent createNote/
+        // updateNote would silently skip the hash for up to the TTL (ADV-1).
+        __clearNoteFieldCache();
+        context.logger.info(
+          "ensureNoteFields: {created} created, {present} present, {failed} failed",
+          {
+            created: created.length,
+            present: alreadyPresent.length,
+            failed: failed.length,
+          },
+        );
+        const handle = await context.writeResource(
+          "fieldsEnsured",
+          "fieldsEnsured-note",
           {
             baseUrl: cfg.baseUrl,
             created,
@@ -7173,6 +7432,18 @@ export const model = {
             });
             return { dataHandles: [handle] };
           }
+          // Population guard (TWENTY-NOTE-RECONCILE): createNote is an opted-in
+          // reconcile writer, so when note.noteHash is provisioned it stamps the
+          // keyed HMAC of title+body (fail-closed on an empty key, SEC-5); field
+          // absent ⇒ undefined ⇒ no hash written (ADV-2). Computed pre-create so
+          // it rides the SAME POST; only stored on a real create (never on a
+          // leadId dedup-reuse). push_leads uses ensureNoteForLead, not this
+          // method, so the lead sink never hashes (pushLeadsContract).
+          const noteHash = await computeNoteHashForWrite(
+            cfg,
+            title,
+            body ?? "",
+          );
           // Capture the note id BEFORE reconciling targets (A6) so a link
           // failure never orphans — targets are best-effort, id is returned.
           const { noteId, created } = await createOrReuseNote(cfg, {
@@ -7180,6 +7451,7 @@ export const model = {
             body,
             leadId,
             dedupByLeadId: Boolean(leadId),
+            noteHash,
           });
           const { linked, failed } = await reconcileNoteTargets(
             cfg,
@@ -7187,7 +7459,7 @@ export const model = {
             targets,
             { bestEffort: true },
           );
-          const handle = await context.writeResource("noteWrite", instance, {
+          const createdSnap: Record<string, unknown> = {
             baseUrl: cfg.baseUrl,
             op: "create",
             action: created ? "created" : "present",
@@ -7200,7 +7472,15 @@ export const model = {
             dryRun: false,
             confirmed: true,
             writtenAt: new Date().toISOString(),
-          });
+          };
+          // Only a real create stores the hash; a dedup-reuse leaves the note
+          // (and its existing noteHash) untouched.
+          if (created && noteHash) createdSnap.bodyHash = noteHash;
+          const handle = await context.writeResource(
+            "noteWrite",
+            instance,
+            createdSnap,
+          );
           return { dataHandles: [handle] };
         } catch (e) {
           throw new Error(redactError(e, 300, cfg.apiToken));
@@ -7300,9 +7580,37 @@ export const model = {
             );
             return { dataHandles: [handle] };
           }
+          // Population guard (TWENTY-NOTE-RECONCILE): updateNote is an opted-in
+          // reconcile writer. The hash must cover the note's FULL post-write
+          // title+body, so a body-only update reuses the existing title and a
+          // title-only update reuses the existing body — both read from the
+          // already-fetched `note` (no extra I/O), and the existing body is used
+          // ONLY to hash, never snapshotted/logged (SR-1 intact). Fail-closed on
+          // an empty key when provisioned (SEC-5); field absent ⇒ no hash.
+          // ADV-3 (read-back fidelity): the reconciler's create + full-replace
+          // paths hash the INPUT body, so they match a YAML-derived hash
+          // regardless of any Twenty normalization. Only this title-only path
+          // hashes the READ-BACK bodyV2.markdown. PROBE (twenty-local, Twenty
+          // v2.38.1, 2026-09-18): a created markdown body round-trips
+          // BYTE-IDENTICAL on read-back (trailing spaces + blank lines
+          // preserved), so read-back-body == input-body and the title-only hash
+          // stays consistent with the reconciler. Version-dependent, like the §6
+          // blocknote probe: if a future Twenty normalizes markdown on read, a
+          // title-only update could produce a hash the reconciler reads as
+          // diverged (a self-healing full-replace, never a silent clobber).
+          const finalTitle = hasTitle
+            ? (title ?? "")
+            : String(note.title ?? "");
+          const finalBody = hasBody ? (body ?? "") : noteMarkdown(note);
+          const noteHash = await computeNoteHashForWrite(
+            cfg,
+            finalTitle,
+            finalBody,
+          );
           const patch: Record<string, unknown> = {};
           if (hasTitle) patch.title = title;
           if (hasBody) patch.bodyV2 = { markdown: body };
+          if (noteHash) patch.noteHash = noteHash;
           await noteWriteRequest(
             cfg,
             "PATCH",
@@ -7310,10 +7618,12 @@ export const model = {
             patch,
             "update",
           );
+          const updatedSnap = snap("updated", true);
+          if (noteHash) updatedSnap.bodyHash = noteHash;
           const handle = await context.writeResource(
             "noteWrite",
             instance,
-            snap("updated", true),
+            updatedSnap,
           );
           return { dataHandles: [handle] };
         } catch (e) {
@@ -9844,6 +10154,7 @@ export const model = {
       labels: ["live"],
       appliesTo: [
         "ensureLeadFields",
+        "ensureNoteFields",
         "push_leads",
         "upsertOpportunity",
         "ensureStageOption",
