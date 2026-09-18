@@ -2174,6 +2174,20 @@ async function fetchUpsertObjectMeta(
 // never append an option to the wrong picklist. Extend deliberately.
 const STAGE_OPTION_ALLOWLIST = new Set<string>(["opportunity.stage"]);
 
+// TWENTY-OPTION-REMOVE: the SELECT picklists removeSelectOption may retire an
+// option from. Checked BEFORE any I/O (SO-4 discipline); `force` cannot bypass it.
+// All four opportunity SELECTs (human decision). CAVEAT (ADV-7): opportunity.stage
+// is a STANDARD/system field tied to board OPEN/WON/LOST semantics — its metadata
+// option edits may be constrained differently than the custom SELECTs; verified
+// independently on the sandbox (design OQ6) and the method surfaces a clean error
+// (never a partial write) if Twenty rejects a standard-field option removal.
+const OPTION_REMOVE_ALLOWLIST = new Set<string>([
+  "opportunity.stage",
+  "opportunity.sourceChannel",
+  "opportunity.lineOfBusiness",
+  "opportunity.offering",
+]);
+
 // Twenty option tokens are UPPER_SNAKE (letters/digits/underscore, no spaces).
 const STAGE_OPTION_VALUE_RE = /^[A-Z][A-Z0-9_]*$/;
 
@@ -2240,6 +2254,30 @@ interface SelectFieldMeta {
   fieldId: string;
   type: string;
   options: SelectOption[];
+  /**
+   * The field's default option token, NORMALIZED to the bare value (TWENTY-OPTION-REMOVE
+   * ADV-10): Twenty returns a SELECT field's defaultValue as a quoted enum literal
+   * (e.g. "'NEW'"), so this strips the surrounding single-quotes; null/empty/unset →
+   * undefined (no default). removeSelectOption refuses to remove the default option.
+   */
+  defaultValue?: string;
+}
+
+/**
+ * Normalize a Twenty SELECT field.defaultValue to its bare option token (ADV-10).
+ * Twenty stores the default as a quoted enum literal — e.g. the string `'NEW'`
+ * (with the single-quotes as literal characters) — so a raw compare against the
+ * bare `NEW` token never matches. Strip ONE layer of surrounding single-quotes and
+ * trim; treat null/undefined/empty (and a bare `null` literal) as "no default".
+ */
+function normalizeDefaultValue(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  let s = raw.trim();
+  if (s === "" || s === "null") return undefined;
+  if (s.length >= 2 && s.startsWith("'") && s.endsWith("'")) {
+    s = s.slice(1, -1).trim();
+  }
+  return s === "" ? undefined : s;
 }
 
 /**
@@ -2314,7 +2352,11 @@ async function fetchSelectField(
     // duplicate), so a non-string/empty id hard-stops above rather than degrade.
     return { id: opt.id, value, label, color, position };
   });
-  return { objectId, fieldId, type, options };
+  // ADV-10: capture the field's default option (normalized) so removeSelectOption
+  // can refuse to remove it. Best-effort — an absent/odd-shaped default is treated
+  // as "no default" (undefined), never a hard-stop (ensureStageOption ignores it).
+  const defaultValue = normalizeDefaultValue(field.defaultValue);
+  return { objectId, fieldId, type, options, defaultValue };
 }
 
 /** True if two option arrays are equivalent (keyed by value; id/label/color/position). */
@@ -2324,6 +2366,41 @@ function optionsEquivalent(a: SelectOption[], b: SelectOption[]): boolean {
     JSON.stringify([o.value, o.label, o.color, o.position, o.id ?? ""]);
   const setB = new Set(b.map(key));
   return a.every((o) => setB.has(key(o)));
+}
+
+/**
+ * TWENTY-OPTION-REMOVE anti-orphan count — exact, PII-minimal, fail-closed.
+ * Reads ONLY the authoritative `totalCount` the Twenty REST list envelope exposes
+ * for a server-side `<field>[eq]:<value>` filter (limit=1: at most one record body
+ * transits and is DISCARDED — never paged in bulk, never logged). Server-side
+ * filtering counts custom SELECTs incl. `offering` correctly (the filter is
+ * independent of any node/field selection) and is authoritative so there is no
+ * truncation (ADV-1/ADV-11/SEC-1/SEC-6/SEC-8).
+ *
+ * Returns { count, trusted }. `trusted` is false when the envelope omits a usable
+ * numeric totalCount (no-total) — the caller then REFUSES ('refused-untrusted-count')
+ * rather than trust a silent 0. NOTE (ADV-14): the per-field filter ENCODING is
+ * proven by the positive-control acceptance test (design OQ8: a known-referenced
+ * value must count nonzero and a known-absent value must count 0) — a mis-targeting
+ * filter that silently matches nothing cannot be caught at runtime, only by that test.
+ * `value` is UPPER_SNAKE-validated by the caller and URL-encoded here (anti-injection).
+ */
+async function countOpportunitiesByFieldValue(
+  cfg: TwentyCfg,
+  fieldName: string,
+  value: string,
+): Promise<{ count: number; trusted: boolean }> {
+  const clause = `${fieldName}[eq]:${encodeURIComponent(value)}`;
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    `/rest/opportunities?filter=${clause}&limit=1`,
+  );
+  const tc = (json as { totalCount?: unknown }).totalCount;
+  if (typeof tc === "number" && Number.isFinite(tc) && tc >= 0) {
+    return { count: tc, trusted: true };
+  }
+  return { count: 0, trusted: false };
 }
 
 // --- Generalized field provisioning helpers (TWENTY-ENSURE-FIELD) ------------
@@ -4020,6 +4097,58 @@ const StageOptionSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// TWENTY-OPTION-REMOVE: result of a removeSelectOption run. Emergency-safe
+// (SEC-3/ADV-13): only a SINGLE folded refCount is recorded (emergency+non-emergency
+// total) — never the split — so neither emergency volume nor an emergency-presence
+// bit is inferable. No opportunity names/ids/PII.
+const SelectOptionRemovalSchema = z.object({
+  baseUrl: z.string(),
+  object: z.string(),
+  field: z.string(),
+  value: z.string(),
+  action: z.enum([
+    "absent",
+    "planned-remove",
+    "removed",
+    "refused-in-use",
+    "refused-default",
+    "refused-untrusted-count",
+    "refused-drift",
+  ]),
+  refCount: z
+    .number()
+    .int()
+    .describe(
+      "Total opportunities referencing the value at decision time (emergency+non-emergency folded; the split is never recorded). 0 on the removable path.",
+    ),
+  countTrusted: z
+    .boolean()
+    .describe(
+      "True when a numeric server totalCount was returned for the reference filter (false ⇒ refused-untrusted-count, fail-closed; also false on the pre-count absent/refused-default short-circuits). Whether the filter actually TARGETS the intended field (incl. custom SELECTs like offering) is proven by the OQ8 sandbox positive-control — a pre-prod acceptance gate — not asserted at runtime.",
+    ),
+  emergencyReadReliable: z
+    .boolean()
+    .describe(
+      "Best-effort: true when a live Opportunity read completed this run (the count GET returned); false when no read was attempted (absent/refused-default short-circuits). Defense-in-depth for ADV-5 — does NOT prove row-level emergency visibility, which is covered by the documented token precondition, not by code.",
+    ),
+  forced: z.boolean().describe(
+    "True when the in-use guard was overridden via force.",
+  ),
+  options: z
+    .array(
+      z.object({
+        value: z.string(),
+        label: z.string(),
+        color: z.string(),
+        position: z.number(),
+      }),
+    )
+    .describe(
+      "The resulting (or planned, on dryRun) full option set after removal",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Generalized field-provisioning snapshot (TWENTY-ENSURE-FIELD) ----------
 
 const FieldEnsuredSchema = z.object({
@@ -4412,7 +4541,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.17.2",
+  version: "2026.09.17.3",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -4533,6 +4662,14 @@ export const model = {
       toVersion: "2026.09.17.2",
       description:
         "Add full Note management (TWENTY-NOTE-MGMT): createNote/updateNote/appendNote/linkNote/unlinkNote — confirm-gated, dryRun-by-default write surface over /rest/notes + /rest/noteTargets (ensureNoteForLead refactored to a thin wrapper over the shared create+link core), plus a short-TTL noteWrite snapshot (no body text). appendNote reads the existing body across the SR-1 boundary only under confirm; body writes refuse on a note with a non-empty blocknote until markdown re-derivation is proven. Also folds in the .17.1 adversarial-review remediation: a string/comment-aware read-only twentyGraphQL guard, redaction of listViews' sample + ensureOpportunityViews' errors. Additive methods + one new resource; globalArguments unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.17.3",
+      description:
+        "Add removeSelectOption (TWENTY-OPTION-REMOVE): confirm-gated, allowlisted, fail-closed retirement of a SELECT option from an opportunity picklist (stage/sourceChannel/lineOfBusiness/offering) — the reverse of ensureStageOption. Reads the full option set + normalized defaultValue, refuses when the value is the field default / still referenced by any opportunity (authoritative server-side totalCount, fail-closed on no-total) / on a concurrent option-array edit; force overrides the in-use refusal only with a matching expectedInUseCount ack. Adds the selectOptionRemoval snapshot (folded refCount, no PII). globalArguments unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -4684,6 +4821,13 @@ export const model = {
       description:
         "Result of an ensureStageOption run: the target picklist, the option, the action taken, and the full option set",
       schema: StageOptionSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "selectOptionRemoval": {
+      description:
+        "Result of a removeSelectOption run: the target picklist, the removed value, the action, the (folded) reference count, and the resulting/planned option set. No PII, no emergency split.",
+      schema: SelectOptionRemovalSchema,
       lifetime: "infinite",
       garbageCollection: 100,
     },
@@ -5100,6 +5244,278 @@ export const model = {
             snap,
           );
           return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e));
+        }
+      },
+    },
+    removeSelectOption: {
+      description:
+        "Retire a SELECT option from an allowlisted opportunity picklist (opportunity.stage/sourceChannel/lineOfBusiness/offering) — the reverse of ensureStageOption. Reads the field's FULL option set and PATCHes it back with the target value DROPPED, preserving every surviving option (id/label/color/position) verbatim. FAIL-CLOSED anti-orphan guard: refuses when the value is the field default, when any opportunity still references it (default path), or when the reference count is untrusted. Idempotent — an already-absent value is a no-op success ('absent'). confirm-gated with dryRun defaulting TRUE (a bare call previews and writes nothing); a real removal needs dryRun=false AND confirm=true. `force` overrides the in-use refusal ONLY, and requires expectedInUseCount to match the live count. SELECT-only; MULTI_SELECT/unknown/non-allowlisted targets rejected. Snapshots a `selectOptionRemoval` resource (folded refCount, no PII). PRECONDITION (ADV-5): the token must be an unrestricted-visibility role.",
+      arguments: z.object({
+        objectNameSingular: z
+          .string()
+          .default("opportunity")
+          .describe(
+            "Object owning the field (allowlisted; default opportunity)",
+          ),
+        fieldName: z
+          .string()
+          .describe(
+            "SELECT field name (allowlisted: stage/sourceChannel/lineOfBusiness/offering)",
+          ),
+        value: z
+          .string()
+          .describe("Option token to remove — UPPER_SNAKE (e.g. CLOSED)"),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Must be true (with dryRun:false) to apply — mutates workspace metadata",
+          ),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Preview the planned (reduced) option array + refCount; write nothing. Defaults true.",
+          ),
+        force: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Override the in-use refusal ONLY. Requires expectedInUseCount == the live reference count AND confirm. Never bypasses allowlist/default/drift/re-count guards. Sandbox+Neil gated (design OQ1).",
+          ),
+        expectedInUseCount: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Required when force=true — must equal the live reference count at write time, or the run aborts (acknowledgement token).",
+          ),
+      }),
+      execute: async (
+        args: {
+          objectNameSingular: string;
+          fieldName: string;
+          value: string;
+          confirm: boolean;
+          dryRun: boolean;
+          force: boolean;
+          expectedInUseCount?: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          // Reject any target not on the allowlist BEFORE any I/O; force cannot bypass.
+          const target = `${args.objectNameSingular}.${args.fieldName}`;
+          if (!OPTION_REMOVE_ALLOWLIST.has(target)) {
+            throw new Error(
+              `Target '${target}' is not on the removeSelectOption allowlist (allowed: ${
+                [...OPTION_REMOVE_ALLOWLIST].join(", ")
+              })`,
+            );
+          }
+          const value = String(args.value ?? "").trim();
+          if (!STAGE_OPTION_VALUE_RE.test(value)) {
+            throw new Error(
+              "Invalid option value: must be UPPER_SNAKE (A-Z, 0-9, _), no spaces",
+            );
+          }
+          // dryRun (default true) previews; a real write needs confirm AND dryRun:false.
+          if (!args.confirm && !args.dryRun) {
+            throw new Error(
+              "Refusing to remove a stage option without confirm:true (mutates workspace metadata). Use dryRun:true (default) to preview.",
+            );
+          }
+
+          // Mandatory full-shape read (+ normalized default); hard-stops on non-SELECT / lossy.
+          const field = await fetchSelectField(
+            cfg,
+            args.objectNameSingular,
+            args.fieldName,
+          );
+          const optionsFor = (opts: SelectOption[]) =>
+            opts.map((o) => ({
+              value: o.value,
+              label: o.label,
+              color: o.color,
+              position: o.position,
+            }));
+          // Set true ONLY when force actually overrides an in-use (count>0)
+          // refusal, so the snapshot's `forced` bit is an honest audit signal.
+          let overrodeInUse = false;
+          const writeSnap = async (
+            action:
+              | "absent"
+              | "planned-remove"
+              | "removed"
+              | "refused-in-use"
+              | "refused-default"
+              | "refused-untrusted-count"
+              | "refused-drift",
+            opts: SelectOption[],
+            refCount: number,
+            countTrusted: boolean,
+            emergencyReadReliable: boolean,
+          ): Promise<ExecuteResult> => {
+            context.logger.info(
+              "removeSelectOption {target} value={value}: {action}",
+              { target, value, action },
+            );
+            const handle = await context.writeResource(
+              "selectOptionRemoval",
+              `optremove-${args.objectNameSingular}-${args.fieldName}-${value}`,
+              {
+                baseUrl: cfg.baseUrl,
+                object: args.objectNameSingular,
+                field: args.fieldName,
+                value,
+                action,
+                refCount,
+                countTrusted,
+                emergencyReadReliable,
+                // CR-2: `forced` is honest — true ONLY when force actually
+                // overrode an in-use (count>0) refusal, not merely when force
+                // was passed. False on every refusal and on a count==0 run.
+                forced: overrodeInUse,
+                options: optionsFor(opts),
+                retrievedAt: new Date().toISOString(),
+              },
+            );
+            return { dataHandles: [handle] };
+          };
+
+          const existing = field.options.find((o) => o.value === value);
+          // Idempotent: removing an already-absent value is a success no-op.
+          // CR-1: no count/read ran on this path, so countTrusted and
+          // emergencyReadReliable are recorded false (not asserted true).
+          if (!existing) {
+            return await writeSnap("absent", field.options, 0, false, false);
+          }
+          // ADV-3/ADV-10: never remove the field's (normalized) default option.
+          // CR-1: refuses BEFORE any count/read — audit bits false, not true.
+          if (field.defaultValue && field.defaultValue === value) {
+            return await writeSnap(
+              "refused-default",
+              field.options,
+              0,
+              false,
+              false,
+            );
+          }
+
+          // Anti-orphan count (authoritative totalCount; fail-closed on no-total).
+          const c = await countOpportunitiesByFieldValue(
+            cfg,
+            args.fieldName,
+            value,
+          );
+          const emergencyReadReliable = true; // the count GET succeeded ⇒ token can read Opportunity.
+          if (!c.trusted) {
+            return await writeSnap(
+              "refused-untrusted-count",
+              field.options,
+              0,
+              false,
+              emergencyReadReliable,
+            );
+          }
+          if (c.count > 0 && !args.force) {
+            return await writeSnap(
+              "refused-in-use",
+              field.options,
+              c.count,
+              true,
+              emergencyReadReliable,
+            );
+          }
+          if (args.force && c.count > 0) {
+            if (args.expectedInUseCount !== c.count) {
+              throw new Error(
+                `force requires expectedInUseCount to equal the live reference count (${c.count}); got ${args.expectedInUseCount}. Re-check and re-run.`,
+              );
+            }
+            // force is genuinely overriding an in-use refusal here.
+            overrodeInUse = true;
+          }
+
+          const reduced = field.options.filter((o) => o.value !== value);
+
+          if (args.dryRun) {
+            return await writeSnap(
+              "planned-remove",
+              reduced,
+              c.count,
+              true,
+              emergencyReadReliable,
+            );
+          }
+
+          // Real write. Optimistic concurrency: re-read options + STRICT drift check
+          // (a concurrent reorder/edit is drift and aborts — no lost update).
+          const fresh = await fetchSelectField(
+            cfg,
+            args.objectNameSingular,
+            args.fieldName,
+          );
+          if (!optionsEquivalent(fresh.options, field.options)) {
+            return await writeSnap(
+              "refused-drift",
+              fresh.options,
+              c.count,
+              true,
+              emergencyReadReliable,
+            );
+          }
+          // Re-count immediately before the write to close the count→write TOCTOU.
+          const rc = await countOpportunitiesByFieldValue(
+            cfg,
+            args.fieldName,
+            value,
+          );
+          if (!rc.trusted) {
+            return await writeSnap(
+              "refused-untrusted-count",
+              field.options,
+              0,
+              false,
+              emergencyReadReliable,
+            );
+          }
+          if (!args.force) {
+            if (rc.count !== 0) {
+              return await writeSnap(
+                "refused-in-use",
+                field.options,
+                rc.count,
+                true,
+                emergencyReadReliable,
+              );
+            }
+          } else if (rc.count !== args.expectedInUseCount) {
+            throw new Error(
+              `force aborted: reference count changed to ${rc.count} (expected ${args.expectedInUseCount}) between check and write. Re-run.`,
+            );
+          }
+
+          // options-only PATCH — Twenty's metadata field PATCH is a partial update,
+          // so sibling attributes (name/label/type/isNullable/defaultValue) are
+          // preserved. Survivors are sent verbatim WITH their ids so Twenty treats
+          // them as the same options (never re-creates/duplicates).
+          await twentyRequest(
+            cfg,
+            "PATCH",
+            `/rest/metadata/fields/${field.fieldId}`,
+            { options: reduced },
+          );
+          return await writeSnap(
+            "removed",
+            reduced,
+            rc.count,
+            true,
+            emergencyReadReliable,
+          );
         } catch (e) {
           throw new Error(redactError(e));
         }

@@ -3449,6 +3449,574 @@ Deno.test("ensureStageOption aborts on concurrent drift (SO-3)", async () => {
   }
 });
 
+// --- removeSelectOption (TWENTY-OPTION-REMOVE) ------------------------------
+
+const REMOVE_OPTS = [
+  ...STAGE_OPTS,
+  { id: "o6", value: "CLOSED", label: "Closed", color: "gray", position: 5 },
+];
+
+function selMeta(
+  fieldName: string,
+  opts: unknown[],
+  defaultValue?: string,
+): Record<string, unknown> {
+  const field: Record<string, unknown> = {
+    name: fieldName,
+    id: "fld1",
+    type: "SELECT",
+    options: opts,
+  };
+  if (defaultValue !== undefined) field.defaultValue = defaultValue;
+  return {
+    data: [{ nameSingular: "opportunity", id: "obj1", fields: [field] }],
+  };
+}
+
+const RM_ARGS = {
+  objectNameSingular: "opportunity",
+  fieldName: "stage",
+  confirm: false,
+  dryRun: true,
+  force: false,
+};
+
+Deno.test("removeSelectOption dryRun: planned-remove, no write, survivors preserved", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 0 } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "planned-remove");
+    assertEquals(writes[0].data.refCount, 0);
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not write on dryRun",
+    );
+    const opts = writes[0].data.options as Array<{ value: string }>;
+    assertEquals(opts.length, 5);
+    assert(!opts.some((o) => o.value === "CLOSED"), "CLOSED must be dropped");
+    for (const v of ["NEW", "SCREENING", "MEETING", "PROPOSAL", "CUSTOMER"]) {
+      assert(opts.some((o) => o.value === v), `dropped survivor ${v}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption confirm: options-only PATCH, survivors verbatim, target gone", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 0 } };
+    }
+    if (method === "PATCH" && path === "/rest/metadata/fields/fld1") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "removed");
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    const body = patch!.body as Record<string, unknown>;
+    assertEquals(Object.keys(body), ["options"]); // options-only
+    const opts = body.options as Array<
+      { id?: string; value: string; label: string; color: string }
+    >;
+    assertEquals(opts.length, 5);
+    assert(!opts.some((o) => o.value === "CLOSED"), "CLOSED must be removed");
+    for (const orig of STAGE_OPTS) {
+      const kept = opts.find((o) => o.value === orig.value);
+      assert(kept, `dropped survivor ${orig.value}`);
+      assertEquals(kept!.id, orig.id); // id preserved verbatim
+      assertEquals(kept!.label, orig.label);
+      assertEquals(kept!.color, orig.color);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption absent value: idempotent no-op, no count, no write", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      {
+        ...RM_ARGS,
+        value: "NONEXISTENT",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "absent");
+    assert(!calls.some((c) => c.method === "PATCH"));
+    assert(
+      !calls.some((c) => c.path.startsWith("/rest/opportunities")),
+      "absent short-circuits before the count",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption refuses the field default (ADV-10 quote-stripped)", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      // Twenty returns the default as a quoted enum literal.
+      return { body: selMeta("stage", REMOVE_OPTS, "'NEW'") };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "NEW", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "refused-default");
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption refuses when the value is still in use (fail-closed)", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 2 } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "refused-in-use");
+    assertEquals(writes[0].data.refCount, 2);
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not orphan a referenced option",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption refuses an untrusted (no-total) count", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { data: [] } }; // no totalCount → untrusted
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "refused-untrusted-count");
+    assertEquals(writes[0].data.countTrusted, false);
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption re-count TOCTOU: races to in-use before the write", async () => {
+  let oppCount = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      oppCount++;
+      return { body: { totalCount: oppCount === 1 ? 0 : 1 } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "refused-in-use");
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "re-count must block the write",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption aborts on concurrent option drift (strict check)", async () => {
+  let getMeta = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      getMeta++;
+      if (getMeta === 1) return { body: selMeta("stage", REMOVE_OPTS) };
+      // pre-write re-read: a drifted set (an extra option appeared)
+      return {
+        body: selMeta("stage", [
+          ...REMOVE_OPTS,
+          {
+            id: "o7",
+            value: "EXTRA",
+            label: "Extra",
+            color: "gray",
+            position: 6,
+          },
+        ]),
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 0 } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "refused-drift");
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not write after drift",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption force: removes an in-use option with a matching ack", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 3 } };
+    }
+    if (method === "PATCH" && path === "/rest/metadata/fields/fld1") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      {
+        ...RM_ARGS,
+        value: "CLOSED",
+        dryRun: false,
+        confirm: true,
+        force: true,
+        expectedInUseCount: 3,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "removed");
+    assertEquals(writes[0].data.forced, true);
+    assert(calls.some((c) => c.method === "PATCH"), "force+ack should write");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption force: aborts on a mismatched expectedInUseCount", async () => {
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 3 } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.removeSelectOption.execute(
+          {
+            ...RM_ARGS,
+            value: "CLOSED",
+            dryRun: false,
+            confirm: true,
+            force: true,
+            expectedInUseCount: 1,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "expectedInUseCount",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption rejects an off-allowlist target before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.removeSelectOption.execute(
+          { ...RM_ARGS, fieldName: "amount", value: "CLOSED" } as never,
+          ctx as never,
+        ),
+      Error,
+      "not on the removeSelectOption allowlist",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption allows the custom offering SELECT (allowlisted)", async () => {
+  const OFFERING = [
+    {
+      id: "f1",
+      value: "MANAGED_IT",
+      label: "Managed IT",
+      color: "blue",
+      position: 0,
+    },
+    {
+      id: "f2",
+      value: "LEGACY_X",
+      label: "Legacy X",
+      color: "gray",
+      position: 1,
+    },
+  ];
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("offering", OFFERING) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 0 } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, fieldName: "offering", value: "LEGACY_X" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "planned-remove");
+    assert(!calls.some((c) => c.method === "PATCH"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption rejects a non-UPPER_SNAKE value before any I/O", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.removeSelectOption.execute(
+          { ...RM_ARGS, value: "not snake" } as never,
+          ctx as never,
+        ),
+      Error,
+      "UPPER_SNAKE",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption refuses a real write without confirm", async () => {
+  const { calls, restore } = stubFetchStatus(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.removeSelectOption.execute(
+          {
+            ...RM_ARGS,
+            value: "CLOSED",
+            dryRun: false,
+            confirm: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "confirm",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption count applies the field[eq]:value filter with limit=1 (CR-3 positive control)", async () => {
+  const cases: Array<[string, unknown[], string]> = [
+    ["stage", REMOVE_OPTS, "CLOSED"],
+    ["offering", [
+      {
+        id: "f1",
+        value: "LEGACY_X",
+        label: "Legacy X",
+        color: "gray",
+        position: 0,
+      },
+      { id: "f2", value: "KEEP", label: "Keep", color: "blue", position: 1 },
+    ], "LEGACY_X"],
+  ];
+  for (const [fieldName, opts, value] of cases) {
+    const { calls, restore } = stubFetchStatus((method, path) => {
+      if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+        return { body: selMeta(fieldName, opts) };
+      }
+      if (method === "GET" && path.startsWith("/rest/opportunities")) {
+        return { body: { totalCount: 0 } };
+      }
+      return {};
+    });
+    const { ctx } = readCtx();
+    try {
+      await model.methods.removeSelectOption.execute(
+        { ...RM_ARGS, fieldName, value } as never,
+        ctx as never,
+      );
+      const countGet = calls.find((c) =>
+        c.method === "GET" && c.path.startsWith("/rest/opportunities")
+      );
+      assert(countGet, `expected a count GET for ${fieldName}`);
+      // The count MUST filter on the target field/value — not count all opps.
+      assert(
+        countGet!.path.includes(`${fieldName}[eq]:${value}`),
+        `count filter must target ${fieldName}[eq]:${value}; got ${
+          countGet!.path
+        }`,
+      );
+      assert(countGet!.path.includes("limit=1"), "count must use limit=1");
+    } finally {
+      restore();
+    }
+  }
+});
+
+Deno.test("removeSelectOption force: aborts when the re-count drifts from the ack at write (CR-4)", async () => {
+  let opp = 0;
+  const { calls, restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      opp++;
+      return { body: { totalCount: opp === 1 ? 3 : 2 } }; // drifts before the write
+    }
+    if (method === "PATCH") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.removeSelectOption.execute(
+          {
+            ...RM_ARGS,
+            value: "CLOSED",
+            dryRun: false,
+            confirm: true,
+            force: true,
+            expectedInUseCount: 3,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "changed",
+    );
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "must not write after re-count drift",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("removeSelectOption audit honesty: forced=false on non-force removal; false-audit on absent (CR-1/CR-2)", async () => {
+  const { restore } = stubFetchStatus((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/metadata/objects")) {
+      return { body: selMeta("stage", REMOVE_OPTS) };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities")) {
+      return { body: { totalCount: 0 } };
+    }
+    if (method === "PATCH") {
+      return { body: { data: { updateField: { id: "fld1" } } } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "CLOSED", dryRun: false, confirm: true } as never,
+      ctx as never,
+    );
+    assertEquals(writes[0].data.action, "removed");
+    assertEquals(writes[0].data.forced, false); // non-force removal
+    await model.methods.removeSelectOption.execute(
+      { ...RM_ARGS, value: "NONEXISTENT" } as never,
+      ctx as never,
+    );
+    assertEquals(writes[1].data.action, "absent");
+    assertEquals(writes[1].data.countTrusted, false); // no count ran
+    assertEquals(writes[1].data.emergencyReadReliable, false);
+    assertEquals(writes[1].data.forced, false);
+  } finally {
+    restore();
+  }
+});
+
 // --- upsertPerson (TWENTY-PERSON-UPSERT) ------------------------------------
 
 const PERSON_ARGS = {
