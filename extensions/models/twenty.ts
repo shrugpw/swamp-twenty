@@ -3872,6 +3872,17 @@ export interface OppViewFilterRef {
   fieldMetadataId?: string;
   operand?: string;
   value?: unknown;
+  // Carried for the reconciling upsert path (TWENTY-VIEW-UPSERT / ADV-9): the
+  // viewFilter identity key includes subFieldName + viewFilterGroupId so a field
+  // reused across groups can't alias, and a grouped view can round-trip.
+  subFieldName?: string | null;
+  viewFilterGroupId?: string | null;
+  positionInViewFilterGroup?: number | null;
+}
+export interface OppViewFilterGroupRef {
+  id: string;
+  logicalOperator?: string; // "AND" | "OR"
+  parentViewFilterGroupId?: string | null;
 }
 export interface OppViewRef {
   id: string;
@@ -3881,6 +3892,7 @@ export interface OppViewRef {
   isCustom?: boolean;
   objectMetadataId?: string;
   filters?: OppViewFilterRef[];
+  filterGroups?: OppViewFilterGroupRef[];
 }
 export interface OppViewPlan {
   target: string;
@@ -4038,6 +4050,916 @@ export const ViewEnsuredSchema = z.object({
   })),
   createdCount: z.number(),
   refusedCount: z.number(),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Opportunity view UPSERT (TWENTY-VIEW-UPSERT) ----------------------------
+// Additive reconciling view management. Does NOT touch the create-only
+// ensureOpportunityViews / planOpportunityView / ViewEnsuredSchema surface
+// (ADV-6). Snapshots the extended-action viewEnsured2 resource. All shapes
+// settled by the S0 twenty-local spike (2026-09-19).
+
+/** Operands the reconciler will manage on a SELECT viewFilter (fail-closed). */
+const UPSERT_ALLOWED_OPERANDS: ReadonlySet<string> = new Set(["IS", "IS_NOT"]);
+
+/**
+ * Write form of a viewFilter `value` for the reconciling upsert path: a
+ * JSON-STRINGIFIED array of option tokens (e.g. `"[\"CUSTOMER\"]"`) — the exact
+ * form the Twenty UI writes (S0 spike). Twenty does NOT normalize the stored
+ * type (a bare array in reads back as a bare array), so writing the UI form
+ * keeps swamp-authored filters byte-identical to UI-authored ones and avoids
+ * churn; reads are normalized via normalizeFilterValueTokens regardless of the
+ * stored form. Distinct from buildViewFilterValue (the legacy create-only path,
+ * left unchanged — ADV-6).
+ */
+export function buildViewFilterValueString(values: readonly string[]): string {
+  return JSON.stringify([...values]);
+}
+
+export interface DesiredViewFilter {
+  field: string;
+  operand: string;
+  values: string[];
+  subFieldName?: string | null;
+}
+export interface DesiredView {
+  name: string;
+  filters: DesiredViewFilter[];
+  filterGroup?: "and" | "or";
+  adoptFrom?: string;
+  objectMetadataId?: string;
+}
+
+interface ResolvedClause {
+  field: string;
+  fieldMetadataId: string;
+  operand: string;
+  values: string[];
+  subFieldName: string | null;
+}
+
+/**
+ * An ordered reconcile operation the executor performs (only under confirm).
+ * Expressed so it needs NO pre-existing id EXCEPT where it references an
+ * existing filter/group id (patch/delete/ungroup/patch-group-operator). A
+ * `create-group` id is resolved at execution and reused by later grouped
+ * `create-filter`s; a `delete-group` is only ever emitted for a group that the
+ * plan leaves EMPTY (ADV-3 — never dangle a member).
+ */
+export type ViewUpsertOp =
+  | { op: "rename-view"; toName: string }
+  | { op: "create-group"; logicalOperator: string }
+  | { op: "patch-group-operator"; groupId: string; logicalOperator: string }
+  | { op: "delete-group"; groupId: string }
+  | {
+    op: "create-filter";
+    fieldMetadataId: string;
+    operand: string;
+    value: string;
+    subFieldName: string | null;
+    grouped: boolean;
+    position: number | null;
+  }
+  | {
+    op: "patch-filter";
+    filterId: string;
+    operand?: string;
+    value?: string;
+    ungroup?: boolean;
+  }
+  | { op: "delete-filter"; filterId: string };
+
+export interface ViewUpsertPlan {
+  name: string;
+  action: "create" | "adopt" | "reconcile" | "present" | "refuse";
+  reason: string;
+  viewId?: string;
+  adoptFrom?: string;
+  grouped: boolean;
+  groupOperator?: string;
+  ops: ViewUpsertOp[];
+  filtersAdded: number;
+  filtersRemoved: number;
+  filtersPatched: number;
+  existingGroupId?: string;
+}
+
+/** viewFilter identity within a view (ADV-9): field + subField + operand. */
+function clauseKey(
+  fieldMetadataId: string,
+  subFieldName: string | null,
+  operand: string,
+): string {
+  return `${fieldMetadataId} ${subFieldName ?? ""} ${operand}`;
+}
+
+/** Positive proof of mutability (S0 spike): API-created views report
+ * isCustom=true; system/seeded views report isCustom=false and/or a non-null
+ * key / isSystemSideEffect. Absent/false => LOCKED (fail-closed, SEC-1/ADV-1). */
+function viewIsMutable(v: OppViewRef): boolean {
+  return v.isCustom === true && v.key == null && v.isSystemSideEffect !== true;
+}
+
+/** Resolve + validate desired filters against live field metadata. Fail-closed:
+ * unresolved fieldMetadataId, retired/invalid option token, unsupported
+ * operand, missing filterGroup on a multi-clause view, or a duplicate clause
+ * key all REFUSE. */
+function resolveDesiredClauses(
+  desired: DesiredView,
+  fieldMeta: Record<
+    string,
+    { fieldMetadataId?: string; options: string[] } | undefined
+  >,
+): { clauses: ResolvedClause[] } | { refuse: string } {
+  if (!desired.filters || desired.filters.length === 0) {
+    return {
+      refuse: "no filters specified — a managed view needs >=1 filter clause",
+    };
+  }
+  if (desired.filters.length > 1 && desired.filterGroup == null) {
+    return {
+      refuse:
+        `filterGroup ('and'|'or') is required for a multi-clause view (${desired.filters.length} clauses)`,
+    };
+  }
+  const clauses: ResolvedClause[] = [];
+  const seen = new Set<string>();
+  for (const f of desired.filters) {
+    const operand = String(f.operand ?? "").toUpperCase();
+    if (!UPSERT_ALLOWED_OPERANDS.has(operand)) {
+      return {
+        refuse:
+          `operand '${f.operand}' on field '${f.field}' is not supported (allowed: IS, IS_NOT)`,
+      };
+    }
+    const meta = fieldMeta[f.field];
+    const fieldMetadataId = meta?.fieldMetadataId;
+    if (!fieldMetadataId) {
+      return {
+        refuse:
+          `field '${f.field}' has no resolvable fieldMetadataId in live schema (fail-closed)`,
+      };
+    }
+    const liveOpts = new Set(meta?.options ?? []);
+    const values = [...(f.values ?? [])];
+    if (values.length === 0) {
+      return { refuse: `field '${f.field}' clause has no values` };
+    }
+    const missing = values.filter(
+      (v) => !STAGE_OPTION_VALUE_RE.test(v) || !liveOpts.has(v),
+    );
+    if (missing.length) {
+      return {
+        refuse: `option(s) [${
+          missing.join(", ")
+        }] absent from live '${f.field}' schema — fail-closed (retired/invalid token)`,
+      };
+    }
+    const subFieldName = f.subFieldName ?? null;
+    const key = clauseKey(fieldMetadataId, subFieldName, operand);
+    if (seen.has(key)) {
+      return {
+        refuse: `duplicate desired clause on (field=${f.field}, subField=${
+          subFieldName ?? "-"
+        }, operand=${operand})`,
+      };
+    }
+    seen.add(key);
+    clauses.push({
+      field: f.field,
+      fieldMetadataId,
+      operand,
+      values,
+      subFieldName,
+    });
+  }
+  return { clauses };
+}
+
+/**
+ * Compute the ordered reconcile ops to bring an existing (already-proven-mutable)
+ * view to the desired clause set + grouping. Fail-closed on unsafe group
+ * structure (ADV-10): a nested group, >1 top-level group, an ambiguous
+ * duplicate clause key, or an ungrouped-view -> grouped-desired restructure all
+ * REFUSE rather than risk corrupting the boolean structure.
+ */
+function diffExistingView(
+  existing: OppViewRef,
+  clauses: ResolvedClause[],
+  grouped: boolean,
+  groupOperator: string | undefined,
+):
+  | {
+    ops: ViewUpsertOp[];
+    added: number;
+    removed: number;
+    patched: number;
+    existingGroupId?: string;
+  }
+  | { refuse: string } {
+  const groups = existing.filterGroups ?? [];
+  const topGroups = groups.filter((g) => g.parentViewFilterGroupId == null);
+  const nested = groups.filter((g) => g.parentViewFilterGroupId != null);
+  if (nested.length > 0) {
+    return {
+      refuse:
+        "existing view has nested viewFilterGroup(s) — multi-group/nested reconcile is deferred (fail-closed, ADV-10)",
+    };
+  }
+  if (topGroups.length > 1) {
+    return {
+      refuse:
+        `existing view has ${topGroups.length} top-level viewFilterGroups — single-flat-group scope only (fail-closed, ADV-10)`,
+    };
+  }
+  const existingGroupId = topGroups.length === 1 ? topGroups[0].id : undefined;
+  const filters = existing.filters ?? [];
+
+  if (grouped) {
+    const anyUngrouped = filters.some((f) =>
+      (f.viewFilterGroupId ?? null) == null
+    );
+    if (filters.length > 0 && (existingGroupId == null || anyUngrouped)) {
+      return {
+        refuse:
+          `desired is a grouped (${groupOperator}) multi-clause view but the existing view has ungrouped/absent group structure — grouped restructure of an existing view is deferred (fail-closed)`,
+      };
+    }
+  }
+
+  const ops: ViewUpsertOp[] = [];
+  let added = 0, removed = 0, patched = 0;
+
+  const byKey = new Map<string, OppViewFilterRef>();
+  for (const f of filters) {
+    const k = clauseKey(
+      String(f.fieldMetadataId ?? ""),
+      f.subFieldName ?? null,
+      String(f.operand ?? "").toUpperCase(),
+    );
+    if (byKey.has(k)) {
+      return {
+        refuse:
+          `existing view has two viewFilters sharing key (fieldMetadataId,subFieldName,operand) — ambiguous, fail-closed (ADV-9)`,
+      };
+    }
+    byKey.set(k, f);
+  }
+  const desiredKeys = new Set(
+    clauses.map((c) => clauseKey(c.fieldMetadataId, c.subFieldName, c.operand)),
+  );
+
+  let pos = 0;
+  for (const c of clauses) {
+    const k = clauseKey(c.fieldMetadataId, c.subFieldName, c.operand);
+    const ex = byKey.get(k);
+    const desiredValueStr = buildViewFilterValueString(c.values);
+    if (!ex) {
+      ops.push({
+        op: "create-filter",
+        fieldMetadataId: c.fieldMetadataId,
+        operand: c.operand,
+        value: desiredValueStr,
+        subFieldName: c.subFieldName,
+        grouped,
+        position: grouped ? pos : null,
+      });
+      added++;
+    } else {
+      const valueDrift = !setEq(normalizeFilterValueTokens(ex.value), c.values);
+      const exGrouped = (ex.viewFilterGroupId ?? null) != null;
+      const needUngroup = !grouped && exGrouped;
+      if (grouped && !exGrouped) {
+        return {
+          refuse:
+            `existing clause ${k} is ungrouped but desired is grouped — grouped restructure deferred (fail-closed)`,
+        };
+      }
+      if (valueDrift || needUngroup) {
+        const patch: ViewUpsertOp = {
+          op: "patch-filter",
+          filterId: String(ex.id),
+        };
+        if (valueDrift) patch.value = desiredValueStr;
+        if (needUngroup) patch.ungroup = true;
+        ops.push(patch);
+        patched++;
+      }
+    }
+    pos++;
+  }
+
+  for (const f of filters) {
+    const k = clauseKey(
+      String(f.fieldMetadataId ?? ""),
+      f.subFieldName ?? null,
+      String(f.operand ?? "").toUpperCase(),
+    );
+    if (!desiredKeys.has(k)) {
+      ops.push({ op: "delete-filter", filterId: String(f.id) });
+      removed++;
+    }
+  }
+
+  if (grouped && existingGroupId && groupOperator) {
+    if (
+      String(topGroups[0].logicalOperator ?? "").toUpperCase() !== groupOperator
+    ) {
+      ops.push({
+        op: "patch-group-operator",
+        groupId: existingGroupId,
+        logicalOperator: groupOperator,
+      });
+      patched++;
+    }
+  }
+
+  if (grouped && existingGroupId == null) {
+    // grouped fresh-in-existing (existing had no filters): create the group first.
+    ops.unshift({
+      op: "create-group",
+      logicalOperator: groupOperator as string,
+    });
+  }
+
+  if (!grouped && existingGroupId) {
+    // ungrouped desired collapses every member out of the existing group; it
+    // ends EMPTY, so deleting it is safe (no dangling member — ADV-3). Emitted
+    // LAST so it runs after the ungroup patches + member deletes.
+    ops.push({ op: "delete-group", groupId: existingGroupId });
+  }
+
+  return { ops, added, removed, patched, existingGroupId };
+}
+
+/**
+ * Pure planner for ONE desired opportunity view. Decides create / adopt /
+ * reconcile / present / refuse, resolves + validates the desired clauses, proves
+ * mutability, and emits the ordered op list the executor applies under confirm.
+ * NON-MUTATING by construction.
+ */
+export function planUpsertOpportunityView(
+  desired: DesiredView,
+  fieldMeta: Record<
+    string,
+    { fieldMetadataId?: string; options: string[] } | undefined
+  >,
+  existingViews: OppViewRef[],
+  objectMetadataId: string | undefined,
+): ViewUpsertPlan {
+  const grouped = (desired.filters?.length ?? 0) > 1;
+  const groupOperator = desired.filterGroup
+    ? desired.filterGroup.toUpperCase()
+    : undefined;
+  const base = {
+    name: desired.name,
+    grouped,
+    groupOperator,
+    ops: [] as ViewUpsertOp[],
+    filtersAdded: 0,
+    filtersRemoved: 0,
+    filtersPatched: 0,
+  };
+  const refuse = (
+    reason: string,
+    extra?: Partial<ViewUpsertPlan>,
+  ): ViewUpsertPlan => ({ ...base, action: "refuse", reason, ...extra });
+
+  const name = String(desired.name ?? "").trim();
+  if (!name) return refuse("desired view name is empty");
+  if (!objectMetadataId) {
+    return refuse("opportunity objectMetadataId unresolved — fail-closed");
+  }
+
+  const resolved = resolveDesiredClauses(desired, fieldMeta);
+  if ("refuse" in resolved) return refuse(resolved.refuse);
+  const clauses = resolved.clauses;
+
+  const inObject = existingViews.filter(
+    (v) => (v.objectMetadataId ?? objectMetadataId) === objectMetadataId,
+  );
+
+  const nameMatches = inObject.filter((v) => v.name === name);
+  if (nameMatches.length > 1) {
+    return refuse(
+      `${nameMatches.length} views named '${name}' — ambiguous, fail-closed`,
+      { viewId: nameMatches[0].id },
+    );
+  }
+
+  if (nameMatches.length === 1) {
+    const view = nameMatches[0];
+    if (!viewIsMutable(view)) {
+      return refuse(
+        `view '${name}' is locked/system (key=${
+          JSON.stringify(view.key)
+        }, isSystemSideEffect=${view.isSystemSideEffect}, isCustom=${view.isCustom}) — never mutate (fail-closed)`,
+        { viewId: view.id },
+      );
+    }
+    const diff = diffExistingView(view, clauses, grouped, groupOperator);
+    if ("refuse" in diff) return refuse(diff.refuse, { viewId: view.id });
+    if (diff.ops.length === 0) {
+      return {
+        ...base,
+        action: "present",
+        reason: "view exists with the desired filters — no change",
+        viewId: view.id,
+        existingGroupId: diff.existingGroupId,
+      };
+    }
+    return {
+      ...base,
+      action: "reconcile",
+      reason:
+        `reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch`,
+      viewId: view.id,
+      ops: diff.ops,
+      filtersAdded: diff.added,
+      filtersRemoved: diff.removed,
+      filtersPatched: diff.patched,
+      existingGroupId: diff.existingGroupId,
+    };
+  }
+
+  // ABSENT — adopt (explicit opt-in) or create.
+  const adoptRef = String(desired.adoptFrom ?? "").trim();
+  if (adoptRef !== "") {
+    const byId = UUID_RE.test(adoptRef);
+    const adoptMatches = inObject.filter(
+      (v) => byId ? v.id === adoptRef : v.name === adoptRef,
+    );
+    if (adoptMatches.length > 1) {
+      return refuse(
+        `${adoptMatches.length} views match adoptFrom '${adoptRef}' — ambiguous, fail-closed`,
+      );
+    }
+    if (adoptMatches.length === 1) {
+      const src = adoptMatches[0];
+      if (!viewIsMutable(src)) {
+        return refuse(
+          `adoptFrom source '${adoptRef}' is locked/system (key=${
+            JSON.stringify(src.key)
+          }, isSystemSideEffect=${src.isSystemSideEffect}, isCustom=${src.isCustom}) — refuse to adopt (fail-closed, SEC-8)`,
+          { viewId: src.id },
+        );
+      }
+      const diff = diffExistingView(src, clauses, grouped, groupOperator);
+      if ("refuse" in diff) return refuse(diff.refuse, { viewId: src.id });
+      const ops: ViewUpsertOp[] = [
+        { op: "rename-view", toName: name },
+        ...diff.ops,
+      ];
+      return {
+        ...base,
+        action: "adopt",
+        reason:
+          `adopt (rename '${src.name}' -> '${name}') + reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch`,
+        viewId: src.id,
+        adoptFrom: adoptRef,
+        ops,
+        filtersAdded: diff.added,
+        filtersRemoved: diff.removed,
+        filtersPatched: diff.patched,
+        existingGroupId: diff.existingGroupId,
+      };
+    }
+    // adoptFrom given but not found -> fall through to create (per spec).
+  }
+
+  const createOps: ViewUpsertOp[] = [];
+  if (grouped) {
+    createOps.push({
+      op: "create-group",
+      logicalOperator: groupOperator as string,
+    });
+  }
+  let cpos = 0;
+  for (const c of clauses) {
+    createOps.push({
+      op: "create-filter",
+      fieldMetadataId: c.fieldMetadataId,
+      operand: c.operand,
+      value: buildViewFilterValueString(c.values),
+      subFieldName: c.subFieldName,
+      grouped,
+      position: grouped ? cpos : null,
+    });
+    cpos++;
+  }
+  return {
+    ...base,
+    action: "create",
+    reason: "no view with this name — create",
+    ops: createOps,
+    filtersAdded: clauses.length,
+  };
+}
+
+/** POST a fresh opportunity view; returns its new id (fail-closed on none). */
+async function createOppView(
+  cfg: TwentyCfg,
+  name: string,
+  objectMetadataId: string,
+): Promise<string> {
+  const resp = await twentyRequest(cfg, "POST", "/rest/metadata/views", {
+    name,
+    objectMetadataId,
+    type: "TABLE",
+    icon: "IconTable",
+  });
+  const id = String(
+    ((resp as { data?: { id?: string } }).data ?? (resp as { id?: string }))
+      ?.id ?? "",
+  );
+  if (!id) throw new Error("view create returned no id");
+  return id;
+}
+
+/**
+ * Apply a ViewUpsertPlan's ops against the live API (confirm path). For a
+ * `create` action it POSTs the view first; a `create-group` id is captured and
+ * reused by later grouped `create-filter`s (falling back to the plan's
+ * existingGroupId when reusing an existing group). Returns the target viewId.
+ */
+async function executeViewUpsertPlan(
+  cfg: TwentyCfg,
+  plan: ViewUpsertPlan,
+  objectMetadataId: string,
+): Promise<{ viewId: string }> {
+  let viewId = plan.viewId ?? "";
+  if (plan.action === "create") {
+    viewId = await createOppView(cfg, plan.name, objectMetadataId);
+  }
+  let createdGroupId: string | undefined;
+  const groupIdFor = (): string | undefined =>
+    createdGroupId ?? plan.existingGroupId;
+  for (const op of plan.ops) {
+    switch (op.op) {
+      case "rename-view":
+        await twentyRequest(cfg, "PATCH", `/rest/metadata/views/${viewId}`, {
+          name: op.toName,
+        });
+        break;
+      case "create-group": {
+        const resp = await twentyRequest(
+          cfg,
+          "POST",
+          "/rest/metadata/viewFilterGroups",
+          { viewId, logicalOperator: op.logicalOperator },
+        );
+        createdGroupId = String(
+          ((resp as { data?: { id?: string } }).data ??
+            (resp as { id?: string }))?.id ?? "",
+        );
+        if (!createdGroupId) {
+          throw new Error("viewFilterGroup create returned no id");
+        }
+        break;
+      }
+      case "patch-group-operator":
+        await twentyRequest(
+          cfg,
+          "PATCH",
+          `/rest/metadata/viewFilterGroups/${op.groupId}`,
+          { logicalOperator: op.logicalOperator },
+        );
+        break;
+      case "delete-group":
+        await twentyRequest(
+          cfg,
+          "DELETE",
+          `/rest/metadata/viewFilterGroups/${op.groupId}`,
+        );
+        break;
+      case "create-filter": {
+        const body: Record<string, unknown> = {
+          viewId,
+          fieldMetadataId: op.fieldMetadataId,
+          operand: op.operand,
+          value: op.value,
+        };
+        if (op.subFieldName != null) body.subFieldName = op.subFieldName;
+        if (op.grouped) {
+          const gid = groupIdFor();
+          if (!gid) throw new Error("grouped create-filter has no group id");
+          body.viewFilterGroupId = gid;
+          body.positionInViewFilterGroup = op.position;
+        }
+        await twentyRequest(cfg, "POST", "/rest/metadata/viewFilters", body);
+        break;
+      }
+      case "patch-filter": {
+        const body: Record<string, unknown> = {};
+        if (op.value != null) body.value = op.value;
+        if (op.operand != null) body.operand = op.operand;
+        if (op.ungroup) {
+          body.viewFilterGroupId = null;
+          body.positionInViewFilterGroup = null;
+        }
+        await twentyRequest(
+          cfg,
+          "PATCH",
+          `/rest/metadata/viewFilters/${op.filterId}`,
+          body,
+        );
+        break;
+      }
+      case "delete-filter":
+        await twentyRequest(
+          cfg,
+          "DELETE",
+          `/rest/metadata/viewFilters/${op.filterId}`,
+        );
+        break;
+    }
+  }
+  return { viewId };
+}
+
+/** Load opportunity views WITH their viewFilters + viewFilterGroups joined
+ * (the reconcile input). Scoped to the opportunity object. */
+async function loadOppViewRefs(
+  cfg: TwentyCfg,
+  oppOid: string,
+): Promise<OppViewRef[]> {
+  const [views, filters, groups] = await Promise.all([
+    fetchMetadataList(cfg, "views"),
+    fetchMetadataList(cfg, "viewFilters"),
+    fetchMetadataList(cfg, "viewFilterGroups"),
+  ]);
+  const filtersByView = new Map<string, OppViewFilterRef[]>();
+  for (const f of filters as Array<Record<string, unknown>>) {
+    const vid = String(f.viewId ?? "");
+    if (!vid) continue;
+    const arr = filtersByView.get(vid) ?? [];
+    arr.push({
+      id: String(f.id ?? ""),
+      fieldMetadataId: f.fieldMetadataId != null
+        ? String(f.fieldMetadataId)
+        : undefined,
+      operand: f.operand != null ? String(f.operand) : undefined,
+      value: f.value,
+      subFieldName: (f.subFieldName ?? null) as string | null,
+      viewFilterGroupId: (f.viewFilterGroupId ?? null) as string | null,
+      positionInViewFilterGroup: (f.positionInViewFilterGroup ?? null) as
+        | number
+        | null,
+    });
+    filtersByView.set(vid, arr);
+  }
+  const groupsByView = new Map<string, OppViewFilterGroupRef[]>();
+  for (const g of groups as Array<Record<string, unknown>>) {
+    const vid = String(g.viewId ?? "");
+    if (!vid) continue;
+    const arr = groupsByView.get(vid) ?? [];
+    arr.push({
+      id: String(g.id ?? ""),
+      logicalOperator: g.logicalOperator != null
+        ? String(g.logicalOperator)
+        : undefined,
+      parentViewFilterGroupId: (g.parentViewFilterGroupId ?? null) as
+        | string
+        | null,
+    });
+    groupsByView.set(vid, arr);
+  }
+  const refs: OppViewRef[] = [];
+  for (const v of views as Array<Record<string, unknown>>) {
+    if (String(v.objectMetadataId ?? "") !== oppOid) continue;
+    const id = String(v.id ?? "");
+    refs.push({
+      id,
+      name: String(v.name ?? ""),
+      key: (v.key ?? null) as string | null,
+      isSystemSideEffect: typeof v.isSystemSideEffect === "boolean"
+        ? v.isSystemSideEffect
+        : undefined,
+      isCustom: typeof v.isCustom === "boolean" ? v.isCustom : undefined,
+      objectMetadataId: v.objectMetadataId != null
+        ? String(v.objectMetadataId)
+        : undefined,
+      filters: filtersByView.get(id) ?? [],
+      filterGroups: groupsByView.get(id) ?? [],
+    });
+  }
+  return refs;
+}
+
+const UpsertViewFilterArg = z.object({
+  field: z.string(),
+  operand: z.string(),
+  values: z.array(z.string()).min(1),
+  subFieldName: z.string().nullable().optional(),
+});
+const UpsertViewArg = z.object({
+  name: z.string(),
+  filters: z.array(UpsertViewFilterArg).min(1),
+  filterGroup: z.enum(["and", "or"]).optional(),
+  adoptFrom: z.string().optional(),
+  objectMetadataId: z.string().optional(),
+});
+
+/**
+ * Fan-out core (repo rule 6): plan + (under confirm) apply a desired LIST of
+ * opportunity views in ONE execution. Resolves object + field metadata once,
+ * runs a reachability pre-flight, loads existing views once, then per view:
+ * plan -> (confirm) execute -> read-back-verify (re-plan the fresh state and
+ * assert it converges to `present`). Refuses fail-closed on load/reachability/
+ * id gaps and on a duplicate desired name. Returns the viewEnsured2 payload.
+ */
+async function runViewUpserts(
+  cfg: TwentyCfg,
+  desiredViews: DesiredView[],
+  confirm: boolean,
+  dryRun: boolean,
+): Promise<Record<string, unknown>> {
+  const willWrite = confirm === true && dryRun !== true;
+  const fieldNames = Array.from(
+    new Set(desiredViews.flatMap((d) => (d.filters ?? []).map((f) => f.field))),
+  );
+  const { oppOid, fields: fieldMeta } = await resolveOpportunityFilterFields(
+    cfg,
+    fieldNames.length ? fieldNames : undefined,
+  );
+
+  let reachable = false;
+  try {
+    const r = await rawGet(cfg, "/rest/metadata/views?limit=1");
+    reachable = classifyProbe(r.status) === "ok";
+  } catch {
+    reachable = false;
+  }
+
+  let existing: OppViewRef[] = [];
+  let existingLoadOk = false;
+  if (oppOid) {
+    try {
+      existing = await loadOppViewRefs(cfg, oppOid);
+      existingLoadOk = true;
+    } catch {
+      existingLoadOk = false;
+    }
+  }
+
+  const seenNames = new Set<string>();
+  const dupNames = new Set<string>();
+  for (const d of desiredViews) {
+    const n = String(d.name ?? "").trim();
+    if (seenNames.has(n)) dupNames.add(n);
+    seenNames.add(n);
+  }
+
+  const results: Array<Record<string, unknown>> = [];
+  for (const d of desiredViews) {
+    const row: Record<string, unknown> = { name: d.name };
+    if (dupNames.has(String(d.name ?? "").trim())) {
+      results.push({
+        ...row,
+        action: "refuse",
+        reason:
+          `duplicate desired view name '${d.name}' in this request — fail-closed`,
+      });
+      continue;
+    }
+    const plan = planUpsertOpportunityView(d, fieldMeta, existing, oppOid);
+    row.action = plan.action;
+    row.reason = plan.reason;
+    if (plan.viewId) row.viewId = plan.viewId;
+    if (plan.adoptFrom) row.adoptFrom = plan.adoptFrom;
+    row.grouped = plan.grouped;
+    if (plan.groupOperator) row.groupOperator = plan.groupOperator;
+    row.filtersAdded = plan.filtersAdded;
+    row.filtersRemoved = plan.filtersRemoved;
+    row.filtersPatched = plan.filtersPatched;
+
+    const mutating = plan.action === "create" || plan.action === "adopt" ||
+      plan.action === "reconcile";
+    if (mutating && willWrite) {
+      if (!existingLoadOk) {
+        results.push({
+          ...row,
+          action: "refuse",
+          reason:
+            "existing view list failed to load — fail-closed (won't write blind)",
+        });
+        continue;
+      }
+      if (!reachable) {
+        results.push({
+          ...row,
+          action: "refuse",
+          reason: "metadata API not reachable — fail-closed",
+        });
+        continue;
+      }
+      if (!oppOid) {
+        results.push({
+          ...row,
+          action: "refuse",
+          reason: "opportunity objectMetadataId unresolved — fail-closed",
+        });
+        continue;
+      }
+      try {
+        const { viewId } = await executeViewUpsertPlan(cfg, plan, oppOid);
+        row.viewId = viewId;
+        const fresh = await loadOppViewRefs(cfg, oppOid);
+        const verify = planUpsertOpportunityView(
+          {
+            name: plan.name,
+            filters: d.filters,
+            filterGroup: d.filterGroup,
+            objectMetadataId: d.objectMetadataId,
+          },
+          fieldMeta,
+          fresh,
+          oppOid,
+        );
+        if (verify.action === "present") {
+          row.readBackOk = true;
+          row.action = plan.action === "create"
+            ? "created"
+            : plan.action === "adopt"
+            ? "adopted"
+            : "reconciled";
+          row.reason = plan.reason;
+        } else {
+          row.readBackOk = false;
+          row.action = "failed";
+          row.reason =
+            `post-write read-back did not converge (residual plan: ${verify.action} — ${verify.reason})`;
+        }
+        existing = fresh;
+      } catch (e) {
+        row.action = "failed";
+        row.reason = redactError(e, 300, cfg.apiToken);
+      }
+    }
+    results.push(row);
+  }
+
+  const count = (a: string): number =>
+    results.filter((r) => r.action === a).length;
+  return {
+    baseUrl: cfg.baseUrl,
+    dryRun: !willWrite,
+    confirm: confirm === true,
+    reachable,
+    objectMetadataId: oppOid,
+    results,
+    createdCount: count("created"),
+    adoptedCount: count("adopted"),
+    reconciledCount: count("reconciled"),
+    presentCount: count("present"),
+    refusedCount: count("refuse"),
+    failedCount: count("failed"),
+    retrievedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Snapshot from upsertOpportunityView(s): per-view plan/outcome for the gated
+ * reconciling view writes. dryRun records the plan action (create/adopt/
+ * reconcile/present/refuse); confirm records the executed action (created/
+ * adopted/reconciled/present/refuse/failed) + read-back verification.
+ */
+export const ViewEnsured2Schema = z.object({
+  baseUrl: z.string(),
+  dryRun: z.boolean(),
+  confirm: z.boolean(),
+  reachable: z.boolean(),
+  objectMetadataId: z.string().optional(),
+  results: z.array(z.object({
+    name: z.string(),
+    action: z.enum([
+      "create",
+      "adopt",
+      "reconcile",
+      "present",
+      "refuse",
+      "created",
+      "adopted",
+      "reconciled",
+      "failed",
+    ]),
+    reason: z.string(),
+    viewId: z.string().optional(),
+    adoptFrom: z.string().optional(),
+    grouped: z.boolean().optional(),
+    groupOperator: z.string().optional(),
+    filtersAdded: z.number().optional(),
+    filtersRemoved: z.number().optional(),
+    filtersPatched: z.number().optional(),
+    readBackOk: z.boolean().optional(),
+    error: z.string().optional(),
+  })),
+  createdCount: z.number(),
+  adoptedCount: z.number(),
+  reconciledCount: z.number(),
+  presentCount: z.number(),
+  refusedCount: z.number(),
+  failedCount: z.number(),
   retrievedAt: z.iso.datetime(),
 });
 
@@ -4716,7 +5638,7 @@ async function syncPlannedLead(
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.18.1",
+  version: "2026.09.19.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -4857,6 +5779,14 @@ export const model = {
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
     },
+    {
+      toVersion: "2026.09.19.1",
+      description:
+        "Add opportunity view UPSERT (TWENTY-VIEW-UPSERT): the additive, reconciling upsertOpportunityView / upsertOpportunityViews methods (create / adopt+rename / reconcile-filters / present no-op / fail-closed refuse) + the viewEnsured2 snapshot with the extended action set. The create-only ensureOpportunityViews + its viewEnsured snapshot are UNCHANGED (ADV-6). Reconcile is keyed on (fieldMetadataId, subFieldName, operand, viewFilterGroupId), writes the UI stringified value form, verifies every write with a read-back, never mutates a non-isCustom/locked/system view, and never blind-deletes a viewFilterGroup. globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
   ],
   resources: {
     "capability": {
@@ -4945,6 +5875,13 @@ export const model = {
       description:
         "Snapshot from ensureOpportunityViews: per-target plan/outcome for the gated Opportunity view creates (action create/noop/refuse in dryRun; created/failed under confirm) + reachability. Audit trail of what swamp created.",
       schema: ViewEnsuredSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    "viewEnsured2": {
+      description:
+        "Snapshot from upsertOpportunityView(s): per-view plan/outcome for the gated reconciling Opportunity view writes (create/adopt/reconcile/present/refuse in dryRun; created/adopted/reconciled/present/refuse/failed under confirm) + read-back verification + reachability. Audit trail of what swamp reconciled.",
+      schema: ViewEnsured2Schema,
       lifetime: "infinite",
       garbageCollection: 20,
     },
@@ -6477,6 +7414,107 @@ export const model = {
               refusedCount,
               retrievedAt: new Date().toISOString(),
             },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    upsertOpportunityViews: {
+      description:
+        "TWENTY-VIEW-UPSERT (fan-out, repo rule 6): reconcile a desired LIST of Opportunity views to a YAML source-of-truth in ONE execution. Per view: create (name absent) / adopt+rename (adoptFrom an existing swamp-owned view) / reconcile its viewFilters (add missing, delete extra, patch operand/value drift, patch group AND/OR operator, collapse grouped->ungrouped) / present (already matching, quiet no-op) / refuse (fail-closed). Additive — does NOT change the create-only ensureOpportunityViews. Fail-closed guardrails: never mutates a non-isCustom / key!=null / isSystemSideEffect view (positive-proof-of-mutability); refuses >1 name or adoptFrom match, unresolved objectMetadataId/fieldMetadataId, retired/invalid enum tokens (live-schema allowlist), nested / multi top-level groups, and an ungrouped->grouped restructure; never blind-deletes a viewFilterGroup (deletes members first, empties then removes). Writes the UI stringified value form and verifies every write with a post-write read-back. confirm-gated (default dryRun plans only); confirm=true executes. Snapshots viewEnsured2.",
+      arguments: z.object({
+        views: z.array(UpsertViewArg).min(1).describe(
+          "Desired view list. Each: { name, filters:[{field,operand,values[],subFieldName?}], filterGroup?('and'|'or', required when >1 filter), adoptFrom?(existing view name or viewId), objectMetadataId?(defaults to Opportunity) }.",
+        ),
+        confirm: z.boolean().optional().describe(
+          "Execute the writes. Default false = plan only.",
+        ),
+        dryRun: z.boolean().optional().describe(
+          "Plan without writing (default true). A write requires confirm=true AND dryRun=false.",
+        ),
+      }),
+      execute: async (
+        args: {
+          views: DesiredView[];
+          confirm?: boolean;
+          dryRun?: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const payload = await runViewUpserts(
+            cfg,
+            args.views,
+            args.confirm === true,
+            args.dryRun !== false,
+          );
+          const handle = await context.writeResource(
+            "viewEnsured2",
+            "viewEnsured2",
+            payload,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    upsertOpportunityView: {
+      description:
+        "TWENTY-VIEW-UPSERT (single-view convenience over upsertOpportunityViews): reconcile ONE Opportunity view to a desired filter state — create / adopt+rename / reconcile / present / refuse, with the same fail-closed guardrails, stringified-value writes, and read-back verification. Prefer upsertOpportunityViews for multiple views (one lock acquisition). confirm-gated, dryRun default. Snapshots viewEnsured2.",
+      arguments: z.object({
+        name: z.string().describe(
+          "Desired final view name (the stable identity within the object).",
+        ),
+        filters: z.array(UpsertViewFilterArg).min(1).describe(
+          "Desired filter clauses: [{field, operand(IS|IS_NOT), values[], subFieldName?}].",
+        ),
+        filterGroup: z.enum(["and", "or"]).optional().describe(
+          "Boolean combinator for a multi-clause view (required when filters.length>1).",
+        ),
+        adoptFrom: z.string().optional().describe(
+          "Existing view NAME or viewId to rename->name + reconcile (the adoption opt-in).",
+        ),
+        objectMetadataId: z.string().optional().describe(
+          "Object to scope to (defaults to Opportunity).",
+        ),
+        confirm: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+      }),
+      execute: async (
+        args: {
+          name: string;
+          filters: DesiredViewFilter[];
+          filterGroup?: "and" | "or";
+          adoptFrom?: string;
+          objectMetadataId?: string;
+          confirm?: boolean;
+          dryRun?: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const desired: DesiredView = {
+            name: args.name,
+            filters: args.filters,
+            filterGroup: args.filterGroup,
+            adoptFrom: args.adoptFrom,
+            objectMetadataId: args.objectMetadataId,
+          };
+          const payload = await runViewUpserts(
+            cfg,
+            [desired],
+            args.confirm === true,
+            args.dryRun !== false,
+          );
+          const handle = await context.writeResource(
+            "viewEnsured2",
+            "viewEnsured2",
+            payload,
           );
           return { dataHandles: [handle] };
         } catch (e) {

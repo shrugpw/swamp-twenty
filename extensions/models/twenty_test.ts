@@ -23,6 +23,8 @@ import {
   buildOpportunityBody,
   // TWENTY-VIEW-MGMT
   buildViewFilterValue,
+  // TWENTY-VIEW-UPSERT
+  buildViewFilterValueString,
   canonicalJson,
   // TWENTY-NOTE-RECONCILE
   canonicalNote,
@@ -59,6 +61,7 @@ import {
   planLead,
   planOpportunityView,
   planSelectOptions,
+  planUpsertOpportunityView,
   redactError,
   sanitizeText,
   selectBatch,
@@ -9271,6 +9274,1079 @@ Deno.test("pushLeadsContract: push_leads note-write carries NO noteHash even whe
     for (const p of notePosts) {
       assertEquals("noteHash" in (p.body as Record<string, unknown>), false);
     }
+  } finally {
+    restore();
+  }
+});
+
+// ============================================================================
+// TWENTY-VIEW-UPSERT — reconciling opportunity view management
+// ============================================================================
+
+const U_OPP = "opp-oid-vu";
+const U_STAGE = "stage-fid-vu";
+const U_LOB = "lob-fid-vu";
+const U_OPEN = ["NEW", "SCREENING", "MEETING", "PROPOSAL"];
+const U_FIELDMETA: Record<
+  string,
+  { fieldMetadataId?: string; options: string[] } | undefined
+> = {
+  stage: {
+    fieldMetadataId: U_STAGE,
+    options: [
+      "NEW",
+      "SCREENING",
+      "MEETING",
+      "PROPOSAL",
+      "CUSTOMER",
+      "CLOSED_WON",
+      "CLOSED_LOST",
+      "ON_HOLD",
+    ],
+  },
+  lineOfBusiness: {
+    fieldMetadataId: U_LOB,
+    options: ["CONSULTING", "HOSTING", "LOCAL_IT", "NETWORK_PROVIDER", "GAMES"],
+  },
+};
+
+// deno-lint-ignore no-explicit-any
+function uView(over: Record<string, unknown>): any {
+  return {
+    id: "v-1",
+    name: "X",
+    key: null,
+    isSystemSideEffect: false,
+    isCustom: true,
+    objectMetadataId: U_OPP,
+    filters: [],
+    filterGroups: [],
+    ...over,
+  };
+}
+
+function uOps(p: { ops: unknown[] }): Array<Record<string, unknown>> {
+  return p.ops as Array<Record<string, unknown>>;
+}
+
+Deno.test("VIEW-UPSERT buildViewFilterValueString: UI stringified-array form", () => {
+  assertEquals(
+    buildViewFilterValueString(["NEW", "SCREENING"]),
+    '["NEW","SCREENING"]',
+  );
+  assertEquals(buildViewFilterValueString(["CONSULTING"]), '["CONSULTING"]');
+});
+
+Deno.test("VIEW-UPSERT plan: absent name -> create with stringified value", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "create");
+  assertEquals(p.filtersAdded, 1);
+  const ops = uOps(p);
+  assertEquals(ops.length, 1);
+  assertEquals(ops[0].op, "create-filter");
+  assertEquals(ops[0].value, '["CONSULTING"]');
+  assertEquals(ops[0].grouped, false);
+});
+
+Deno.test("VIEW-UPSERT plan: present no-op when filter already matches (bare-array normalized)", () => {
+  const existing = [uView({
+    name: "Consulting",
+    filters: [{
+      id: "f1",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: ["CONSULTING"], // stored as bare array (legacy) -> normalized
+      subFieldName: null,
+      viewFilterGroupId: null,
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "present");
+  assertEquals(uOps(p).length, 0);
+});
+
+Deno.test("VIEW-UPSERT plan: value drift -> reconcile patch-filter (stringified)", () => {
+  const existing = [uView({
+    name: "Consulting",
+    filters: [{
+      id: "f1",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: '["HOSTING"]',
+      subFieldName: null,
+      viewFilterGroupId: null,
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "reconcile");
+  assertEquals(p.filtersPatched, 1);
+  const ops = uOps(p);
+  assertEquals(ops[0].op, "patch-filter");
+  assertEquals(ops[0].filterId, "f1");
+  assertEquals(ops[0].value, '["CONSULTING"]');
+});
+
+Deno.test("VIEW-UPSERT plan: reconcile add-missing + delete-extra", () => {
+  const existing = [uView({
+    name: "Consulting",
+    filters: [{
+      id: "fx",
+      fieldMetadataId: U_STAGE,
+      operand: "IS",
+      value: '["NEW"]',
+      subFieldName: null,
+      viewFilterGroupId: null,
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "reconcile");
+  assertEquals(p.filtersAdded, 1);
+  assertEquals(p.filtersRemoved, 1);
+  const kinds = uOps(p).map((o) => o.op);
+  assert(kinds.includes("create-filter"));
+  assert(kinds.includes("delete-filter"));
+});
+
+Deno.test("VIEW-UPSERT plan: adopt (rename + reduce grouped 2-clause -> single ungrouped)", () => {
+  const existing = [uView({
+    id: "open-pipe",
+    name: "Open Pipeline",
+    filterGroups: [{
+      id: "g1",
+      logicalOperator: "AND",
+      parentViewFilterGroupId: null,
+    }],
+    filters: [
+      {
+        id: "m-lob",
+        fieldMetadataId: U_LOB,
+        operand: "IS_NOT",
+        value: '["NETWORK_PROVIDER"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 0,
+      },
+      {
+        id: "m-stage",
+        fieldMetadataId: U_STAGE,
+        operand: "IS_NOT",
+        value: '["CUSTOMER"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 1,
+      },
+    ],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Sales Pipeline",
+      adoptFrom: "Open Pipeline",
+      filters: [{ field: "stage", operand: "IS", values: U_OPEN }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "adopt");
+  assertEquals(p.viewId, "open-pipe");
+  const ops = uOps(p);
+  assertEquals(ops[0].op, "rename-view");
+  assertEquals(ops[0].toName, "Sales Pipeline");
+  const kinds = ops.map((o) => o.op);
+  assert(kinds.includes("create-filter"), "adds the desired stage IS clause");
+  assertEquals(kinds.filter((k) => k === "delete-filter").length, 2);
+  assert(
+    kinds.includes("delete-group"),
+    "removes the emptied group (no dangling)",
+  );
+  // delete-group must come after the member deletes (ADV-3).
+  const lastDelFilter = kinds.lastIndexOf("delete-filter");
+  const delGroup = kinds.indexOf("delete-group");
+  assert(
+    delGroup > lastDelFilter,
+    "delete-group is emitted after all member deletes",
+  );
+});
+
+Deno.test("VIEW-UPSERT plan: locked/system view refused as name target", () => {
+  const existing = [uView({ name: "Consulting", isCustom: false })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("locked/system"));
+});
+
+Deno.test("VIEW-UPSERT plan: locked adoptFrom source refused (SEC-8)", () => {
+  const existing = [uView({ id: "old", name: "Old", isCustom: false })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "New",
+      adoptFrom: "Old",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("SEC-8"));
+});
+
+Deno.test("VIEW-UPSERT plan: >1 name match refused", () => {
+  const existing = [
+    uView({ id: "a", name: "Consulting" }),
+    uView({ id: "b", name: "Consulting" }),
+  ];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("ambiguous"));
+});
+
+Deno.test("VIEW-UPSERT plan: >1 adoptFrom match refused", () => {
+  const existing = [
+    uView({ id: "a", name: "Old" }),
+    uView({ id: "b", name: "Old" }),
+  ];
+  const p = planUpsertOpportunityView(
+    {
+      name: "New",
+      adoptFrom: "Old",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("adoptFrom"));
+});
+
+Deno.test("VIEW-UPSERT plan: retired/invalid enum token refused (live allowlist)", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["RETIRED_LOB"],
+      }],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("absent from live"));
+});
+
+Deno.test("VIEW-UPSERT plan: unresolved fieldMetadataId refused", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Ghost",
+      filters: [{ field: "nonexistentField", operand: "IS", values: ["X"] }],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("fieldMetadataId"));
+});
+
+Deno.test("VIEW-UPSERT plan: multi-clause without filterGroup refused", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filters: [
+        { field: "stage", operand: "IS", values: ["NEW"] },
+        { field: "lineOfBusiness", operand: "IS", values: ["CONSULTING"] },
+      ],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("filterGroup"));
+});
+
+Deno.test("VIEW-UPSERT plan: unsupported operand refused", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "CONTAINS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("not supported"));
+});
+
+Deno.test("VIEW-UPSERT plan: duplicate desired clause refused", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filterGroup: "and",
+      filters: [
+        { field: "stage", operand: "IS", values: ["NEW"] },
+        { field: "stage", operand: "IS", values: ["PROPOSAL"] },
+      ],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("duplicate desired clause"));
+});
+
+Deno.test("VIEW-UPSERT plan: grouped create (create-group + members)", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filterGroup: "and",
+      filters: [
+        { field: "stage", operand: "IS", values: ["NEW"] },
+        { field: "lineOfBusiness", operand: "IS", values: ["CONSULTING"] },
+      ],
+    },
+    U_FIELDMETA,
+    [],
+    U_OPP,
+  );
+  assertEquals(p.action, "create");
+  assertEquals(p.grouped, true);
+  assertEquals(p.groupOperator, "AND");
+  const ops = uOps(p);
+  assertEquals(ops[0].op, "create-group");
+  assertEquals(ops[0].logicalOperator, "AND");
+  assertEquals(ops.filter((o) => o.op === "create-filter").length, 2);
+  assert(ops.slice(1).every((o) => o.grouped === true));
+});
+
+Deno.test("VIEW-UPSERT plan: group operator drift -> patch-group-operator", () => {
+  const existing = [uView({
+    name: "Board",
+    filterGroups: [{
+      id: "g1",
+      logicalOperator: "AND",
+      parentViewFilterGroupId: null,
+    }],
+    filters: [
+      {
+        id: "m1",
+        fieldMetadataId: U_STAGE,
+        operand: "IS",
+        value: '["NEW"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 0,
+      },
+      {
+        id: "m2",
+        fieldMetadataId: U_LOB,
+        operand: "IS",
+        value: '["CONSULTING"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 1,
+      },
+    ],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filterGroup: "or",
+      filters: [
+        { field: "stage", operand: "IS", values: ["NEW"] },
+        { field: "lineOfBusiness", operand: "IS", values: ["CONSULTING"] },
+      ],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "reconcile");
+  const ops = uOps(p);
+  assertEquals(ops.length, 1);
+  assertEquals(ops[0].op, "patch-group-operator");
+  assertEquals(ops[0].logicalOperator, "OR");
+});
+
+Deno.test("VIEW-UPSERT plan: nested viewFilterGroup refused (fail-closed ADV-10)", () => {
+  const existing = [uView({
+    name: "Board",
+    filterGroups: [
+      { id: "g1", logicalOperator: "AND", parentViewFilterGroupId: null },
+      { id: "g2", logicalOperator: "OR", parentViewFilterGroupId: "g1" },
+    ],
+    filters: [{
+      id: "m1",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: '["CONSULTING"]',
+      subFieldName: null,
+      viewFilterGroupId: "g1",
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("nested"));
+});
+
+Deno.test("VIEW-UPSERT plan: >1 top-level group refused (fail-closed ADV-10)", () => {
+  const existing = [uView({
+    name: "Board",
+    filterGroups: [
+      { id: "g1", logicalOperator: "AND", parentViewFilterGroupId: null },
+      { id: "g2", logicalOperator: "AND", parentViewFilterGroupId: null },
+    ],
+    filters: [{
+      id: "m1",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: '["CONSULTING"]',
+      subFieldName: null,
+      viewFilterGroupId: "g1",
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("top-level"));
+});
+
+Deno.test("VIEW-UPSERT plan: ungrouped -> grouped restructure refused", () => {
+  const existing = [uView({
+    name: "Board",
+    filters: [
+      {
+        id: "m1",
+        fieldMetadataId: U_STAGE,
+        operand: "IS",
+        value: '["NEW"]',
+        subFieldName: null,
+        viewFilterGroupId: null,
+      },
+      {
+        id: "m2",
+        fieldMetadataId: U_LOB,
+        operand: "IS",
+        value: '["CONSULTING"]',
+        subFieldName: null,
+        viewFilterGroupId: null,
+      },
+    ],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Board",
+      filterGroup: "and",
+      filters: [
+        { field: "stage", operand: "IS", values: ["NEW"] },
+        { field: "lineOfBusiness", operand: "IS", values: ["CONSULTING"] },
+      ],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("grouped restructure"));
+});
+
+Deno.test("VIEW-UPSERT plan: adoptFrom by viewId (UUID-parse selects id)", () => {
+  const id = "12345678-1234-1234-1234-1234567890ab";
+  const existing = [uView({ id, name: "Old", filters: [] })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "New",
+      adoptFrom: id,
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "adopt");
+  assertEquals(p.viewId, id);
+});
+
+Deno.test("VIEW-UPSERT plan: object-scoped (view in another object ignored)", () => {
+  const existing = [uView({
+    name: "Consulting",
+    objectMetadataId: "some-other-object",
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "create");
+});
+
+Deno.test("VIEW-UPSERT plan: unresolved objectMetadataId refused", () => {
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    [],
+    undefined,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("objectMetadataId"));
+});
+
+// --- Method integration (stateful HTTP store + read-back) -------------------
+
+type StoreRow = Record<string, unknown>;
+function makeViewStore(seed: {
+  views?: StoreRow[];
+  filters?: StoreRow[];
+  groups?: StoreRow[];
+} = {}): {
+  handler: (method: string, path: string, body: unknown) => unknown;
+  views: StoreRow[];
+  filters: StoreRow[];
+  groups: StoreRow[];
+} {
+  const objects = {
+    data: [{
+      nameSingular: "opportunity",
+      id: U_OPP,
+      fields: [
+        {
+          name: "stage",
+          id: U_STAGE,
+          type: "SELECT",
+          options: U_FIELDMETA.stage!.options.map((v) => ({ value: v })),
+        },
+        {
+          name: "lineOfBusiness",
+          id: U_LOB,
+          type: "SELECT",
+          options: U_FIELDMETA.lineOfBusiness!.options.map((v) => ({
+            value: v,
+          })),
+        },
+      ],
+    }],
+    pageInfo: { hasNextPage: false },
+  };
+  const views = [...(seed.views ?? [])];
+  const filters = [...(seed.filters ?? [])];
+  const groups = [...(seed.groups ?? [])];
+  let seq = 1;
+  const nid = (p: string) => `${p}-${seq++}`;
+  const handler = (method: string, path: string, body: unknown): unknown => {
+    const b = (body ?? {}) as Record<string, unknown>;
+    const p = path.split("?")[0];
+    if (method === "GET") {
+      if (p === "/rest/metadata/objects") return objects;
+      if (p === "/rest/metadata/views") {
+        return { data: views, pageInfo: { hasNextPage: false } };
+      }
+      if (p === "/rest/metadata/viewFilters") {
+        return { data: filters, pageInfo: { hasNextPage: false } };
+      }
+      if (p === "/rest/metadata/viewFilterGroups") {
+        return { data: groups, pageInfo: { hasNextPage: false } };
+      }
+      return { data: [], pageInfo: { hasNextPage: false } };
+    }
+    if (method === "POST") {
+      if (p === "/rest/metadata/views") {
+        const id = nid("view");
+        views.push({
+          id,
+          name: b.name,
+          key: null,
+          isCustom: true,
+          isSystemSideEffect: false,
+          objectMetadataId: b.objectMetadataId,
+        });
+        return { id };
+      }
+      if (p === "/rest/metadata/viewFilterGroups") {
+        const id = nid("grp");
+        groups.push({
+          id,
+          viewId: b.viewId,
+          logicalOperator: b.logicalOperator,
+          parentViewFilterGroupId: null,
+        });
+        return { id };
+      }
+      if (p === "/rest/metadata/viewFilters") {
+        const id = nid("flt");
+        filters.push({
+          id,
+          viewId: b.viewId,
+          fieldMetadataId: b.fieldMetadataId,
+          operand: b.operand,
+          value: b.value,
+          subFieldName: b.subFieldName ?? null,
+          viewFilterGroupId: b.viewFilterGroupId ?? null,
+          positionInViewFilterGroup: b.positionInViewFilterGroup ?? null,
+        });
+        return { id };
+      }
+    }
+    if (method === "PATCH") {
+      const mv = p.match(/^\/rest\/metadata\/views\/(.+)$/);
+      if (mv) {
+        const v = views.find((x) => x.id === mv[1]);
+        if (v) Object.assign(v, b);
+        return v ?? {};
+      }
+      const mf = p.match(/^\/rest\/metadata\/viewFilters\/(.+)$/);
+      if (mf) {
+        const f = filters.find((x) => x.id === mf[1]);
+        if (f) Object.assign(f, b);
+        return f ?? {};
+      }
+      const mg = p.match(/^\/rest\/metadata\/viewFilterGroups\/(.+)$/);
+      if (mg) {
+        const g = groups.find((x) => x.id === mg[1]);
+        if (g) Object.assign(g, b);
+        return g ?? {};
+      }
+    }
+    if (method === "DELETE") {
+      const mf = p.match(/^\/rest\/metadata\/viewFilters\/(.+)$/);
+      if (mf) {
+        const i = filters.findIndex((x) => x.id === mf[1]);
+        if (i >= 0) filters.splice(i, 1);
+        return { success: true };
+      }
+      const mg = p.match(/^\/rest\/metadata\/viewFilterGroups\/(.+)$/);
+      if (mg) {
+        const i = groups.findIndex((x) => x.id === mg[1]);
+        if (i >= 0) groups.splice(i, 1);
+        return { success: true };
+      }
+      const mv = p.match(/^\/rest\/metadata\/views\/(.+)$/);
+      if (mv) {
+        const i = views.findIndex((x) => x.id === mv[1]);
+        if (i >= 0) views.splice(i, 1);
+        return { success: true };
+      }
+    }
+    return {};
+  };
+  return { handler, views, filters, groups };
+}
+
+type ViewEnsured2Snap = {
+  results: Array<Record<string, unknown>>;
+  [k: string]: unknown;
+};
+function vuCtx(): {
+  ctx: unknown;
+  writes: ViewEnsured2Snap[];
+} {
+  const writes: ViewEnsured2Snap[] = [];
+  const ctx = {
+    globalArgs: { baseUrl: "https://crm.example.com", apiToken: "tok" },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: (_s: string, _n: string, data: unknown) => {
+      writes.push(data as ViewEnsured2Snap);
+      return Promise.resolve({ name: "viewEnsured2" });
+    },
+  };
+  return { ctx, writes };
+}
+
+Deno.test("VIEW-UPSERT method: dryRun (default) plans only, no writes", async () => {
+  const store = makeViewStore();
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityViews.execute(
+      {
+        views: [{
+          name: "Consulting",
+          filters: [{
+            field: "lineOfBusiness",
+            operand: "IS",
+            values: ["CONSULTING"],
+          }],
+        }],
+      } as never,
+      ctx as never,
+    );
+    const mutations = calls.filter((c) => c.method !== "GET");
+    assertEquals(mutations.length, 0);
+    assertEquals(writes[0].results[0].action, "create");
+    assertEquals(writes[0].dryRun, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: confirm create writes stringified value + reads back", async () => {
+  const store = makeViewStore();
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityViews.execute(
+      {
+        views: [{
+          name: "Consulting",
+          filters: [{
+            field: "lineOfBusiness",
+            operand: "IS",
+            values: ["CONSULTING"],
+          }],
+        }],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const viewPost = calls.find((c) =>
+      c.method === "POST" && c.path === "/rest/metadata/views"
+    );
+    assert(viewPost, "POSTs the view");
+    const filterPost = calls.find((c) =>
+      c.method === "POST" && c.path === "/rest/metadata/viewFilters"
+    );
+    assert(filterPost, "POSTs the viewFilter");
+    assertEquals(
+      (filterPost!.body as Record<string, unknown>).value,
+      '["CONSULTING"]',
+    );
+    assertEquals(writes[0].results[0].action, "created");
+    assertEquals(writes[0].results[0].readBackOk, true);
+    assertEquals(writes[0].createdCount, 1);
+    assertEquals(store.views.length, 1);
+    assertEquals(store.filters.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: confirm adopt reduces grouped source, no dangling group", async () => {
+  const store = makeViewStore({
+    views: [{
+      id: "open-pipe",
+      name: "Open Pipeline",
+      key: null,
+      isCustom: true,
+      isSystemSideEffect: false,
+      objectMetadataId: U_OPP,
+    }],
+    groups: [{
+      id: "g1",
+      viewId: "open-pipe",
+      logicalOperator: "AND",
+      parentViewFilterGroupId: null,
+    }],
+    filters: [
+      {
+        id: "m-lob",
+        viewId: "open-pipe",
+        fieldMetadataId: U_LOB,
+        operand: "IS_NOT",
+        value: '["NETWORK_PROVIDER"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 0,
+      },
+      {
+        id: "m-stage",
+        viewId: "open-pipe",
+        fieldMetadataId: U_STAGE,
+        operand: "IS_NOT",
+        value: '["CUSTOMER"]',
+        subFieldName: null,
+        viewFilterGroupId: "g1",
+        positionInViewFilterGroup: 1,
+      },
+    ],
+  });
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityView.execute(
+      {
+        name: "Sales Pipeline",
+        adoptFrom: "Open Pipeline",
+        filters: [{ field: "stage", operand: "IS", values: U_OPEN }],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    const rename = calls.find((c) =>
+      c.method === "PATCH" && c.path === "/rest/metadata/views/open-pipe"
+    );
+    assert(rename, "renames the source view");
+    assertEquals(
+      (rename!.body as Record<string, unknown>).name,
+      "Sales Pipeline",
+    );
+    assert(
+      calls.some((c) =>
+        c.method === "DELETE" &&
+        c.path === "/rest/metadata/viewFilterGroups/g1"
+      ),
+      "deletes the emptied group",
+    );
+    // final state: one ungrouped stage IS filter, no groups.
+    assertEquals(store.groups.length, 0);
+    assertEquals(store.filters.length, 1);
+    assertEquals(store.filters[0].fieldMetadataId, U_STAGE);
+    assertEquals(store.filters[0].operand, "IS");
+    assertEquals(store.filters[0].viewFilterGroupId, null);
+    assertEquals(store.views[0].name, "Sales Pipeline");
+    assertEquals(writes[0].results[0].action, "adopted");
+    assertEquals(writes[0].results[0].readBackOk, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: confirm re-run is a quiet present no-op", async () => {
+  const store = makeViewStore({
+    views: [{
+      id: "cv",
+      name: "Consulting",
+      key: null,
+      isCustom: true,
+      isSystemSideEffect: false,
+      objectMetadataId: U_OPP,
+    }],
+    filters: [{
+      id: "cf",
+      viewId: "cv",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: ["CONSULTING"], // bare-array legacy form -> must normalize to no-op
+      subFieldName: null,
+      viewFilterGroupId: null,
+      positionInViewFilterGroup: null,
+    }],
+  });
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityView.execute(
+      {
+        name: "Consulting",
+        filters: [{
+          field: "lineOfBusiness",
+          operand: "IS",
+          values: ["CONSULTING"],
+        }],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.filter((c) => c.method !== "GET").length, 0);
+    assertEquals(writes[0].results[0].action, "present");
+    assertEquals(writes[0].presentCount, 1);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: confirm refuses a locked view (no writes)", async () => {
+  const store = makeViewStore({
+    views: [{
+      id: "sys",
+      name: "Consulting",
+      key: "INDEX",
+      isCustom: false,
+      isSystemSideEffect: true,
+      objectMetadataId: U_OPP,
+    }],
+  });
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityView.execute(
+      {
+        name: "Consulting",
+        filters: [{
+          field: "lineOfBusiness",
+          operand: "IS",
+          values: ["CONSULTING"],
+        }],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.filter((c) => c.method !== "GET").length, 0);
+    assertEquals(writes[0].results[0].action, "refuse");
+    assertEquals(writes[0].refusedCount, 1);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: fan-out duplicate desired name refused", async () => {
+  const store = makeViewStore();
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityViews.execute(
+      {
+        views: [
+          {
+            name: "Dup",
+            filters: [{
+              field: "lineOfBusiness",
+              operand: "IS",
+              values: ["CONSULTING"],
+            }],
+          },
+          {
+            name: "Dup",
+            filters: [{
+              field: "lineOfBusiness",
+              operand: "IS",
+              values: ["HOSTING"],
+            }],
+          },
+        ],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.filter((c) => c.method !== "GET").length, 0);
+    assertEquals(writes[0].results[0].action, "refuse");
+    assertEquals(writes[0].results[1].action, "refuse");
+    assert(String(writes[0].results[0].reason).includes("duplicate"));
   } finally {
     restore();
   }
