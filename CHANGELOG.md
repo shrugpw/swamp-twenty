@@ -3,6 +3,34 @@
 All notable changes to `@shrug/twenty`. Versions are CalVer
 (`YYYY.MM.DD.micro`).
 
+## 2026.09.19.1
+
+### Added -- reconciling opportunity view UPSERT (`TWENTY-VIEW-UPSERT`)
+
+- **`upsertOpportunityView`** and **`upsertOpportunityViews`** (fan-out) -- a new,
+  additive, reconciling view manager. Per view it will **create** (name absent),
+  **adopt+rename** (an explicit `adoptFrom` an existing swamp-owned view),
+  **reconcile** its `viewFilter`s (add missing / delete extra / patch
+  operand/value drift / patch a group's AND/OR operator / collapse
+  grouped->ungrouped), report **present** (already matching -- a quiet no-op), or
+  **refuse** (fail-closed). Reconcile is keyed on
+  `(fieldMetadataId, subFieldName, operand)` with `viewFilterGroupId` used to
+  detect and refuse ambiguous / nested / multi-group structures.
+- **Fail-closed guardrails.** Never mutates a view without positive proof of
+  mutability (`isCustom === true && key == null && !isSystemSideEffect`);
+  requires an explicit `adoptFrom` opt-in to reconcile a **divergent**
+  name-matched view (a bare re-run will not clobber a human view that merely
+  shares the name); refuses `>1` name or `adoptFrom` match, unresolved
+  object/field metadata, retired/invalid enum tokens (live-schema allowlist),
+  nested / multiple top-level groups, and an ungrouped->grouped restructure.
+- **Safe writes.** Writes the UI JSON-stringified value form and normalizes both
+  sides when diffing (no churn against UI-authored filters); never blind-deletes
+  a `viewFilterGroup` (deletes/ungroups members first, then removes the emptied
+  group); verifies every write with a post-write read-back. `confirm`-gated with
+  a no-write `dryRun` default. Snapshots a new **`viewEnsured2`** resource.
+- The create-only **`ensureOpportunityViews`** and its `viewEnsured` snapshot are
+  **unchanged** (this is purely additive).
+
 ## 2026.09.18.1
 
 ### Added -- note reconciliation, extension scope A+B (`TWENTY-NOTE-RECONCILE`)
