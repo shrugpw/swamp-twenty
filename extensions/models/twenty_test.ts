@@ -9389,7 +9389,7 @@ Deno.test("VIEW-UPSERT plan: present no-op when filter already matches (bare-arr
   assertEquals(uOps(p).length, 0);
 });
 
-Deno.test("VIEW-UPSERT plan: value drift -> reconcile patch-filter (stringified)", () => {
+Deno.test("VIEW-UPSERT plan: divergent name-match WITHOUT adoptFrom is refused (SEC-3)", () => {
   const existing = [uView({
     name: "Consulting",
     filters: [{
@@ -9404,6 +9404,36 @@ Deno.test("VIEW-UPSERT plan: value drift -> reconcile patch-filter (stringified)
   const p = planUpsertOpportunityView(
     {
       name: "Consulting",
+      filters: [{
+        field: "lineOfBusiness",
+        operand: "IS",
+        values: ["CONSULTING"],
+      }],
+    },
+    U_FIELDMETA,
+    existing,
+    U_OPP,
+  );
+  assertEquals(p.action, "refuse");
+  assert(p.reason.includes("SEC-3"));
+});
+
+Deno.test("VIEW-UPSERT plan: value drift -> reconcile patch-filter (stringified, self-adopt opt-in)", () => {
+  const existing = [uView({
+    name: "Consulting",
+    filters: [{
+      id: "f1",
+      fieldMetadataId: U_LOB,
+      operand: "IS",
+      value: '["HOSTING"]',
+      subFieldName: null,
+      viewFilterGroupId: null,
+    }],
+  })];
+  const p = planUpsertOpportunityView(
+    {
+      name: "Consulting",
+      adoptFrom: "Consulting", // explicit opt-in to reconcile the divergence
       filters: [{
         field: "lineOfBusiness",
         operand: "IS",
@@ -9437,6 +9467,7 @@ Deno.test("VIEW-UPSERT plan: reconcile add-missing + delete-extra", () => {
   const p = planUpsertOpportunityView(
     {
       name: "Consulting",
+      adoptFrom: "Consulting", // explicit opt-in to reconcile the divergence
       filters: [{
         field: "lineOfBusiness",
         operand: "IS",
@@ -9741,6 +9772,7 @@ Deno.test("VIEW-UPSERT plan: group operator drift -> patch-group-operator", () =
   const p = planUpsertOpportunityView(
     {
       name: "Board",
+      adoptFrom: "Board", // divergence (operator) -> explicit opt-in (SEC-3)
       filterGroup: "or",
       filters: [
         { field: "stage", operand: "IS", values: ["NEW"] },
@@ -9756,6 +9788,9 @@ Deno.test("VIEW-UPSERT plan: group operator drift -> patch-group-operator", () =
   assertEquals(ops.length, 1);
   assertEquals(ops[0].op, "patch-group-operator");
   assertEquals(ops[0].logicalOperator, "OR");
+  // group-operator drift is NOT counted as a filter patch (CR-3)
+  assertEquals(p.filtersPatched, 0);
+  assert(p.reason.includes("group-operator"));
 });
 
 Deno.test("VIEW-UPSERT plan: nested viewFilterGroup refused (fail-closed ADV-10)", () => {
@@ -10347,6 +10382,56 @@ Deno.test("VIEW-UPSERT method: fan-out duplicate desired name refused", async ()
     assertEquals(writes[0].results[0].action, "refuse");
     assertEquals(writes[0].results[1].action, "refuse");
     assert(String(writes[0].results[0].reason).includes("duplicate"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("VIEW-UPSERT method: fan-out duplicate adoptFrom refused (no writes)", async () => {
+  const store = makeViewStore({
+    views: [{
+      id: "src",
+      name: "Src",
+      key: null,
+      isCustom: true,
+      isSystemSideEffect: false,
+      objectMetadataId: U_OPP,
+    }],
+  });
+  const { calls, restore } = stubTwentyFetch(store.handler);
+  const { ctx, writes } = vuCtx();
+  try {
+    await model.methods.upsertOpportunityViews.execute(
+      {
+        views: [
+          {
+            name: "A",
+            adoptFrom: "Src",
+            filters: [{
+              field: "lineOfBusiness",
+              operand: "IS",
+              values: ["CONSULTING"],
+            }],
+          },
+          {
+            name: "B",
+            adoptFrom: "Src",
+            filters: [{
+              field: "lineOfBusiness",
+              operand: "IS",
+              values: ["HOSTING"],
+            }],
+          },
+        ],
+        confirm: true,
+        dryRun: false,
+      } as never,
+      ctx as never,
+    );
+    assertEquals(calls.filter((c) => c.method !== "GET").length, 0);
+    assertEquals(writes[0].results[0].action, "refuse");
+    assertEquals(writes[0].results[1].action, "refuse");
+    assert(String(writes[0].results[0].reason).includes("adoptFrom"));
   } finally {
     restore();
   }

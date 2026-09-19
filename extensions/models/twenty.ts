@@ -4087,7 +4087,6 @@ export interface DesiredView {
   filters: DesiredViewFilter[];
   filterGroup?: "and" | "or";
   adoptFrom?: string;
-  objectMetadataId?: string;
 }
 
 interface ResolvedClause {
@@ -4254,6 +4253,7 @@ function diffExistingView(
     added: number;
     removed: number;
     patched: number;
+    groupOpPatched: boolean;
     existingGroupId?: string;
   }
   | { refuse: string } {
@@ -4289,6 +4289,7 @@ function diffExistingView(
 
   const ops: ViewUpsertOp[] = [];
   let added = 0, removed = 0, patched = 0;
+  let groupOpPatched = false;
 
   const byKey = new Map<string, OppViewFilterRef>();
   for (const f of filters) {
@@ -4370,7 +4371,9 @@ function diffExistingView(
         groupId: existingGroupId,
         logicalOperator: groupOperator,
       });
-      patched++;
+      // Group-operator drift is a group-level change, NOT a filter patch — kept
+      // out of `patched` so the audit doesn't misattribute it to a viewFilter.
+      groupOpPatched = true;
     }
   }
 
@@ -4389,7 +4392,7 @@ function diffExistingView(
     ops.push({ op: "delete-group", groupId: existingGroupId });
   }
 
-  return { ops, added, removed, patched, existingGroupId };
+  return { ops, added, removed, patched, groupOpPatched, existingGroupId };
 }
 
 /**
@@ -4438,6 +4441,7 @@ export function planUpsertOpportunityView(
   const inObject = existingViews.filter(
     (v) => (v.objectMetadataId ?? objectMetadataId) === objectMetadataId,
   );
+  const adoptRef = String(desired.adoptFrom ?? "").trim();
 
   const nameMatches = inObject.filter((v) => v.name === name);
   if (nameMatches.length > 1) {
@@ -4468,12 +4472,28 @@ export function planUpsertOpportunityView(
         existingGroupId: diff.existingGroupId,
       };
     }
+    // SEC-3: a name-matched view whose filters DIVERGE from desired must not be
+    // mutated on a bare confirm re-run — it could be a human-authored view that
+    // merely shares the name (this REST surface exposes no swamp-authorship
+    // marker; isCustom=true is true of any UI-built view too). Reconciling the
+    // divergence requires an explicit adoptFrom opt-in naming THIS view.
+    const selfAdopt = adoptRef !== "" &&
+      (UUID_RE.test(adoptRef) ? view.id === adoptRef : view.name === adoptRef);
+    if (!selfAdopt) {
+      return refuse(
+        `view '${name}' exists but its filters diverge from desired; refusing to mutate a name-matched view on a bare run — it may be a human-authored view sharing the name (no swamp-authorship marker exists on this API). Set adoptFrom='${name}' (or its viewId) to explicitly opt in to reconciling it (SEC-3).`,
+        { viewId: view.id },
+      );
+    }
     return {
       ...base,
       action: "reconcile",
       reason:
-        `reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch`,
+        `reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch${
+          diff.groupOpPatched ? " + group-operator" : ""
+        } (adopt-in-place opt-in)`,
       viewId: view.id,
+      adoptFrom: adoptRef,
       ops: diff.ops,
       filtersAdded: diff.added,
       filtersRemoved: diff.removed,
@@ -4483,7 +4503,6 @@ export function planUpsertOpportunityView(
   }
 
   // ABSENT — adopt (explicit opt-in) or create.
-  const adoptRef = String(desired.adoptFrom ?? "").trim();
   if (adoptRef !== "") {
     const byId = UUID_RE.test(adoptRef);
     const adoptMatches = inObject.filter(
@@ -4514,7 +4533,9 @@ export function planUpsertOpportunityView(
         ...base,
         action: "adopt",
         reason:
-          `adopt (rename '${src.name}' -> '${name}') + reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch`,
+          `adopt (rename '${src.name}' -> '${name}') + reconcile ${diff.added} add / ${diff.removed} remove / ${diff.patched} patch${
+            diff.groupOpPatched ? " + group-operator" : ""
+          }`,
         viewId: src.id,
         adoptFrom: adoptRef,
         ops,
@@ -4597,9 +4618,12 @@ async function executeViewUpsertPlan(
   for (const op of plan.ops) {
     switch (op.op) {
       case "rename-view":
-        await twentyRequest(cfg, "PATCH", `/rest/metadata/views/${viewId}`, {
-          name: op.toName,
-        });
+        await twentyRequest(
+          cfg,
+          "PATCH",
+          `/rest/metadata/views/${encodeURIComponent(viewId)}`,
+          { name: op.toName },
+        );
         break;
       case "create-group": {
         const resp = await twentyRequest(
@@ -4621,7 +4645,7 @@ async function executeViewUpsertPlan(
         await twentyRequest(
           cfg,
           "PATCH",
-          `/rest/metadata/viewFilterGroups/${op.groupId}`,
+          `/rest/metadata/viewFilterGroups/${encodeURIComponent(op.groupId)}`,
           { logicalOperator: op.logicalOperator },
         );
         break;
@@ -4629,7 +4653,7 @@ async function executeViewUpsertPlan(
         await twentyRequest(
           cfg,
           "DELETE",
-          `/rest/metadata/viewFilterGroups/${op.groupId}`,
+          `/rest/metadata/viewFilterGroups/${encodeURIComponent(op.groupId)}`,
         );
         break;
       case "create-filter": {
@@ -4660,7 +4684,7 @@ async function executeViewUpsertPlan(
         await twentyRequest(
           cfg,
           "PATCH",
-          `/rest/metadata/viewFilters/${op.filterId}`,
+          `/rest/metadata/viewFilters/${encodeURIComponent(op.filterId)}`,
           body,
         );
         break;
@@ -4669,7 +4693,7 @@ async function executeViewUpsertPlan(
         await twentyRequest(
           cfg,
           "DELETE",
-          `/rest/metadata/viewFilters/${op.filterId}`,
+          `/rest/metadata/viewFilters/${encodeURIComponent(op.filterId)}`,
         );
         break;
     }
@@ -4754,10 +4778,9 @@ const UpsertViewFilterArg = z.object({
 });
 const UpsertViewArg = z.object({
   name: z.string(),
-  filters: z.array(UpsertViewFilterArg).min(1),
+  filters: z.array(UpsertViewFilterArg).min(1).max(20),
   filterGroup: z.enum(["and", "or"]).optional(),
   adoptFrom: z.string().optional(),
-  objectMetadataId: z.string().optional(),
 });
 
 /**
@@ -4804,10 +4827,17 @@ async function runViewUpserts(
 
   const seenNames = new Set<string>();
   const dupNames = new Set<string>();
+  const seenAdopt = new Set<string>();
+  const dupAdopt = new Set<string>();
   for (const d of desiredViews) {
     const n = String(d.name ?? "").trim();
     if (seenNames.has(n)) dupNames.add(n);
     seenNames.add(n);
+    const a = String(d.adoptFrom ?? "").trim();
+    if (a !== "") {
+      if (seenAdopt.has(a)) dupAdopt.add(a);
+      seenAdopt.add(a);
+    }
   }
 
   const results: Array<Record<string, unknown>> = [];
@@ -4819,6 +4849,28 @@ async function runViewUpserts(
         action: "refuse",
         reason:
           `duplicate desired view name '${d.name}' in this request — fail-closed`,
+      });
+      continue;
+    }
+    const adoptRefRaw = String(d.adoptFrom ?? "").trim();
+    if (adoptRefRaw !== "" && dupAdopt.has(adoptRefRaw)) {
+      results.push({
+        ...row,
+        action: "refuse",
+        reason:
+          `duplicate adoptFrom '${adoptRefRaw}' across this request — fail-closed (would re-adopt the same view twice, clobbering the first result)`,
+      });
+      continue;
+    }
+    // Baseline honesty (applies to dryRun too): if the existing-view list could
+    // not be loaded we cannot tell create from present/adopt, so suppress the
+    // plan rather than emit a false "will create N views" (CR-2).
+    if (oppOid && !existingLoadOk) {
+      results.push({
+        ...row,
+        action: "refuse",
+        reason:
+          "existing view baseline failed to load — plan suppressed, fail-closed (cannot distinguish create vs present)",
       });
       continue;
     }
@@ -4836,29 +4888,32 @@ async function runViewUpserts(
     const mutating = plan.action === "create" || plan.action === "adopt" ||
       plan.action === "reconcile";
     if (mutating && willWrite) {
+      // Exec-time guards: nothing was written, so zero the plan counters in the
+      // snapshot (CR-5 — a refused row must not imply changes it never made).
+      const refusedRow = (reason: string): Record<string, unknown> => ({
+        ...row,
+        action: "refuse",
+        reason,
+        filtersAdded: 0,
+        filtersRemoved: 0,
+        filtersPatched: 0,
+      });
       if (!existingLoadOk) {
-        results.push({
-          ...row,
-          action: "refuse",
-          reason:
+        results.push(
+          refusedRow(
             "existing view list failed to load — fail-closed (won't write blind)",
-        });
+          ),
+        );
         continue;
       }
       if (!reachable) {
-        results.push({
-          ...row,
-          action: "refuse",
-          reason: "metadata API not reachable — fail-closed",
-        });
+        results.push(refusedRow("metadata API not reachable — fail-closed"));
         continue;
       }
       if (!oppOid) {
-        results.push({
-          ...row,
-          action: "refuse",
-          reason: "opportunity objectMetadataId unresolved — fail-closed",
-        });
+        results.push(
+          refusedRow("opportunity objectMetadataId unresolved — fail-closed"),
+        );
         continue;
       }
       try {
@@ -4870,7 +4925,6 @@ async function runViewUpserts(
             name: plan.name,
             filters: d.filters,
             filterGroup: d.filterGroup,
-            objectMetadataId: d.objectMetadataId,
           },
           fieldMeta,
           fresh,
@@ -4906,6 +4960,7 @@ async function runViewUpserts(
     dryRun: !willWrite,
     confirm: confirm === true,
     reachable,
+    existingLoadOk,
     objectMetadataId: oppOid,
     results,
     createdCount: count("created"),
@@ -4929,6 +4984,7 @@ export const ViewEnsured2Schema = z.object({
   dryRun: z.boolean(),
   confirm: z.boolean(),
   reachable: z.boolean(),
+  existingLoadOk: z.boolean(),
   objectMetadataId: z.string().optional(),
   results: z.array(z.object({
     name: z.string(),
@@ -7425,8 +7481,8 @@ export const model = {
       description:
         "TWENTY-VIEW-UPSERT (fan-out, repo rule 6): reconcile a desired LIST of Opportunity views to a YAML source-of-truth in ONE execution. Per view: create (name absent) / adopt+rename (adoptFrom an existing swamp-owned view) / reconcile its viewFilters (add missing, delete extra, patch operand/value drift, patch group AND/OR operator, collapse grouped->ungrouped) / present (already matching, quiet no-op) / refuse (fail-closed). Additive — does NOT change the create-only ensureOpportunityViews. Fail-closed guardrails: never mutates a non-isCustom / key!=null / isSystemSideEffect view (positive-proof-of-mutability); refuses >1 name or adoptFrom match, unresolved objectMetadataId/fieldMetadataId, retired/invalid enum tokens (live-schema allowlist), nested / multi top-level groups, and an ungrouped->grouped restructure; never blind-deletes a viewFilterGroup (deletes members first, empties then removes). Writes the UI stringified value form and verifies every write with a post-write read-back. confirm-gated (default dryRun plans only); confirm=true executes. Snapshots viewEnsured2.",
       arguments: z.object({
-        views: z.array(UpsertViewArg).min(1).describe(
-          "Desired view list. Each: { name, filters:[{field,operand,values[],subFieldName?}], filterGroup?('and'|'or', required when >1 filter), adoptFrom?(existing view name or viewId), objectMetadataId?(defaults to Opportunity) }.",
+        views: z.array(UpsertViewArg).min(1).max(200).describe(
+          "Desired view list (all scoped to Opportunity). Each: { name, filters:[{field,operand,values[],subFieldName?}], filterGroup?('and'|'or', required when >1 filter), adoptFrom?(existing view name or viewId) }.",
         ),
         confirm: z.boolean().optional().describe(
           "Execute the writes. Default false = plan only.",
@@ -7469,7 +7525,7 @@ export const model = {
         name: z.string().describe(
           "Desired final view name (the stable identity within the object).",
         ),
-        filters: z.array(UpsertViewFilterArg).min(1).describe(
+        filters: z.array(UpsertViewFilterArg).min(1).max(20).describe(
           "Desired filter clauses: [{field, operand(IS|IS_NOT), values[], subFieldName?}].",
         ),
         filterGroup: z.enum(["and", "or"]).optional().describe(
@@ -7477,9 +7533,6 @@ export const model = {
         ),
         adoptFrom: z.string().optional().describe(
           "Existing view NAME or viewId to rename->name + reconcile (the adoption opt-in).",
-        ),
-        objectMetadataId: z.string().optional().describe(
-          "Object to scope to (defaults to Opportunity).",
         ),
         confirm: z.boolean().optional(),
         dryRun: z.boolean().optional(),
@@ -7490,7 +7543,6 @@ export const model = {
           filters: DesiredViewFilter[];
           filterGroup?: "and" | "or";
           adoptFrom?: string;
-          objectMetadataId?: string;
           confirm?: boolean;
           dryRun?: boolean;
         },
@@ -7503,7 +7555,6 @@ export const model = {
             filters: args.filters,
             filterGroup: args.filterGroup,
             adoptFrom: args.adoptFrom,
-            objectMetadataId: args.objectMetadataId,
           };
           const payload = await runViewUpserts(
             cfg,
