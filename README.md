@@ -37,8 +37,8 @@ sensitive, so it cannot be stored as a literal — put it in a vault and referen
 it with a CEL expression:
 
 ```bash
-swamp vault create @webframp/pass twenty --config '{"prefix":"shrug.host/twenty"}'
-swamp vault put twenty api-token '<TWENTY_REST_TOKEN>'
+swamp vault create @webframp/pass twenty --config '{"prefix":"brandhost.example/twenty"}'
+swamp vault put twenty api-token  # prompts for the Twenty REST API token
 
 swamp model create @shrug/twenty crm \
   --global-arg baseUrl=https://crm.example.com \

@@ -25,14 +25,27 @@ import {
   buildViewFilterValue,
   // TWENTY-VIEW-UPSERT
   buildViewFilterValueString,
+  // TWENTY-COMPANY-UPSERT
+  canonicalCompanyHost,
+  canonicalCompanyName,
   canonicalJson,
   // TWENTY-NOTE-RECONCILE
   canonicalNote,
+  // LEAD-SPAM-FILTER (shadow)
+  classifyLead,
+  CompanyReconcileSchema,
+  CompanyUpsertSchema,
+  computeDedupKey,
   computeMetadataNameFromLabel,
   DEFAULT_EMAIL_DOMAIN_BLOCKLIST,
+  // TWENTY-EMAIL
+  deriveThreadState,
   domainOfEmail,
   escapeMarkdown,
+  // TWENTY-EMAIL send
+  fetchConnectedAccounts,
   fetchObjectsMeta,
+  handleDomain,
   hashNote,
   isBlockedDomain,
   isFilterSafe,
@@ -41,11 +54,15 @@ import {
   leadFromKvRecord,
   listFiltered,
   listInstanceHash,
+  localpartLooksMachine,
   mapCompanyView,
   mapNoteView,
   mapOppView,
   mapPersonView,
+  messageTs,
+  mintUserAccessToken,
   model,
+  nameLooksGibberish,
   normalizeCloseDate,
   normalizeDomainHost,
   normalizeFilterValueTokens,
@@ -58,17 +75,25 @@ import {
   OpportunityUpsertSchema,
   OppViewSchema,
   parseMicros,
+  phoneLooksBogus,
+  pickLastMessage,
   planLead,
   planOpportunityView,
   planSelectOptions,
   planUpsertOpportunityView,
   redactError,
+  resolveActiveWorkflowVersionId,
+  resolveBrandForSend,
   sanitizeText,
   selectBatch,
+  sendDedupMarkerId,
+  sha256Hex,
+  SPAM_SCORE_THRESHOLD,
   splitName,
   titleCaseToken,
   toCurrency,
   twentyGraphQL,
+  validateBrandMap,
   validateDomain,
   validateEmail,
   validateLeadId,
@@ -358,13 +383,13 @@ Deno.test("selectBatch caps the batch and reports the remainder (no starvation)"
 
 // --- leadFromKvRecord / leadFromKvEntry (KV intake adapter) -----------------
 
-Deno.test("leadFromKvRecord adapts a shrugpw record: geo object -> string, null -> ''", () => {
+Deno.test("leadFromKvRecord adapts a brand record: geo object -> string, null -> ''", () => {
   const l = leadFromKvRecord({
     id: "91c0e5d5",
     received_at: "2026-09-05T02:01:14.776Z",
     status: "new",
-    name: "Neil Hanlon",
-    email: "neil@shrug.pw",
+    name: "Avery Brand",
+    email: "avery@brandmail.example",
     phone: null,
     contact_type: "business",
     message: "Potato engineering",
@@ -379,7 +404,7 @@ Deno.test("leadFromKvRecord adapts a shrugpw record: geo object -> string, null 
   assertEquals(l.message, "Potato engineering"); // no extras to fold
 });
 
-Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, keeps needs/reason/timing/source as structured details", () => {
+Deno.test("leadFromKvRecord maps brandhost.example org->company, infers business, keeps needs/reason/timing/source as structured details", () => {
   const l = leadFromKvRecord({
     id: "sh-1",
     received_at: "2026-09-06T12:00:00.000Z",
@@ -391,7 +416,7 @@ Deno.test("leadFromKvRecord maps shrug.host org->company, infers business, keeps
     needs: ["web", "files"],
     reason: "broken",
     timing: "contract's up in March",
-    message: "", // shrug.host allows an empty message
+    message: "", // brandhost.example allows an empty message
     source: "shrug.host-contact",
     geo: { city: "Springfield", region: "IL", country: "US" },
   });
@@ -483,7 +508,7 @@ Deno.test("leadFromKvEntry parses a JSON value; null on non-JSON / empty", () =>
   assertEquals(leadFromKvEntry({ value: "42" }), null); // JSON, but not an object
 });
 
-Deno.test("adapted shrug.host record flows through planLead as a valid business lead", () => {
+Deno.test("adapted brandhost.example record flows through planLead as a valid business lead", () => {
   const l = leadFromKvRecord({
     id: "sh-3",
     name: "Dana Fields",
@@ -497,6 +522,523 @@ Deno.test("adapted shrug.host record flows through planLead as a valid business 
   assertEquals(p.contactType, "business");
   assertEquals(p.companyDomain, "bobsroofing.com");
   assertEquals(p.companyName, "Bob's Roofing LLC");
+});
+
+// --- classifyLead (lead spam classification, SHADOW mode) -------------------
+//
+// Acceptance fixture = the 2026-09-30 batch (design/lead-spam-filter.md section
+// 6): six "Robertjisib" submissions (one solicitation template in six languages,
+// shared machine-generated gmail localpart, malformed phone, IPs rotating across
+// LT/RO) must all flag; the WEATHER MAN fediverse referral and the avery@brandmail.example
+// control must both PASS. Flagging WEATHER MAN is an AUTOMATIC FAIL - it is the
+// false-positive canary (a real, now-closed opportunity). Built through
+// leadFromKvRecord so the whole KV intake path (incl. client_ip threading) is
+// exercised, not a hand-rolled LeadRecord.
+
+// A majority-Cyrillic body (Bulgarian "I want to know the price"), kept as \u
+// escapes so this source file stays ASCII while the runtime string is non-Latin.
+// Bulgarian "Iskam da znaya tsenata" ("I want to know the price") - a real
+// non-Latin body like the Robertjisib Cyrillic submission, to exercise the
+// nonlatin-body-ascii-name signal.
+const RJ_CYRILLIC_BODY = "Искам да зная цената";
+
+function the20260930Batch() {
+  const rjIps = [
+    "77.90.185.5",
+    "141.98.11.224",
+    "80.94.95.173",
+    "80.94.95.202",
+    "77.90.185.5",
+    "141.98.11.224",
+  ];
+  // Same template, six languages. English + Cyrillic carry extra signals; the
+  // Latin-script translations (Latin/Lithuanian/Indonesian) carry NONE of the
+  // language-specific signals and MUST still flag on velocity + localpart +
+  // phone + IP rotation alone - the whole point of the batch.
+  const rjMessages = [
+    "Hi, I want to know your price.", // English (solicitation phrase)
+    RJ_CYRILLIC_BODY, // Bulgarian (non-Latin body)
+    "Salve, volo scire pretium tuum.", // Latin (ASCII, no keyword)
+    "Sveiki, noriu suzinoti jusu kaina.", // Lithuanian (ASCII, no keyword)
+    "Halo, saya ingin tahu harga anda.", // Indonesian (ASCII, no keyword)
+    "Bonjour, je veux connaitre votre prix.", // French (ASCII, no keyword)
+  ];
+  const robertjisib = rjMessages.map((message, i) =>
+    leadFromKvRecord({
+      id: `rj-0${i + 1}`,
+      received_at: `2026-09-30T0${i}:00:00Z`,
+      status: "new",
+      name: "Robertjisib",
+      email: "gregoryj8tl2g@gmail.com",
+      phone: "80055512345", // 11 digits leading 8 -> not NANP/E.164 dialable
+      contact_type: null, // raw null (coerced downstream; NOT a gating signal)
+      message,
+      client_ip: rjIps[i],
+    })
+  );
+
+  const weatherman = leadFromKvRecord({
+    id: "wm-01",
+    received_at: "2026-09-30T12:00:00Z",
+    status: "new",
+    name: "WEATHER MAN",
+    email: "WEATHERMAN@WEATHERISHAPPENING.COM",
+    phone: null,
+    contact_type: null, // null + all-caps + quirky domain: surface-only, must NOT gate
+    message: "SNOOPJEDI SENT ME FROM THE FEDIVERSE",
+    client_ip: "203.0.113.7",
+  });
+
+  const avery = leadFromKvRecord({
+    id: "avery-01",
+    received_at: "2026-09-30T13:00:00Z",
+    status: "new",
+    name: "Avery Brand",
+    email: "avery@brandmail.example",
+    phone: "+1 617 555 0100",
+    contact_type: "business",
+    message: "Potato engineering",
+    client_ip: "198.51.100.23",
+  });
+
+  return { robertjisib, weatherman, avery };
+}
+
+Deno.test("classifyLead ACCEPTANCE: flags the 6 Robertjisib, PASSES WEATHER MAN + avery (2026-09-30 batch)", () => {
+  const { robertjisib, weatherman, avery } = the20260930Batch();
+  const batch = [...robertjisib, weatherman, avery];
+  const verdicts = classifyLead(batch);
+
+  // All six spam entries flag - regardless of message language.
+  for (const l of robertjisib) {
+    const v = verdicts.get(l.id);
+    assert(v, `missing verdict for ${l.id}`);
+    assertEquals(v!.flagged, true, `${l.id} should be flagged (${v!.reasons})`);
+    assert(
+      v!.score >= SPAM_SCORE_THRESHOLD,
+      `${l.id} score ${v!.score} < threshold`,
+    );
+  }
+
+  // The false-positive canary: WEATHER MAN is a REAL fediverse referral. Flagging
+  // it is an AUTOMATIC FAIL of the acceptance (design section 6).
+  const wm = verdicts.get("wm-01")!;
+  assertEquals(
+    wm.flagged,
+    false,
+    `WEATHER MAN must PASS (reasons: ${wm.reasons})`,
+  );
+  assert(
+    wm.reasons.includes("referral-mention-discount"),
+    "WEATHER MAN should earn the referral ham discount",
+  );
+
+  // The legit control passes clean.
+  assertEquals(verdicts.get("avery-01")!.flagged, false);
+
+  // Exactly six flagged in the whole batch.
+  const flagged = [...verdicts.values()].filter((v) => v.flagged);
+  assertEquals(flagged.length, 6);
+});
+
+Deno.test("classifyLead: velocity + localpart carry the Latin-script translations (language-independent)", () => {
+  const { robertjisib } = the20260930Batch();
+  // The French/Latin/Lithuanian/Indonesian entries have NO solicitation keyword
+  // and a Latin-script body, so only velocity + localpart + phone + IP rotation
+  // can flag them. Prove those alone clear the bar.
+  const latinOnly = robertjisib.filter((l) =>
+    /^(rj-03|rj-04|rj-05|rj-06)$/.test(l.id)
+  );
+  assertEquals(latinOnly.length, 4);
+  const verdicts = classifyLead(robertjisib);
+  for (const l of latinOnly) {
+    const v = verdicts.get(l.id)!;
+    assertEquals(v.flagged, true);
+    assert(v.reasons.includes("identity-repeat:6"));
+    assert(v.reasons.includes("localpart-machine-generated"));
+    assert(!v.reasons.includes("solicitation-template"));
+  }
+});
+
+Deno.test("classifyLead: a referral mention keeps a surface-spammy lead HAM (WEATHER MAN regression)", () => {
+  // All-caps body + quirky .COM domain + null contact_type must not gate when a
+  // referral mention is present.
+  const lead = leadFromKvRecord({
+    id: "ref-1",
+    status: "new",
+    name: "LOUD REFERRAL",
+    email: "someone@weirddomain.example",
+    message: "A FRIEND REFERRED ME TO YOUR SHOP",
+    contact_type: null,
+  });
+  const v = classifyLead([lead]).get("ref-1")!;
+  assertEquals(v.flagged, false);
+  assert(v.reasons.includes("referral-mention-discount"));
+});
+
+Deno.test("classifyLead: repeat email ALONE does not flag a clean legit submitter", () => {
+  // Three identical submissions from a human (clean localpart, clean phone, no
+  // solicitation, single IP) score only the velocity weight (3) < threshold (4).
+  const leads = [1, 2, 3].map((i) =>
+    leadFromKvRecord({
+      id: `dup-${i}`,
+      status: "new",
+      name: "Jane Roofing",
+      email: "jane@example.com",
+      phone: "+1 617 555 0133",
+      message: "Following up on my quote request, thanks!",
+      contact_type: "business",
+      client_ip: "198.51.100.9",
+    })
+  );
+  const verdicts = classifyLead(leads);
+  for (const id of ["dup-1", "dup-2", "dup-3"]) {
+    assertEquals(verdicts.get(id)!.flagged, false);
+  }
+});
+
+Deno.test("localpartLooksMachine: machine-generated vs human localparts", () => {
+  assert(localpartLooksMachine("gregoryj8tl2g@gmail.com"));
+  assert(localpartLooksMachine("joshuaguerrero2v7t40d@gmail.com"));
+  assert(!localpartLooksMachine("avery@brandmail.example"));
+  assert(!localpartLooksMachine("weatherman@weatherishappening.com"));
+  assert(!localpartLooksMachine("john.doe@example.com"));
+  assert(!localpartLooksMachine("jsmith2024@example.com")); // trailing year: 1 transition
+});
+
+Deno.test("phoneLooksBogus: malformed vs dialable numbers", () => {
+  assert(phoneLooksBogus("80055512345")); // bare 11-digit trunk-8, not intl -> bogus
+  assert(!phoneLooksBogus("+1 617 555 0100")); // clean NANP
+  assert(!phoneLooksBogus("617-555-0100")); // bare 10-digit NANP
+  assert(!phoneLooksBogus("+44 7911 123456")); // plausible UK E.164
+  assert(!phoneLooksBogus("")); // absent -> not a signal
+  assert(!phoneLooksBogus("12345")); // too short -> not a signal
+  // review M2: real zone-8 E.164 numbers must NOT flag, with or without '+'.
+  assert(!phoneLooksBogus("+84912345678")); // Vietnam, entered as E.164
+  assert(!phoneLooksBogus("+81312345678")); // Japan, entered as E.164
+  assert(!phoneLooksBogus("84912345678")); // Vietnam pasted without '+' (cycle 2)
+  assert(!phoneLooksBogus("81312345678")); // Japan pasted without '+'
+});
+
+Deno.test("classifyLead reasons are PII-free and client_ip drives ip-rotation (never a raw IP)", () => {
+  const { robertjisib } = the20260930Batch();
+  const v = classifyLead(robertjisib).get("rj-01")!;
+  // IP rotation fired (4 distinct IPs across the identity)...
+  assert(v.reasons.some((r) => r.startsWith("ip-rotation:")));
+  // ...but no reason token leaks a raw IP, email, name, or message substring.
+  const joined = v.reasons.join(" ");
+  assert(
+    !/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(joined),
+    "no raw IP in reasons",
+  );
+  assert(!/gregory|gmail|robertjisib/i.test(joined), "no raw PII in reasons");
+});
+
+// --- classifyLead: review-cycle-1 hardening regressions ---------------------
+
+Deno.test("classifyLead H1: a referral mention CANNOT smuggle a high-velocity burst through", () => {
+  // Append a generic referral clause to every Robertjisib message (the exact
+  // evasion the reviewer found). The already-flagging score must ignore the
+  // discount, so all six still flag.
+  const { robertjisib } = the20260930Batch();
+  const evasive = robertjisib.map((l) => ({
+    ...l,
+    message: `${l.message} A friend sent me.`,
+  }));
+  const verdicts = classifyLead(evasive);
+  for (const l of evasive) {
+    const v = verdicts.get(l.id)!;
+    assertEquals(v.flagged, true, `${l.id} must still flag (${v.reasons})`);
+    assert(v.reasons.includes("referral-mention-ignored-corroborated"));
+    assert(!v.reasons.includes("referral-mention-discount"));
+  }
+});
+
+Deno.test("classifyLead H1 (cycle 2): a SINGLE-SHOT spam lead cannot zero itself out with a referral phrase", () => {
+  // One submission, one IP (no velocity/rotation) but machine localpart +
+  // solicitation + free-mail => score 5, already flagging. A referral clause
+  // must NOT rescue it (the cycle-2 finding: the old velocity-only gate let
+  // this through).
+  const base = {
+    id: "oneshot-1",
+    status: "new",
+    name: "Gregory",
+    email: "gregoryj8tl2g@gmail.com",
+    message: "I want to know your price",
+    client_ip: "77.90.185.5",
+  };
+  const plain = classifyLead([leadFromKvRecord(base)]).get("oneshot-1")!;
+  assertEquals(plain.flagged, true);
+  const withReferral = classifyLead([
+    leadFromKvRecord({
+      ...base,
+      message: `${base.message}. A friend sent me.`,
+    }),
+  ]).get("oneshot-1")!;
+  assertEquals(
+    withReferral.flagged,
+    true,
+    `single-shot evasion (${withReferral.reasons})`,
+  );
+  assert(
+    withReferral.reasons.includes("referral-mention-ignored-corroborated"),
+  );
+});
+
+Deno.test("classifyLead H2: a loyal customer contacting months apart from 2 networks is NOT flagged", () => {
+  // Same email, 3 submissions spread across a year, two different IPs. Outside
+  // the velocity window each submission is a singleton -> no velocity, no
+  // rotation -> clean.
+  const leads = [
+    { when: "2026-01-10T10:00:00Z", ip: "198.51.100.5" },
+    { when: "2026-05-22T14:00:00Z", ip: "203.0.113.9" }, // different network
+    { when: "2026-10-01T09:00:00Z", ip: "198.51.100.5" },
+  ].map((e, i) =>
+    leadFromKvRecord({
+      id: `loyal-${i}`,
+      status: "new",
+      received_at: e.when,
+      name: "Pat Customer",
+      email: "pat@patsgarage.example",
+      phone: "+1 617 555 0144",
+      message: "Hi, following up on our project - thanks again!",
+      contact_type: "business",
+      client_ip: e.ip,
+    })
+  );
+  const verdicts = classifyLead(leads);
+  for (const id of ["loyal-0", "loyal-1", "loyal-2"]) {
+    const v = verdicts.get(id)!;
+    assertEquals(v.flagged, false, `${id} should pass (${v.reasons})`);
+    assert(!v.reasons.some((r) => r.startsWith("identity-repeat")));
+    assert(!v.reasons.some((r) => r.startsWith("ip-rotation")));
+  }
+});
+
+Deno.test("classifyLead H2: a same-week burst DOES cluster (window works both ways)", () => {
+  const leads = [0, 1, 2, 3].map((i) =>
+    leadFromKvRecord({
+      id: `burst-${i}`,
+      status: "new",
+      received_at: `2026-10-0${i + 1}T09:00:00Z`,
+      name: "Spammer",
+      email: "burst@gmail.com",
+      message: "know your price",
+      client_ip: `80.94.95.${i + 1}`,
+      phone: "80055512345",
+    })
+  );
+  const verdicts = classifyLead(leads);
+  for (const l of leads) {
+    assertEquals(verdicts.get(l.id)!.flagged, true);
+  }
+});
+
+Deno.test("classifyLead H3: a legit free-mail B2B inquiry is NOT flagged", () => {
+  // A real freelancer from gmail. "cooperation"/"SEO"/"marketing services" are
+  // no longer solicitation signals; a bare price question (+freemail) stays
+  // below threshold.
+  const cooperation = leadFromKvRecord({
+    id: "legit-coop",
+    status: "new",
+    name: "Dana Smith",
+    email: "dana.smith@gmail.com",
+    message:
+      "Hi, I'd love to explore a cooperation on SEO and marketing services for my shop.",
+    contact_type: "business",
+    client_ip: "198.51.100.40",
+  });
+  const priceAsk = leadFromKvRecord({
+    id: "legit-price",
+    status: "new",
+    name: "Sam Jones",
+    email: "sam.jones@gmail.com",
+    message: "Could you let me know your price for a small website?",
+    contact_type: "business",
+    client_ip: "198.51.100.41",
+  });
+  const verdicts = classifyLead([cooperation, priceAsk]);
+  assertEquals(verdicts.get("legit-coop")!.flagged, false);
+  assert(
+    !verdicts.get("legit-coop")!.reasons.includes("solicitation-template"),
+  );
+  const price = verdicts.get("legit-price")!;
+  assertEquals(price.flagged, false); // solicitation(2)+freemail(1)=3 < 4
+  assert(price.score < SPAM_SCORE_THRESHOLD);
+});
+
+Deno.test("classifyLead M1: a known-customer domain hard-passes even a spammy-looking lead", () => {
+  const { robertjisib } = the20260930Batch();
+  // Same would-be-spam lead, but its domain is on the known-customer allowlist.
+  const asCustomer = robertjisib.map((l) => ({
+    ...l,
+    email: l.email.replace("@gmail.com", "@knowncustomer.example"),
+  }));
+  const verdicts = classifyLead(asCustomer, {
+    knownDomains: ["knowncustomer.example"],
+  });
+  for (const l of asCustomer) {
+    const v = verdicts.get(l.id)!;
+    assertEquals(v.flagged, false);
+    assertEquals(v.reasons, ["known-customer-hardpass"]);
+  }
+});
+
+Deno.test("classifyLead M3: the free-mail signal honors the configurable blocklist", () => {
+  // gmail.com NOT in the passed list => no freemail-plus-solicitation reason.
+  const lead = leadFromKvRecord({
+    id: "cfg-1",
+    status: "new",
+    name: "X",
+    email: "someone@gmail.com",
+    message: "know your price",
+    client_ip: "198.51.100.50",
+  });
+  const withEmpty = classifyLead([lead], { freemailDomains: [] }).get("cfg-1")!;
+  assert(!withEmpty.reasons.includes("freemail-plus-solicitation"));
+  const withGmail = classifyLead([lead], { freemailDomains: ["gmail.com"] })
+    .get("cfg-1")!;
+  assert(withGmail.reasons.includes("freemail-plus-solicitation"));
+  // review INFO-7: a mixed-case operator entry still matches (list lowercased).
+  const mixedCase = classifyLead([lead], { freemailDomains: ["GMAIL.COM"] })
+    .get("cfg-1")!;
+  assert(mixedCase.reasons.includes("freemail-plus-solicitation"));
+});
+
+Deno.test("classifyLead L1: Latin-with-diacritics (Vietnamese) is NOT treated as non-Latin script", () => {
+  const viet = leadFromKvRecord({
+    id: "viet-1",
+    status: "new",
+    name: "Nguyen Van A", // ASCII name
+    email: "nguyen@example.com",
+    message:
+      "Chào bạn, tôi muốn hỏi về dịch vụ của bạn cho một dự án nhỏ sắp tới nhé.",
+    contact_type: "business",
+    client_ip: "198.51.100.60",
+  });
+  const v = classifyLead([viet]).get("viet-1")!;
+  assert(!v.reasons.includes("nonlatin-body-ascii-name"));
+  assertEquals(v.flagged, false);
+});
+
+// --- classifyLead: October-wave tuning (name velocity + gibberish handle) ---
+//
+// The live 2026-10 shadow run surfaced a wave the 09-30 fixture did not cover:
+// a persona ("Robertjisib") rotating a FRESH gmail each submission (defeating
+// email velocity), and a separate gibberish-handle campaign with random
+// uppercase-plus-digits names. These regressions lock in the two language-
+// independent signals added to catch them, and the FP guards that keep them off
+// real humans. All identities below are synthetic stand-ins (no real lead data).
+
+Deno.test("nameLooksGibberish: machine handles vs human names", () => {
+  assert(nameLooksGibberish("NARYTHY911194NEYRTHYT"));
+  assert(nameLooksGibberish("NARTYTRYUT911194NEWETREWT"));
+  assert(!nameLooksGibberish("Avery Brand")); // multi-word
+  assert(!nameLooksGibberish("WEATHER MAN")); // multi-word, all-caps but spaced
+  assert(!nameLooksGibberish("Robertjisib")); // no digit run
+  assert(!nameLooksGibberish("jsmith2024")); // short + only 4 digits, len < 12
+  assert(!nameLooksGibberish("Nguyen Van A")); // multi-word
+  assert(!nameLooksGibberish("")); // empty
+});
+
+Deno.test("classifyLead: one persona across DISTINCT burner emails corroborates (name-velocity)", () => {
+  // Same name, two DIFFERENT gmail addresses, same week => name-repeat:2. Paired
+  // with a machine localpart it clears the bar - the exact Robertjisib-wave lead
+  // that email velocity alone missed.
+  const leads = [
+    leadFromKvRecord({
+      id: "persona-a",
+      status: "new",
+      received_at: "2026-10-10T09:00:00Z",
+      name: "Robertjisib",
+      email: "joshuaguerrero2v7t40d@gmail.com", // machine localpart
+      message: "Hi, I want to know your price.",
+      client_ip: "77.90.185.5",
+    }),
+    leadFromKvRecord({
+      id: "persona-b",
+      status: "new",
+      received_at: "2026-10-11T09:00:00Z",
+      name: "Robertjisib",
+      email: "ninadvhegmannjfc33@gmail.com", // different burner
+      message: "Salve, volo scire pretium tuum.",
+      client_ip: "141.98.11.224",
+    }),
+  ];
+  const verdicts = classifyLead(leads);
+  const a = verdicts.get("persona-a")!;
+  assert(a.reasons.includes("name-repeat:2"), `a reasons: ${a.reasons}`);
+  assertEquals(a.flagged, true); // solicitation+freemail+localpart+name-repeat
+  // The partner lead earns the name-repeat corroboration too (symmetry).
+  assert(verdicts.get("persona-b")!.reasons.includes("name-repeat:2"));
+});
+
+Deno.test("classifyLead: name-velocity needs DISTINCT emails - a typo resubmit stays HAM", () => {
+  // A real human resubmits with the same name but two addresses (work + a typo).
+  // name-repeat:2 fires (+1) but can never flag alone, so an otherwise-clean
+  // human is safe - the FP guard that keeps name-velocity from over-reaching.
+  const leads = [
+    leadFromKvRecord({
+      id: "human-1",
+      status: "new",
+      received_at: "2026-10-10T10:00:00Z",
+      name: "Jordan Fields",
+      email: "jordan.fields@acme.example",
+      phone: "+1 617 555 0170",
+      message: "Hi, following up on the roofing quote for our warehouse.",
+      contact_type: "business",
+      client_ip: "198.51.100.70",
+    }),
+    leadFromKvRecord({
+      id: "human-2",
+      status: "new",
+      received_at: "2026-10-10T10:05:00Z",
+      name: "Jordan Fields",
+      email: "jordan.fields@acme.exampl", // typo'd domain on resubmit
+      phone: "+1 617 555 0170",
+      message: "Hi, following up on the roofing quote for our warehouse.",
+      contact_type: "business",
+      client_ip: "198.51.100.70",
+    }),
+  ];
+  const verdicts = classifyLead(leads);
+  for (const id of ["human-1", "human-2"]) {
+    const v = verdicts.get(id)!;
+    assert(v.reasons.includes("name-repeat:2"), `${id}: ${v.reasons}`);
+    assertEquals(v.flagged, false, `${id} must stay ham (${v.score})`);
+  }
+});
+
+Deno.test("classifyLead: a gibberish-handle name flags on velocity + handle", () => {
+  // The belettersmail campaign: random uppercase-plus-digits names, same burner
+  // email reused across rotating IPs. name-gibberish (+2) is what carries the
+  // second-IP sibling that email velocity alone left one point short.
+  const leads = [
+    leadFromKvRecord({
+      id: "gib-1",
+      status: "new",
+      received_at: "2026-10-09T08:00:00Z",
+      name: "NARTYTRYUT911194NEWETREWT",
+      email: "ericson44961@belettersmail.example",
+      message: "MERTHYTJTJ911194MAMYJRTH",
+      client_ip: "193.29.139.219",
+    }),
+    leadFromKvRecord({
+      id: "gib-2",
+      status: "new",
+      received_at: "2026-10-09T08:05:00Z",
+      name: "NARYTHY911194NEYRTHYT",
+      email: "ericson44961@belettersmail.example", // same burner
+      message: "MEYJTJ911194MAYTRYR",
+      client_ip: "193.29.139.223", // rotated IP
+    }),
+  ];
+  const verdicts = classifyLead(leads);
+  for (const id of ["gib-1", "gib-2"]) {
+    const v = verdicts.get(id)!;
+    assert(v.reasons.includes("name-gibberish"), `${id}: ${v.reasons}`);
+    assertEquals(v.flagged, true, `${id} should flag (${v.score})`);
+  }
 });
 
 // --- push_leads confirm-gate (throws before any I/O) ------------------------
@@ -1124,7 +1666,7 @@ Deno.test("upsertOpportunity writes asn (uppercased) + qualStatus on create", as
   try {
     await model.methods.upsertOpportunity.execute(
       {
-        leadId: "shrug-net-example-2026",
+        leadId: "brand-net-example-2026",
         name: "Provider Deal",
         asn: "as64496", // lowercase input => uppercased on store
         qualStatus: "TECH_QUALIFICATION_NEEDED",
@@ -6103,7 +6645,7 @@ Deno.test("push_leads fails fast on a non-UPPER_SNAKE leadSourceChannel (before 
 // --- upsertRecord (generic custom-object create-or-update) -------------------
 // All exercised via the injected-fetch harness (stubTwentyFetch / bespoke
 // stubs) — no live Twenty. Metadata mirrors the LIVE shape of the two
-// allowlisted objects (verified against crm.shrug.pw 2026-09-16): scalar
+// allowlisted objects (verified against crm.brandmail.example 2026-09-16): scalar
 // TEXT/NUMBER/SELECT fields + reserved id/createdAt/deletedAt/position + real
 // composite types (RELATION), plus a synthetic CURRENCY field for the
 // composite-rejection case.
@@ -10432,6 +10974,2865 @@ Deno.test("VIEW-UPSERT method: fan-out duplicate adoptFrom refused (no writes)",
     assertEquals(writes[0].results[0].action, "refuse");
     assertEquals(writes[0].results[1].action, "refuse");
     assert(String(writes[0].results[0].reason).includes("adoptFrom"));
+  } finally {
+    restore();
+  }
+});
+
+// --- Email/thread READ (TWENTY-EMAIL) ---------------------------------------
+
+const T_OPP = "44444444-4444-4444-4444-444444444444";
+const T_PERSON = "55555555-5555-5555-5555-555555555555";
+const THREAD1 = "66666666-6666-6666-6666-666666666666";
+const THREAD2 = "77777777-7777-7777-7777-777777777777";
+const MSG1 = "88888888-8888-8888-8888-888888888888";
+const MSG2 = "99999999-9999-9999-9999-999999999999";
+const MSG3 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const PID1 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+// --- Pure helpers -----------------------------------------------------------
+
+Deno.test("messageTs coalesces receivedAt, else createdAt, else ''", () => {
+  assertEquals(
+    messageTs({ receivedAt: "2026-09-05T00:00:00.000Z", createdAt: "x" }),
+    "2026-09-05T00:00:00.000Z",
+  );
+  assertEquals(
+    messageTs({ receivedAt: null, createdAt: "2026-09-05T00:00:00.000Z" }),
+    "2026-09-05T00:00:00.000Z",
+  );
+  assertEquals(messageTs({}), "");
+});
+
+Deno.test("pickLastMessage is receivedAt-null-safe (F15): createdAt fallback wins", () => {
+  const older = { id: MSG1, receivedAt: "2026-09-01T00:00:00.000Z" };
+  // Null receivedAt but a LATER createdAt => this is the true last message.
+  const newer = {
+    id: MSG2,
+    receivedAt: null,
+    createdAt: "2026-09-05T00:00:00.000Z",
+  };
+  const last = pickLastMessage([older, newer]);
+  assertEquals(last?.id, MSG2);
+  // Order-independent.
+  assertEquals(pickLastMessage([newer, older])?.id, MSG2);
+  assertEquals(pickLastMessage([]), null);
+});
+
+Deno.test("deriveThreadState covers every branch (incl. unknown edge, F8)", () => {
+  assertEquals(deriveThreadState("OUTGOING", 2, 7, 0), "empty");
+  // Direction unknown => never guess.
+  assertEquals(deriveThreadState("unknown", 2, 7, 3), "unknown");
+  assertEquals(deriveThreadState("INCOMING", 100, 7, 3), "awaiting-us");
+  assertEquals(deriveThreadState("OUTGOING", 2, 7, 3), "sent-unanswered");
+  assertEquals(deriveThreadState("OUTGOING", 10, 7, 3), "dormant");
+  // Null age with an OUTGOING last defaults to sent-unanswered (not dormant).
+  assertEquals(deriveThreadState("OUTGOING", null, 7, 3), "sent-unanswered");
+});
+
+// --- Shared thread-scenario mock --------------------------------------------
+// A two-message thread THREAD1: MSG1 OUTGOING (09-03), MSG2 INCOMING (09-05,
+// receivedAt-null so its createdAt is the effective ts). Participants carry a
+// raw handle + displayName that MUST be stripped from every snapshot (F6).
+function threadOneHandler(method: string, path: string): unknown {
+  if (method === "GET" && path.startsWith("/rest/messages?")) {
+    return {
+      data: {
+        messages: [
+          {
+            id: MSG1,
+            subject: "Re: hi",
+            text: "hello there",
+            receivedAt: "2026-09-03T00:00:00.000Z",
+            createdAt: "2026-09-03T00:00:00.000Z",
+          },
+          {
+            id: MSG2,
+            subject: "",
+            text: "reply",
+            receivedAt: null,
+            createdAt: "2026-09-05T00:00:00.000Z",
+          },
+        ],
+      },
+      pageInfo: { hasNextPage: false },
+    };
+  }
+  if (
+    method === "GET" &&
+    path.startsWith("/rest/messageChannelMessageAssociations?")
+  ) {
+    if (path.includes(MSG1)) {
+      return {
+        data: {
+          messageChannelMessageAssociations: [{ direction: "OUTGOING" }],
+        },
+      };
+    }
+    if (path.includes(MSG2)) {
+      return {
+        data: {
+          messageChannelMessageAssociations: [{ direction: "INCOMING" }],
+        },
+      };
+    }
+    return { data: { messageChannelMessageAssociations: [] } };
+  }
+  if (method === "GET" && path.startsWith("/rest/messageParticipants?")) {
+    return {
+      data: {
+        messageParticipants: [
+          {
+            personId: PID1,
+            role: path.includes(MSG1) ? "from" : "to",
+            handle: "ada@example.com",
+            displayName: "Ada Lovelace",
+          },
+        ],
+      },
+    };
+  }
+  return {};
+}
+
+Deno.test("listThreads (opportunity target): body-free per-thread summary", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/messageThreadTargets?")) {
+      return {
+        data: {
+          messageThreadTargets: [{ id: "tt1", messageThreadId: THREAD1 }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    return threadOneHandler(method, path);
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listThreads.execute(
+      { opportunityId: T_OPP, limit: 30, messageLimit: 60 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadList");
+    assert(snap, "expected a threadList snapshot");
+    assert(String(snap!.name).startsWith("threads-"));
+    const d = snap!.data;
+    assertEquals((d.target as Record<string, unknown>).kind, "opportunity");
+    assertEquals((d.target as Record<string, unknown>).found, true);
+    assertEquals((d.target as Record<string, unknown>).resolvedId, T_OPP);
+    assertEquals(d.count, 1);
+    const items = d.items as Array<Record<string, unknown>>;
+    assertEquals(items[0].id, THREAD1);
+    assertEquals(items[0].messageCount, 2);
+    // Subject comes from the true LAST message (MSG2, empty subject).
+    assertEquals(items[0].subjectPresent, false);
+    assertEquals(items[0].subjectLength, 0);
+    assertEquals(items[0].lastOutboundAt, "2026-09-03T00:00:00.000Z");
+    assertEquals(items[0].lastInboundAt, "2026-09-05T00:00:00.000Z");
+    // Participants deduped to ONE join key; no handle/displayName.
+    const parts = items[0].participants as Array<Record<string, unknown>>;
+    assertEquals(parts.length, 1);
+    assertEquals(parts[0].personId, PID1);
+    // Filtered on the correct polymorphic field (F18).
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/messageThreadTargets?") &&
+        c.path.includes("targetOpportunityId")
+      ),
+    );
+    // PII guard (F6): no raw handle/name/subject/body anywhere in the snapshot.
+    const blob = JSON.stringify(d);
+    for (
+      const pii of [
+        "ada@example.com",
+        "Ada Lovelace",
+        "hello there",
+        "reply",
+        "Re: hi",
+      ]
+    ) {
+      assert(!blob.includes(pii), `snapshot leaked PII: ${pii}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listThreads rejects a non-UUID opportunity target before I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.listThreads.execute(
+          { opportunityId: "not-a-uuid", limit: 30, messageLimit: 60 } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid opportunityId",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listThreads (leadId -> person fallback): resolves person when no opp", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities?")) {
+      return { data: { opportunities: [] } }; // no opp for this lead
+    }
+    if (method === "GET" && path.startsWith("/rest/people?")) {
+      return { data: { people: [{ id: T_PERSON }] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/messageThreadTargets?")) {
+      return {
+        data: {
+          messageThreadTargets: [{ id: "tt-x", messageThreadId: THREAD1 }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    return threadOneHandler(method, path);
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listThreads.execute(
+      { leadId: "LEAD-1", limit: 30, messageLimit: 60 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadList");
+    const t = snap!.data.target as Record<string, unknown>;
+    assertEquals(t.kind, "leadId");
+    assertEquals(t.resolvedKind, "person");
+    assertEquals(t.resolvedId, T_PERSON);
+    // Filtered by the PERSON join column, never the opportunity one (F18).
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/messageThreadTargets?") &&
+        c.path.includes("targetPersonId")
+      ),
+    );
+    assert(
+      !calls.some((c) => c.path.includes("targetOpportunityId")),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listThreads (leadId with no opp AND no person): found:false, empty", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities?")) {
+      return { data: { opportunities: [] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/people?")) {
+      return { data: { people: [] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listThreads.execute(
+      { leadId: "LEAD-nope", limit: 30, messageLimit: 60 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadList");
+    assertEquals((snap!.data.target as Record<string, unknown>).found, false);
+    assertEquals(snap!.data.count, 0);
+    assertEquals(snap!.data.stopReason, "complete");
+    assertEquals((snap!.data.items as unknown[]).length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getThread: oldest->newest ordering + body-free views (F6/F15)", async () => {
+  const { restore } = stubTwentyFetch((method, path) =>
+    threadOneHandler(method, path)
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getThread.execute(
+      { threadId: THREAD1, limit: 200 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadDetail");
+    assert(snap, "expected a threadDetail snapshot");
+    assertEquals(snap!.name, `thread-${THREAD1}`);
+    const msgs = snap!.data.messages as Array<Record<string, unknown>>;
+    // Oldest (MSG1, 09-03) -> newest (MSG2, 09-05 via createdAt fallback).
+    assertEquals(msgs.map((m) => m.id), [MSG1, MSG2]);
+    assertEquals(msgs[0].direction, "OUTGOING");
+    assertEquals(msgs[1].direction, "INCOMING");
+    // Subject/body as presence+length only, never text.
+    assertEquals(msgs[0].subjectPresent, true);
+    assertEquals(msgs[0].subjectLength, 6); // "Re: hi"
+    assertEquals(msgs[0].bodyLength, 11); // "hello there"
+    const blob = JSON.stringify(snap!.data);
+    for (
+      const pii of ["ada@example.com", "Ada Lovelace", "hello there", "Re: hi"]
+    ) {
+      assert(!blob.includes(pii), `getThread leaked PII: ${pii}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getThread: message with no association => direction 'unknown' (F8 edge)", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/messages?")) {
+      return {
+        data: {
+          messages: [{
+            id: MSG3,
+            subject: "x",
+            text: "y",
+            createdAt: "2026-09-06T00:00:00.000Z",
+          }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    if (
+      method === "GET" &&
+      path.startsWith("/rest/messageChannelMessageAssociations?")
+    ) {
+      return { data: { messageChannelMessageAssociations: [] } }; // no association
+    }
+    if (method === "GET" && path.startsWith("/rest/messageParticipants?")) {
+      return { data: { messageParticipants: [] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.getThread.execute(
+      { threadId: THREAD2, limit: 200 } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadDetail");
+    const msgs = snap!.data.messages as Array<Record<string, unknown>>;
+    assertEquals(msgs[0].direction, "unknown");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("getThread rejects a non-UUID threadId before any I/O", async () => {
+  const { calls, restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.getThread.execute(
+          { threadId: "not-a-uuid", limit: 200 } as never,
+          ctx as never,
+        ),
+      Error,
+      "Invalid threadId",
+    );
+    assertEquals(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("threadStatus (single thread): last INCOMING => awaiting-us", async () => {
+  const { restore } = stubTwentyFetch((method, path) =>
+    threadOneHandler(method, path)
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        threadId: THREAD1,
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 60,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadStatus");
+    assert(snap, "expected a threadStatus snapshot");
+    assertEquals(snap!.name, `thread-status-${THREAD1}`);
+    const items = snap!.data.items as Array<Record<string, unknown>>;
+    assertEquals(items[0].state, "awaiting-us");
+    assertEquals(items[0].lastDirection, "INCOMING");
+    assertEquals(items[0].messageCount, 2);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("threadStatus: OUTGOING last, old => dormant", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/messages?")) {
+      return {
+        data: {
+          messages: [{
+            id: MSG1,
+            subject: "hi",
+            text: "old outbound",
+            receivedAt: null,
+            createdAt: "2020-01-01T00:00:00.000Z",
+          }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    if (
+      method === "GET" &&
+      path.startsWith("/rest/messageChannelMessageAssociations?")
+    ) {
+      return {
+        data: {
+          messageChannelMessageAssociations: [{ direction: "OUTGOING" }],
+        },
+      };
+    }
+    if (method === "GET" && path.startsWith("/rest/messageParticipants?")) {
+      return { data: { messageParticipants: [] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        threadId: THREAD1,
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 60,
+      } as never,
+      ctx as never,
+    );
+    const items = (writes.find((w) => w.type === "threadStatus"))!.data
+      .items as Array<Record<string, unknown>>;
+    assertEquals(items[0].state, "dormant");
+    assertEquals(items[0].lastDirection, "OUTGOING");
+    assert((items[0].ageDays as number) > 7);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("threadStatus: no association on last message => state 'unknown' (F8)", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/messages?")) {
+      return {
+        data: {
+          messages: [{ id: MSG3, createdAt: "2026-09-06T00:00:00.000Z" }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    if (
+      method === "GET" &&
+      path.startsWith("/rest/messageChannelMessageAssociations?")
+    ) {
+      return { data: { messageChannelMessageAssociations: [] } };
+    }
+    return {};
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        threadId: THREAD2,
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 60,
+      } as never,
+      ctx as never,
+    );
+    const items = (writes.find((w) => w.type === "threadStatus"))!.data
+      .items as Array<Record<string, unknown>>;
+    assertEquals(items[0].state, "unknown");
+    assertEquals(items[0].lastDirection, "unknown");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("threadStatus (leadId target): resolves opp, statuses its threads", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities?")) {
+      return { data: { opportunities: [{ id: T_OPP }] } };
+    }
+    if (method === "GET" && path.startsWith("/rest/messageThreadTargets?")) {
+      return {
+        data: {
+          messageThreadTargets: [{ id: "tt-x", messageThreadId: THREAD1 }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    return threadOneHandler(method, path);
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        leadId: "LEAD-1",
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 60,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "threadStatus");
+    const t = snap!.data.target as Record<string, unknown>;
+    assertEquals(t.kind, "leadId");
+    assertEquals(t.resolvedKind, "opportunity");
+    assertEquals(t.resolvedId, T_OPP);
+    assertEquals(snap!.data.count, 1);
+    const items = snap!.data.items as Array<Record<string, unknown>>;
+    assertEquals(items[0].threadId, THREAD1);
+    assertEquals(items[0].state, "awaiting-us");
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/messageThreadTargets?") &&
+        c.path.includes("targetOpportunityId")
+      ),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("threadStatus refuses threadId AND a record target together", async () => {
+  const { restore } = stubTwentyFetch(() => ({}));
+  const { ctx } = readCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.threadStatus.execute(
+          {
+            threadId: THREAD1,
+            opportunityId: T_OPP,
+            dormantDays: 7,
+            limit: 30,
+            messageLimit: 60,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "not both",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// ===========================================================================
+// TWENTY-EMAIL send subsystem (mocked — NO live calls)
+// ===========================================================================
+
+const S_CID = "11111111-1111-4111-8111-111111111111";
+const S_PERSON = "22222222-2222-4222-8222-222222222222";
+const S_OPP = "33333333-3333-4333-8333-333333333333";
+const S_WVID = "44444444-4444-4444-8444-444444444444";
+
+// A ctx whose globalArgs carry the send subsystem fields (mirrors readCtx).
+function sendCtx(overrides?: Record<string, unknown>): {
+  writes: Array<{ type: string; name: string; data: Record<string, unknown> }>;
+  ctx: unknown;
+} {
+  const writes: Array<
+    { type: string; name: string; data: Record<string, unknown> }
+  > = [];
+  return {
+    writes,
+    ctx: {
+      globalArgs: {
+        baseUrl: "https://crm.example.com",
+        apiToken: "tok",
+        opportunityStage: "NEW",
+        emailDomainBlocklist: [...DEFAULT_EMAIL_DOMAIN_BLOCKLIST],
+        emergencyRestrictedRole: "",
+        noteHashHmacKey: "",
+        sendUserEmail: "svc@brandhost.example",
+        sendUserPassword: "hunter2",
+        brandConnectedAccounts: { "brandhost.example": S_CID },
+        lineOfBusinessBrand: {},
+        sendWorkflowName: "Send Email",
+        twentyOrigin: "",
+        ...overrides,
+      },
+      logger: { debug() {}, info() {}, warning() {}, error() {} },
+      writeResource: (
+        type: string,
+        name: string,
+        data: Record<string, unknown>,
+      ) => {
+        writes.push({ type, name, data });
+        return Promise.resolve({ name });
+      },
+    },
+  };
+}
+
+// A fetch router for the send path. Routes graphql ops by body.query content and
+// REST by method+path. Every handler is mock-only; nothing hits the network.
+function sendRouter(opts: {
+  accounts?: Array<Record<string, unknown>>;
+  workflows?: Array<Record<string, unknown>>;
+  priorNotes?: Array<Record<string, unknown>>;
+  runId?: string;
+  lob?: string | null;
+  personEmail?: string;
+  loginToken?: string | null;
+  accessToken?: string | null;
+} = {}) {
+  const accounts = opts.accounts ??
+    [{
+      id: S_CID,
+      handle: "send@brandhost.example",
+      provider: "google",
+      authFailedAt: null,
+      archivedAt: null,
+    }];
+  const workflows = opts.workflows ??
+    [{ id: "wf1", name: "Send Email", lastPublishedVersionId: S_WVID }];
+  return (method: string, path: string, body: unknown): unknown => {
+    if (method === "POST" && path === "/graphql") {
+      const q = String((body as { query?: string })?.query ?? "");
+      if (q.includes("getLoginTokenFromCredentials")) {
+        return {
+          data: {
+            getLoginTokenFromCredentials: {
+              loginToken: opts.loginToken === undefined
+                ? "login-tok"
+                : opts.loginToken,
+            },
+          },
+        };
+      }
+      if (q.includes("getAuthTokensFromLoginToken")) {
+        return {
+          data: {
+            getAuthTokensFromLoginToken: {
+              tokens: {
+                accessOrWorkspaceAgnosticToken: {
+                  token: opts.accessToken === undefined
+                    ? "access-tok"
+                    : opts.accessToken,
+                  expiresAt: "2026-09-21T01:00:00.000Z",
+                },
+                refreshToken: { token: "refresh-tok", expiresAt: "x" },
+              },
+            },
+          },
+        };
+      }
+      if (q.includes("runWorkflowVersion")) {
+        return {
+          data: {
+            runWorkflowVersion: { workflowRunId: opts.runId ?? "run-1" },
+          },
+        };
+      }
+      return { data: {} };
+    }
+    if (method === "POST" && path === "/metadata") {
+      return { data: { myConnectedAccounts: accounts } };
+    }
+    if (method === "GET" && path.startsWith("/rest/workflows")) {
+      return { data: { workflows } };
+    }
+    if (method === "GET" && path.startsWith("/rest/notes")) {
+      return { data: { notes: opts.priorNotes ?? [] } };
+    }
+    if (method === "POST" && path === "/rest/notes") {
+      return { data: { createNote: { id: "marker-note" } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/opportunities/")) {
+      return { data: { opportunity: { lineOfBusiness: opts.lob ?? null } } };
+    }
+    if (method === "GET" && path.startsWith("/rest/people/")) {
+      return {
+        data: { person: { emails: { primaryEmail: opts.personEmail ?? "" } } },
+      };
+    }
+    return {};
+  };
+}
+
+// --- pure helpers ---
+
+Deno.test("handleDomain keeps the domain only, never the local-part", () => {
+  assertEquals(handleDomain("Alice.Sender@Brandhost.Example"), "brandhost.example");
+  assertEquals(handleDomain("nodomain"), "");
+  assertEquals(handleDomain(null), "");
+});
+
+Deno.test("validateBrandMap: rejects a non-UUID value (F14 load)", () => {
+  assert(validateBrandMap({ "brandhost.example": "not-a-uuid" }) !== null);
+  assert(validateBrandMap({ "brandhost.example": "" }) !== null);
+});
+
+Deno.test("validateBrandMap: rejects duplicate connectedAccountIds (F14)", () => {
+  const err = validateBrandMap({ "brandhost.example": S_CID, "brandmail.example": S_CID });
+  assert(err !== null && /duplicate/.test(err));
+});
+
+Deno.test("validateBrandMap: an empty or all-valid map passes", () => {
+  assertEquals(validateBrandMap({}), null);
+  assertEquals(validateBrandMap({ "brandhost.example": S_CID }), null);
+});
+
+Deno.test("resolveBrandForSend: explicit unmapped fromBrand => hard refuse (F4)", () => {
+  const r = resolveBrandForSend({
+    fromBrand: "brandzzz.example",
+    targetKind: "opportunity",
+    lineOfBusiness: "HOSTING",
+    brandMap: { "brandhost.example": S_CID },
+    lobMap: { HOSTING: "brandhost.example" },
+  });
+  assertEquals(r.ok, false);
+  if (!r.ok) assert(/F4/.test(r.reason));
+});
+
+Deno.test("resolveBrandForSend: empty mapped connectedAccountId => hard refuse", () => {
+  const r = resolveBrandForSend({
+    fromBrand: "brandhost.example",
+    targetKind: "person",
+    brandMap: { "brandhost.example": "" },
+    lobMap: {},
+  });
+  assertEquals(r.ok, false);
+});
+
+Deno.test("resolveBrandForSend: non-opp target, no fromBrand => refuse (F5)", () => {
+  const r = resolveBrandForSend({
+    targetKind: "person",
+    brandMap: { "brandhost.example": S_CID },
+    lobMap: { HOSTING: "brandhost.example" },
+  });
+  assertEquals(r.ok, false);
+  if (!r.ok) assert(/F5/.test(r.reason));
+});
+
+Deno.test("resolveBrandForSend: opp + LoB default resolves (F5 default)", () => {
+  const r = resolveBrandForSend({
+    targetKind: "opportunity",
+    lineOfBusiness: "HOSTING",
+    brandMap: { "brandhost.example": S_CID },
+    lobMap: { HOSTING: "brandhost.example" },
+  });
+  assertEquals(r.ok, true);
+  if (r.ok) {
+    assertEquals(r.connectedAccountId, S_CID);
+    assertEquals(r.brand, "brandhost.example");
+    assertEquals(r.source, "lob-default");
+  }
+});
+
+Deno.test("computeDedupKey is stable within a UTC day and varies by input", async () => {
+  const now = new Date("2026-09-21T12:00:00.000Z");
+  const a = await computeDedupKey({
+    to: "x@y.com",
+    connectedAccountId: S_CID,
+    subject: "hi",
+    body: "b",
+    now,
+  });
+  const b = await computeDedupKey({
+    to: "x@y.com",
+    connectedAccountId: S_CID,
+    subject: "hi",
+    body: "b",
+    now: new Date("2026-09-21T23:00:00.000Z"),
+  });
+  const c = await computeDedupKey({
+    to: "x@y.com",
+    connectedAccountId: S_CID,
+    subject: "different",
+    body: "b",
+    now,
+  });
+  assertEquals(a, b); // same UTC day => same key
+  assert(a !== c); // different subject => different key
+});
+
+// --- token mint ---
+
+Deno.test("mintUserAccessToken: happy path returns the access token", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  try {
+    const tok = await mintUserAccessToken({
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+      sendUserEmail: "svc@brandhost.example",
+      sendUserPassword: "pw",
+      twentyOrigin: "",
+    } as never);
+    assertEquals(tok, "access-tok");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("mintUserAccessToken: fail-closed on missing credentials (no I/O)", async () => {
+  const orig = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = (() => {
+    called = true;
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as typeof fetch;
+  try {
+    await assertRejects(
+      () =>
+        mintUserAccessToken({
+          baseUrl: "https://crm.example.com",
+          apiToken: "tok",
+          sendUserEmail: "",
+          sendUserPassword: "",
+          twentyOrigin: "",
+        } as never),
+      Error,
+      "not configured",
+    );
+    assertEquals(called, false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+Deno.test("mintUserAccessToken: fail-closed when step 1 yields no loginToken", async () => {
+  const { restore } = stubTwentyFetch(sendRouter({ loginToken: null }));
+  try {
+    await assertRejects(
+      () =>
+        mintUserAccessToken({
+          baseUrl: "https://crm.example.com",
+          apiToken: "tok",
+          sendUserEmail: "svc@brandhost.example",
+          sendUserPassword: "pw",
+          twentyOrigin: "",
+        } as never),
+      Error,
+      "step 1",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- listConnectedAccounts ---
+
+Deno.test("listConnectedAccounts: domain-only snapshot, never the full handle (PII)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter({
+    accounts: [
+      {
+        id: S_CID,
+        handle: "Alice.Sender@brandhost.example",
+        provider: "google",
+        authFailedAt: null,
+        archivedAt: null,
+      },
+      {
+        id: "55555555-5555-4555-8555-555555555555",
+        handle: "ops@brandmail.example",
+        provider: "microsoft",
+        authFailedAt: "2026-09-01T00:00:00Z",
+        archivedAt: null,
+      },
+    ],
+  }));
+  const { writes, ctx } = sendCtx();
+  try {
+    await model.methods.listConnectedAccounts.execute(
+      {} as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "connectedAccountList");
+    assert(snap, "expected a connectedAccountList snapshot");
+    const items = snap!.data.items as Array<Record<string, unknown>>;
+    assertEquals(items.length, 2);
+    assertEquals(items[0].domain, "brandhost.example");
+    assertEquals(items[0].authFailed, false);
+    assertEquals(items[1].domain, "brandmail.example");
+    assertEquals(items[1].authFailed, true);
+    // PII guard: no full handle / local-part anywhere.
+    const blob = JSON.stringify(snap!.data);
+    for (
+      const pii of [
+        "Alice.Sender",
+        "alice.sender",
+        "ops@brandmail.example",
+        "@brandhost.example",
+      ]
+    ) {
+      assert(!blob.includes(pii), `snapshot leaked handle: ${pii}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+// --- sendEmail ---
+
+Deno.test("sendEmail: dryRun returns a plan and records NO dedup marker", async () => {
+  const { calls, restore } = stubTwentyFetch(sendRouter());
+  const { writes, ctx } = sendCtx();
+  try {
+    await model.methods.sendEmail.execute(
+      {
+        personId: S_PERSON,
+        to: "client@corp.example",
+        subject: "Hello",
+        body: "Body text",
+        fromBrand: "brandhost.example",
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "sendRun");
+    assert(snap, "expected a sendRun snapshot");
+    assertEquals(snap!.data.status, "planned");
+    assertEquals(snap!.data.dryRun, true);
+    assertEquals(snap!.data.wouldSend, true);
+    assertEquals(snap!.data.dedupRecorded, false);
+    assertEquals(snap!.data.connectedAccountId, S_CID);
+    assertEquals(snap!.data.workflowVersionId, S_WVID);
+    // NO send + NO durable marker write on dryRun.
+    assert(
+      !calls.some((c) =>
+        c.method === "POST" && c.path === "/graphql" &&
+        String((c.body as { query?: string })?.query ?? "").includes(
+          "runWorkflowVersion",
+        )
+      ),
+      "dryRun must not call runWorkflowVersion",
+    );
+    assert(
+      !calls.some((c) => c.method === "POST" && c.path === "/rest/notes"),
+      "dryRun must not write a dedup marker",
+    );
+    // PII guard.
+    const blob = JSON.stringify(snap!.data);
+    for (const pii of ["client@corp.example", "Hello", "Body text"]) {
+      assert(!blob.includes(pii), `sendRun leaked PII: ${pii}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: explicit unmapped fromBrand => refuse (F4)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandzzz.example",
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "not in brandConnectedAccounts",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: non-opp target with no fromBrand => refuse (F5)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "explicit fromBrand required",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: invalid map (empty connectedAccountId) => hard refuse (F14)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx({ brandConnectedAccounts: { "brandhost.example": "" } });
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "brandConnectedAccounts invalid",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: live domain mismatch => refuse (F3)", async () => {
+  // The mapped account's live handle is on a DIFFERENT domain than the brand.
+  const { restore } = stubTwentyFetch(sendRouter({
+    accounts: [{
+      id: S_CID,
+      handle: "send@brandgames.example",
+      provider: "google",
+      authFailedAt: null,
+      archivedAt: null,
+    }],
+  }));
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+            dryRun: false,
+            confirm: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "domain mismatch",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: invalid recipient => refuse (F11)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "not an email",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "valid recipient",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: no active Send-Email workflow version => refuse (F12)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter({ workflows: [] }));
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+            dryRun: false,
+            confirm: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "no active/published version",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: durable dedup hit => skipped, no send (F9/F10)", async () => {
+  const { calls, restore } = stubTwentyFetch(sendRouter({
+    priorNotes: [{ id: "prior-marker", leadId: "send-abc" }],
+  }));
+  const { writes, ctx } = sendCtx();
+  try {
+    await model.methods.sendEmail.execute(
+      {
+        personId: S_PERSON,
+        to: "c@corp.example",
+        subject: "x",
+        body: "y",
+        fromBrand: "brandhost.example",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "sendRun");
+    assert(snap, "expected a sendRun snapshot");
+    assertEquals(snap!.data.status, "skipped");
+    assertEquals(snap!.data.skipped, true);
+    assertEquals(snap!.data.sent, false);
+    // A dedup hit must NOT enqueue the workflow.
+    assert(
+      !calls.some((c) =>
+        c.method === "POST" && c.path === "/graphql" &&
+        String((c.body as { query?: string })?.query ?? "").includes(
+          "runWorkflowVersion",
+        )
+      ),
+      "a dedup hit must not send",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: confirm + dryRun:false records workflowRunId, PII-safe (F13)", async () => {
+  const { calls, restore } = stubTwentyFetch(sendRouter({ runId: "run-xyz" }));
+  const { writes, ctx } = sendCtx();
+  try {
+    await model.methods.sendEmail.execute(
+      {
+        personId: S_PERSON,
+        to: "client@corp.example",
+        subject: "Résumé",
+        body: "Bonne journée",
+        fromBrand: "brandhost.example",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "sendRun");
+    assert(snap, "expected a sendRun snapshot");
+    assertEquals(snap!.data.status, "sent");
+    assertEquals(snap!.data.sent, true);
+    assertEquals(snap!.data.workflowRunId, "run-xyz");
+    assertEquals(snap!.data.dedupRecorded, true);
+    // runWorkflowVersion was called with the pinned connectedAccountId in the payload.
+    const runCall = calls.find((c) =>
+      c.method === "POST" && c.path === "/graphql" &&
+      String((c.body as { query?: string })?.query ?? "").includes(
+        "runWorkflowVersion",
+      )
+    );
+    assert(runCall, "expected a runWorkflowVersion call");
+    const input =
+      (runCall!.body as { variables?: { input?: Record<string, unknown> } })
+        ?.variables?.input as Record<string, unknown>;
+    const payload = input.payload as Record<string, unknown>;
+    assertEquals(payload.connectedAccountId, S_CID);
+    assertEquals(input.workflowVersionId, S_WVID);
+    // A durable dedup marker was written AFTER the send.
+    assert(
+      calls.some((c) => c.method === "POST" && c.path === "/rest/notes"),
+      "expected a durable dedup marker write",
+    );
+    // PII guard: no raw to/subject/body in the audit.
+    const blob = JSON.stringify(snap!.data);
+    for (const pii of ["client@corp.example", "Résumé", "Bonne journée"]) {
+      assert(!blob.includes(pii), `sendRun leaked PII: ${pii}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: sanitizeText preserves UTF-8 in the workflow payload (F19)", async () => {
+  const { calls, restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx();
+  try {
+    await model.methods.sendEmail.execute(
+      {
+        personId: S_PERSON,
+        to: "c@corp.example",
+        subject: "Événement — café",
+        body: "你好世界",
+        fromBrand: "brandhost.example",
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const runCall = calls.find((c) =>
+      c.method === "POST" && c.path === "/graphql" &&
+      String((c.body as { query?: string })?.query ?? "").includes(
+        "runWorkflowVersion",
+      )
+    );
+    assert(runCall, "expected a runWorkflowVersion call");
+    const payload = (runCall!.body as {
+      variables?: { input?: { payload?: Record<string, unknown> } };
+    })?.variables?.input?.payload as Record<string, unknown>;
+    // Accented + CJK characters survive sanitization (NOT ASCII-forced).
+    assert(String(payload.subject).includes("café"));
+    assert(String(payload.body).includes("你好世界"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail: dryRun:false without confirm => refuse", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            personId: S_PERSON,
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+            dryRun: false,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "requires confirm:true",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- transport helpers ---
+
+Deno.test("resolveActiveWorkflowVersionId returns lastPublishedVersionId or null", async () => {
+  const { restore } = stubTwentyFetch(sendRouter());
+  try {
+    const cfg = {
+      baseUrl: "https://crm.example.com",
+      apiToken: "tok",
+    } as never;
+    assertEquals(
+      await resolveActiveWorkflowVersionId(cfg, "Send Email"),
+      S_WVID,
+    );
+    restore();
+    const { restore: r2 } = stubTwentyFetch(sendRouter({ workflows: [] }));
+    assertEquals(await resolveActiveWorkflowVersionId(cfg, "Send Email"), null);
+    r2();
+  } finally {
+    // already restored
+  }
+});
+
+Deno.test("fetchConnectedAccounts reduces rows to domain-only + booleans", async () => {
+  const { restore } = stubTwentyFetch(sendRouter({
+    accounts: [{
+      id: S_CID,
+      handle: "x@brandhost.example",
+      provider: "google",
+      authFailedAt: null,
+      archivedAt: "2026-01-01T00:00:00Z",
+    }],
+  }));
+  try {
+    const accts = await fetchConnectedAccounts(
+      { baseUrl: "https://crm.example.com", apiToken: "tok" } as never,
+      "user-tok",
+    );
+    assertEquals(accts.length, 1);
+    assertEquals(accts[0].domain, "brandhost.example");
+    assertEquals(accts[0].archived, true);
+    assertEquals(accts[0].authFailed, false);
+    assertEquals(
+      (accts[0] as unknown as Record<string, unknown>).handle,
+      undefined,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendDedupMarkerId is filter-safe hex namespaced under send-", async () => {
+  const id = await sendDedupMarkerId("arbitrary caller key!!");
+  assert(id.startsWith("send-"));
+  assert(isFilterSafe(id));
+  assert(/^send-[0-9a-f]{64}$/.test(id));
+  const sha = await sha256Hex("arbitrary caller key!!");
+  assertEquals(id, "send-" + sha);
+});
+
+// ===========================================================================
+// TWENTY-EMAIL code-review fixes: ORD-1 ordering, TE-1 redaction, TE-4 ambiguity,
+// EMAIL-WF-1 duplicate workflow, EMAIL-DEDUP-1 marker namespace.
+// ===========================================================================
+
+// A >messageLimit thread spanning 2 pages: an INCOMING message is the OLDEST
+// (page 1 in the old ASCENDING read) and an OUTGOING message is the NEWEST (page
+// 2 in the old read, i.e. the TRUE last). With messageLimit=1 the per-thread read
+// is capped to the head page, so the OLD ascending fetch would have returned the
+// INCOMING oldest and derived the WRONG state; the EMAIL-ORD-1 newest-first fetch
+// returns the OUTGOING newest on the head page and derives the true state. The
+// handler serves a different single-record head page depending on order_by
+// (DescNullsLast => newest-first).
+function twoPageThreadHandler(method: string, path: string): unknown {
+  const OLD_IN = {
+    id: MSG1,
+    subject: "",
+    text: "inbound old",
+    receivedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+  const NEW_OUT = {
+    id: MSG2,
+    subject: "",
+    text: "outbound new",
+    receivedAt: "2026-01-10T00:00:00.000Z",
+    createdAt: "2026-01-10T00:00:00.000Z",
+  };
+  if (method === "GET" && path.startsWith("/rest/messages?")) {
+    const desc = path.includes("DescNullsLast");
+    const head = desc ? NEW_OUT : OLD_IN;
+    // A capped head page with more pages available => truncated read.
+    return {
+      data: { messages: [head] },
+      pageInfo: { hasNextPage: true, endCursor: "cur-1" },
+    };
+  }
+  if (
+    method === "GET" &&
+    path.startsWith("/rest/messageChannelMessageAssociations?")
+  ) {
+    if (path.includes(MSG2)) {
+      return {
+        data: {
+          messageChannelMessageAssociations: [{ direction: "OUTGOING" }],
+        },
+      };
+    }
+    if (path.includes(MSG1)) {
+      return {
+        data: {
+          messageChannelMessageAssociations: [{ direction: "INCOMING" }],
+        },
+      };
+    }
+    return { data: { messageChannelMessageAssociations: [] } };
+  }
+  if (method === "GET" && path.startsWith("/rest/messageParticipants?")) {
+    return { data: { messageParticipants: [] } };
+  }
+  return {};
+}
+
+Deno.test("threadStatus: >messageLimit thread, true-last OUTGOING on page 2 => sent-unanswered/dormant + truncated (EMAIL-ORD-1/EMAIL-TEST-1.2)", async () => {
+  const { calls, restore } = stubTwentyFetch((m, p) =>
+    twoPageThreadHandler(m, p)
+  );
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        threadId: THREAD1,
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 1,
+      } as never,
+      ctx as never,
+    );
+    const items = (writes.find((w) => w.type === "threadStatus"))!.data
+      .items as Array<Record<string, unknown>>;
+    // The verdict comes from the newest-first head (OUTGOING), NOT the oldest.
+    assertEquals(items[0].lastDirection, "OUTGOING");
+    assert(
+      ["sent-unanswered", "dormant"].includes(String(items[0].state)),
+      `expected sent-unanswered/dormant, got ${items[0].state}`,
+    );
+    // The capped read is flagged so a partial verdict is never authoritative.
+    assertEquals(items[0].truncated, true);
+    // Proof the message read was newest-first (bracket-modifier DescNullsLast).
+    assert(
+      calls.some((c) =>
+        c.path.startsWith("/rest/messages?") && c.path.includes("DescNullsLast")
+      ),
+      "message read must be newest-first",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("listThreads: >messageLimit thread => lastOutboundAt reflects the page-2 (newest) message + truncated (EMAIL-ORD-1/EMAIL-TEST-1.2)", async () => {
+  const { restore } = stubTwentyFetch((method, path) => {
+    if (method === "GET" && path.startsWith("/rest/messageThreadTargets?")) {
+      return {
+        data: {
+          messageThreadTargets: [{ id: "tt1", messageThreadId: THREAD1 }],
+        },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    return twoPageThreadHandler(method, path);
+  });
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.listThreads.execute(
+      { opportunityId: T_OPP, limit: 30, messageLimit: 1 } as never,
+      ctx as never,
+    );
+    const items = (writes.find((w) => w.type === "threadList"))!.data
+      .items as Array<Record<string, unknown>>;
+    assertEquals(items[0].id, THREAD1);
+    // The newest message (page 2 in the old read) is OUTGOING and dominates.
+    assertEquals(items[0].lastOutboundAt, "2026-01-10T00:00:00.000Z");
+    assertEquals(items[0].lastInboundAt, undefined);
+    assertEquals(items[0].truncated, true);
+  } finally {
+    restore();
+  }
+});
+
+// ORD-1-R pin: the true-newest message is an OUTBOUND reply with receivedAt=NULL
+// (the common shape for a just-sent reply). The head page must still contain it.
+// This handler models Twenty's real ordering: whichever column LEADS the order_by
+// decides the head. A receivedAt-led DescNullsLast (the ORD-1-R bug) buries the
+// null-receivedAt row at the tail, so a cap=1 head is the OLD inbound; a
+// createdAt-led order (the fix) keeps the newest-createdAt outbound in the head.
+function nullRecvOutboundThreadHandler(method: string, path: string): unknown {
+  const OLD_IN = {
+    id: MSG1,
+    subject: "",
+    text: "",
+    receivedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+  const NEW_OUT = {
+    id: MSG2,
+    subject: "",
+    text: "",
+    receivedAt: null,
+    createdAt: "2026-01-10T00:00:00.000Z",
+  };
+  if (method === "GET" && path.startsWith("/rest/messages?")) {
+    const m = path.match(/order_by=([^&]+)/);
+    const ob = m ? decodeURIComponent(m[1]) : "";
+    const leadsCreatedAt = /^createdAt\b/.test(ob);
+    const head = leadsCreatedAt ? NEW_OUT : OLD_IN;
+    return {
+      data: { messages: [head] },
+      pageInfo: { hasNextPage: true, endCursor: "cur-1" },
+    };
+  }
+  return twoPageThreadHandler(method, path);
+}
+
+Deno.test("threadStatus: null-receivedAt OUTBOUND true-newest past the cap must not invert to awaiting-us (ORD-1-R)", async () => {
+  const { restore } = stubTwentyFetch(nullRecvOutboundThreadHandler);
+  const { writes, ctx } = readCtx();
+  try {
+    await model.methods.threadStatus.execute(
+      {
+        threadId: THREAD1,
+        dormantDays: 7,
+        limit: 30,
+        messageLimit: 1,
+      } as never,
+      ctx as never,
+    );
+    const items = (writes.find((w) => w.type === "threadStatus"))!.data
+      .items as Array<Record<string, unknown>>;
+    // Fixed (createdAt-led) order keeps the null-receivedAt newest OUTGOING in the
+    // head; the ORD-1-R bug (receivedAt-led) would bury it -> wrongly awaiting-us.
+    assertEquals(items[0].lastDirection, "OUTGOING");
+    assert(
+      ["sent-unanswered", "dormant"].includes(String(items[0].state)),
+      `expected sent-unanswered/dormant, got ${items[0].state}`,
+    );
+    assertEquals(items[0].truncated, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("redactError masks additional literal secrets (TE-1)", () => {
+  const out = redactError(
+    new Error("boom: password=hunter2 and token usr-token-xyz remained"),
+    300,
+    "apitok",
+    ["hunter2", "usr-token-xyz"],
+  );
+  assert(!out.includes("hunter2"), "leaked the send password");
+  assert(!out.includes("usr-token-xyz"), "leaked the minted user token");
+  // Backward compatible: undefined/short secrets are ignored, not thrown on.
+  const out2 = redactError(new Error("plain"), 300, undefined, [
+    undefined,
+    "ab",
+  ]);
+  assertEquals(out2, "plain");
+});
+
+Deno.test("mint/send path: a failing mint error carries neither the password nor the raw server body (TE-1)", async () => {
+  const orig = globalThis.fetch;
+  // The auth graphql endpoint fails 401 with a body that ECHOES the password.
+  globalThis.fetch = (() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          errors: [{ message: "bad credentials for password hunter2" }],
+        }),
+        { status: 401, statusText: "Unauthorized" },
+      ),
+    )) as typeof fetch;
+  const { ctx } = sendCtx();
+  try {
+    let msg = "";
+    try {
+      await model.methods.listConnectedAccounts.execute(
+        {} as never,
+        ctx as never,
+      );
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    assert(msg.length > 0, "expected the mint to fail-closed");
+    assert(!msg.includes("hunter2"), "error leaked the send password");
+    assert(
+      !msg.includes("bad credentials"),
+      "error leaked the raw server response body",
+    );
+    assert(/credential mint failed/.test(msg), "expected the generic label");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+Deno.test("sendEmail: ambiguous leadId (>1 opportunity) => refuse before send (TE-4)", async () => {
+  const { calls, restore } = stubTwentyFetch((method, path, body) => {
+    if (method === "GET" && path.startsWith("/rest/opportunities?")) {
+      return {
+        data: {
+          opportunities: [
+            { id: S_OPP },
+            { id: "33333333-3333-4333-8333-333333333334" },
+          ],
+        },
+      };
+    }
+    return sendRouter()(method, path, body);
+  });
+  const { ctx } = sendCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.sendEmail.execute(
+          {
+            leadId: "LEAD-DUP",
+            to: "c@corp.example",
+            subject: "x",
+            body: "y",
+            fromBrand: "brandhost.example",
+            dryRun: false,
+            confirm: true,
+          } as never,
+          ctx as never,
+        ),
+      Error,
+      "Ambiguous leadId",
+    );
+    // Refused BEFORE minting a token / running the workflow.
+    assert(
+      !calls.some((c) =>
+        c.method === "POST" && c.path === "/graphql" &&
+        String((c.body as { query?: string })?.query ?? "").includes(
+          "runWorkflowVersion",
+        )
+      ),
+      "an ambiguous leadId must never reach the send",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("resolveActiveWorkflowVersionId refuses a duplicate workflow name (EMAIL-WF-1)", async () => {
+  const { restore } = stubTwentyFetch(sendRouter({
+    workflows: [
+      { id: "wf1", name: "Send Email", lastPublishedVersionId: S_WVID },
+      {
+        id: "wf2",
+        name: "Send Email",
+        lastPublishedVersionId: "44444444-4444-4444-8444-444444444445",
+      },
+    ],
+  }));
+  try {
+    await assertRejects(
+      () =>
+        resolveActiveWorkflowVersionId(
+          { baseUrl: "https://crm.example.com", apiToken: "tok" } as never,
+          "Send Email",
+        ),
+      Error,
+      "Ambiguous Send-Email workflow name",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sendEmail dedup: findPriorSend matches on the TITLE marker, not the leadId namespace (EMAIL-DEDUP-1/EMAIL-TEST-1.1)", async () => {
+  const dedupKey = "explicit-key-1";
+  const markerId = await sendDedupMarkerId(dedupKey);
+  const wantTitle = encodeURIComponent(`sent:${markerId}`);
+  let sawTitleQuery = false;
+  const { calls, restore } = stubTwentyFetch((method, path, body) => {
+    if (method === "GET" && path.startsWith("/rest/notes")) {
+      // Honor the title[eq] filter: return the prior marker ONLY when the queried
+      // title equals sent:<expected markerId>. A leadId-keyed lookup (the old
+      // bug) would never match this, so the dedup hit proves the correct key.
+      if (path.includes("title") && path.includes(wantTitle)) {
+        sawTitleQuery = true;
+        return {
+          data: { notes: [{ id: "prior-marker", title: `sent:${markerId}` }] },
+        };
+      }
+      return { data: { notes: [] } };
+    }
+    return sendRouter()(method, path, body);
+  });
+  const { writes, ctx } = sendCtx();
+  try {
+    await model.methods.sendEmail.execute(
+      {
+        personId: S_PERSON,
+        to: "c@corp.example",
+        subject: "x",
+        body: "y",
+        fromBrand: "brandhost.example",
+        dedupKey,
+        dryRun: false,
+        confirm: true,
+      } as never,
+      ctx as never,
+    );
+    const snap = writes.find((w) => w.type === "sendRun");
+    assertEquals(snap!.data.status, "skipped");
+    assert(sawTitleQuery, "findPriorSend must query the title marker");
+    // The dedup lookup must NOT touch the leadId Note namespace.
+    assert(
+      !calls.some((c) =>
+        c.path.startsWith("/rest/notes") && c.path.includes("leadId")
+      ),
+      "dedup lookup must not use the leadId namespace",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// ============================================================================
+// TWENTY-COMPANY-UPSERT (upsertCompany / reconcileCompanies / exportCompanies)
+// ============================================================================
+
+// --- canonicalizers (pure) --------------------------------------------------
+Deno.test("canonicalCompanyHost strips scheme AND leading www (ADV-1)", () => {
+  assertEquals(canonicalCompanyHost("acme.com"), "acme.com");
+  assertEquals(canonicalCompanyHost("https://www.acme.com"), "acme.com");
+  assertEquals(
+    canonicalCompanyHost("http://www.acme.com/path?q=1"),
+    "acme.com",
+  );
+  assertEquals(canonicalCompanyHost("WWW.Acme.com"), "acme.com");
+  assertEquals(canonicalCompanyHost("shop.acme.com"), "shop.acme.com");
+  // acme.com and https://www.acme.com reduce to the SAME canonical host.
+  assertEquals(
+    canonicalCompanyHost("acme.com"),
+    canonicalCompanyHost("https://www.acme.com"),
+  );
+  assertEquals(canonicalCompanyHost(""), null);
+  assertEquals(canonicalCompanyHost(null), null);
+});
+
+Deno.test("canonicalCompanyName lowercases + collapses whitespace", () => {
+  assertEquals(canonicalCompanyName("  Acme   Inc  "), "acme inc");
+  assertEquals(canonicalCompanyName("ACME\tInc"), "acme inc");
+  assertEquals(canonicalCompanyName(null), "");
+});
+
+// --- company test harness ---------------------------------------------------
+// A stateful in-memory company/member server routed by method+path. The GET
+// list endpoint returns ALL companies so the MODEL performs the real canonical
+// client-side dedup. A handler may return {__status} to force a non-ok response.
+function stubCompanyFetch(
+  handler: (method: string, path: string, body: unknown) => unknown,
+): {
+  calls: Array<{ method: string; path: string; body: unknown }>;
+  restore: () => void;
+} {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => {
+    const path = String(url).replace("https://crm.example.com", "");
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    let payload: unknown;
+    try {
+      payload = handler(method, path, body) ?? {};
+    } catch (e) {
+      return Promise.resolve(
+        {
+          ok: false,
+          status: 500,
+          statusText: "ERR",
+          text: () => Promise.resolve(String(e)),
+        } as Response,
+      );
+    }
+    if (payload && typeof payload === "object" && "__status" in payload) {
+      const p = payload as { __status: number; __body?: unknown };
+      return Promise.resolve(
+        {
+          ok: p.__status >= 200 && p.__status < 300,
+          status: p.__status,
+          statusText: "S",
+          text: () => Promise.resolve(JSON.stringify(p.__body ?? {})),
+        } as Response,
+      );
+    }
+    return Promise.resolve(
+      {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: () => Promise.resolve(JSON.stringify(payload)),
+      } as Response,
+    );
+  }) as typeof fetch;
+  return { calls, restore: () => (globalThis.fetch = orig) };
+}
+
+const COMPANY_META = {
+  data: [{
+    id: "obj-company",
+    nameSingular: "company",
+    namePlural: "companies",
+    fields: [
+      { name: "region", type: "TEXT" },
+      { name: "annualRevenue", type: "CURRENCY" }, // composite -> rejected
+      {
+        name: "tier",
+        type: "SELECT",
+        options: [{ value: "STANDARD" }, { value: "PRIORITY" }],
+      },
+    ],
+  }],
+};
+
+function makeCaptureCtx(): {
+  ctx: unknown;
+  writes: Array<{ type: string; name: string; data: Record<string, unknown> }>;
+} {
+  const writes: Array<
+    { type: string; name: string; data: Record<string, unknown> }
+  > = [];
+  const ctx = {
+    globalArgs: { baseUrl: "https://crm.example.com", apiToken: "tok" },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: (
+      type: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      writes.push({ type, name, data });
+      return Promise.resolve({ name });
+    },
+  };
+  return { ctx, writes };
+}
+
+// A company server backed by a mutable store (for create/update/idempotency).
+function companyServer(opts: {
+  companies?: Array<Record<string, unknown>>;
+  members?: Array<Record<string, unknown>>;
+  ilikeError?: boolean;
+  metaError?: boolean;
+  nameError?: boolean;
+  pageScanError?: boolean;
+} = {}) {
+  const companies = opts.companies ?? [];
+  const members = opts.members ?? [];
+  let nextId = 1;
+  const handler = (method: string, path: string, body: unknown) => {
+    if (path.startsWith("/rest/metadata/objects")) {
+      if (opts.metaError) return { __status: 500 };
+      return COMPANY_META;
+    }
+    if (path.startsWith("/rest/workspaceMembers")) {
+      return {
+        data: { workspaceMembers: members },
+        pageInfo: { hasNextPage: false },
+      };
+    }
+    // Single company by id.
+    if (method === "GET" && /^\/rest\/companies\/[^/?]+$/.test(path)) {
+      const id = path.split("/").pop();
+      const rec = companies.find((c) => c.id === id);
+      return { data: { company: rec ?? {} } };
+    }
+    // List / filtered fetch.
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      if (opts.ilikeError && path.includes("[ilike]")) return { __status: 400 };
+      // Hard error on the name-exact lookup (CR-ADV-2a).
+      if (opts.nameError && path.includes("filter=name")) {
+        return { __status: 500 };
+      }
+      // Hard error on the bounded domain page-scan fallback (CR-ADV-2b).
+      if (opts.pageScanError && path.includes("order_by")) {
+        return { __status: 500 };
+      }
+      return {
+        data: { companies },
+        pageInfo: { hasNextPage: false },
+        totalCount: companies.length,
+      };
+    }
+    if (method === "POST" && path === "/rest/companies") {
+      const rec = { id: `c${nextId++}`, ...(body as Record<string, unknown>) };
+      companies.push(rec);
+      return { data: { createCompany: rec } };
+    }
+    if (method === "PATCH" && path.startsWith("/rest/companies/")) {
+      const id = path.split("/").pop();
+      const rec = companies.find((c) => c.id === id);
+      if (rec) Object.assign(rec, body as Record<string, unknown>);
+      return { data: { updateCompany: rec ?? {} } };
+    }
+    return {};
+  };
+  return { companies, members, handler };
+}
+
+// deno-lint-ignore no-explicit-any
+const asAny = (v: unknown) => v as any;
+
+Deno.test("upsertCompany: dryRun create plans without writing", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "NewCo",
+        domain: "newco.com",
+        confirm: false,
+        dryRun: true,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.find((w) => w.type === "companyUpsert")!.data;
+    CompanyUpsertSchema.parse(snap);
+    assertEquals(snap.action, "planned-create");
+    assertEquals(snap.found, false);
+    assertEquals(srv.companies.length, 0); // nothing written
+    assert(!calls.some((c) => c.method === "POST"), "no POST in dryRun");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: confirm create then idempotent re-run == noop (one record)", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "NewCo",
+        domain: "newco.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    assertEquals(writes.at(-1)!.data.action, "created");
+    assertEquals(srv.companies.length, 1);
+    const posts1 = calls.filter((c) => c.method === "POST").length;
+    assertEquals(posts1, 1);
+    // Re-run with identical inputs -> noop, no new write.
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "NewCo",
+        domain: "newco.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const last = writes.at(-1)!.data;
+    assertEquals(last.action, "noop"); // ASSERT noop, not noop/updated
+    assertEquals(srv.companies.length, 1); // still exactly one
+    assertEquals(calls.filter((c) => c.method === "POST").length, 1);
+    assert(!calls.some((c) => c.method === "PATCH"), "noop must not PATCH");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: non-destructive update sets only the provided field", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "11111111-1111-1111-1111-111111111111",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "acme.com" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Acme",
+        domain: "acme.com",
+        legalName: "Acme, Inc.",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    assert(patch, "expected a PATCH");
+    assertEquals(Object.keys(patch!.body as Record<string, unknown>), [
+      "legalName",
+    ]);
+    assertEquals(writes.at(-1)!.data.action, "updated");
+    assertEquals(writes.at(-1)!.data.fieldsSet, ["legalName"]);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: domain canonicalization matches a stored www/full-URL (no create)", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "c-acme",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "https://www.acme.com" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({ name: "Acme", domain: "acme.com", confirm: true, dryRun: false }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.action, "noop"); // matched the www-stored record
+    assertEquals(snap.found, true);
+    assertEquals(snap.matchedVia, "domain");
+    assert(!calls.some((c) => c.method === "POST"), "must not create a dup");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: create-guard — near-candidate yields planned-conflict, not create", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "c-shop",
+      name: "Shop Acme",
+      domainName: { primaryLinkUrl: "https://shop.acme.com" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Acme Corp",
+        domain: "acme.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.action, "planned-conflict");
+    assertEquals((snap.candidates as unknown[]).length, 1);
+    assertEquals(
+      (snap.candidates as Array<{ domain?: string }>)[0].domain,
+      "shop.acme.com",
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "near-candidate must NOT create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// CR-ADV-3: the broad-domain re-narrow must use a HOST-BOUNDARY match, not a
+// bare substring. Stored siblings `notacme.com` and `acme.com.au` both CONTAIN
+// the substring "acme.com" but are neither equal, a true subdomain, nor a
+// registrable parent of `acme.com`, so they must NOT be treated as candidates.
+// Under the old bare-`.includes` logic both are kept as near-candidates and
+// force a spurious planned-conflict; under `hostMatchesDomainScope` they are
+// dropped and the upsert proceeds to create. (The create-guard test above uses
+// `shop.acme.com`, a true subdomain that is a candidate under BOTH logics, so
+// it does not exercise this boundary.)
+Deno.test("upsertCompany: create-guard — substring siblings are NOT candidates (host-boundary), create proceeds", async () => {
+  const srv = companyServer({
+    companies: [
+      {
+        id: "c-notacme",
+        name: "Not Acme",
+        domainName: { primaryLinkUrl: "https://notacme.com" },
+      },
+      {
+        id: "c-acme-au",
+        name: "Acme Australia",
+        domainName: { primaryLinkUrl: "https://acme.com.au" },
+      },
+    ],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    // Phase 1: dryRun plans a CREATE (not a conflict) — siblings are out of scope.
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Acme Corp",
+        domain: "acme.com",
+        confirm: false,
+        dryRun: true,
+      }),
+      asAny(ctx),
+    );
+    const plan = writes.at(-1)!.data;
+    CompanyUpsertSchema.parse(plan);
+    assertEquals(plan.action, "planned-create");
+    assertEquals(plan.found, false);
+    assert(!calls.some((c) => c.method === "POST"), "dryRun must not POST");
+    assertEquals(srv.companies.length, 2); // nothing written yet
+
+    // Phase 2: confirm actually creates, with a real POST.
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Acme Corp",
+        domain: "acme.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const done = writes.at(-1)!.data;
+    assertEquals(done.action, "created");
+    assertEquals(calls.filter((c) => c.method === "POST").length, 1);
+    assertEquals(srv.companies.length, 3); // the new Acme Corp
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: broad fetch falls back to a page-scan when ilike errors", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "c-acme",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "https://www.acme.com" },
+    }],
+    ilikeError: true, // force the operator-unsupported fallback path
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({ name: "Acme", domain: "acme.com", confirm: false, dryRun: true }),
+      asAny(ctx),
+    );
+    // Found via the page-scan fallback (not a false planned-create).
+    assertEquals(writes.at(-1)!.data.found, true);
+    assertEquals(writes.at(-1)!.data.action, "noop");
+    assert(
+      calls.some((c) => c.path.includes("[ilike]")),
+      "ilike was attempted first",
+    );
+    assert(
+      calls.some((c) =>
+        c.path.includes("order_by") && !c.path.includes("[ilike]")
+      ),
+      "page-scan fallback ran",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: multi-match name -> conflict WITH candidate ids, no write", async () => {
+  const srv = companyServer({
+    companies: [
+      { id: "c-a1", name: "Acme" },
+      { id: "c-a2", name: "Acme" },
+    ],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({ matchBy: "name", name: "Acme", confirm: true, dryRun: false }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.action, "conflict");
+    const ids = (snap.candidates as Array<{ id: string }>).map((c) => c.id)
+      .sort();
+    assertEquals(ids, ["c-a1", "c-a2"]);
+    assert(
+      !calls.some((c) => c.method === "POST" || c.method === "PATCH"),
+      "a conflict writes nothing",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: domain-hit with a materially different name is a conflict (no silent rename)", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "c-acme",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "acme.com" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Globex",
+        domain: "acme.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.action, "conflict");
+    assertEquals((snap.candidates as Array<{ id: string }>)[0].id, "c-acme");
+    assert(!calls.some((c) => c.method === "PATCH"), "no silent rename");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: customFields reserved key is rejected at plan time", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            customFields: { legalName: "x" },
+            confirm: false,
+            dryRun: true,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "reserved",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: customFields unknown key is rejected (fail-closed) at plan time", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            customFields: { bogusField: "x" },
+            confirm: false,
+            dryRun: true,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "Unknown customFields key",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: customFields non-scalar (composite) key is rejected", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            customFields: { annualRevenue: 5 },
+            confirm: false,
+            dryRun: true,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "non-scalar",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: a valid customFields scalar flows into the create body", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "NewCo",
+        domain: "newco.com",
+        customFields: { region: "US", tier: "PRIORITY" },
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const post = calls.find((c) => c.method === "POST")!.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(post.region, "US");
+    assertEquals(post.tier, "PRIORITY");
+    assert((writes.at(-1)!.data.fieldsSet as string[]).includes("region"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: unmatched explicit id ABORTS (never creates)", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            id: "22222222-2222-2222-2222-222222222222",
+            name: "Ghost",
+            domain: "ghost.com",
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "id not found",
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "unmatched id must not create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: name-only miss (no domain) aborts, no stable key", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({ name: "Orphan", confirm: true, dryRun: false }),
+          asAny(ctx),
+        ),
+      Error,
+      "without a domain",
+    );
+    assert(!calls.some((c) => c.method === "POST"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: accountOwnerEmail resolves to an opaque id; email never in the snapshot", async () => {
+  const srv = companyServer({
+    members: [{ id: "member-xyz", userEmail: "owner@acme.com" }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "NewCo",
+        domain: "newco.com",
+        accountOwnerEmail: "owner@acme.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const post = calls.find((c) => c.method === "POST")!.body as Record<
+      string,
+      unknown
+    >;
+    assertEquals(post.accountOwnerId, "member-xyz");
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.accountOwnerResolved, true);
+    assert(
+      !JSON.stringify(snap).includes("owner@acme.com"),
+      "the owner email must never enter the snapshot",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: unresolved accountOwnerEmail aborts (email not leaked)", async () => {
+  const srv = companyServer({ members: [] });
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            accountOwnerEmail: "nobody@acme.com",
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "did not resolve",
+    );
+    assert(
+      !err.message.includes("nobody@acme.com"),
+      "email scrubbed from error",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: a filter-unsafe/invalid accountOwnerEmail errors before any filter use", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            accountOwnerEmail: "a(b)@x.com",
+            confirm: false,
+            dryRun: true,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "accountOwnerEmail",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// CR-ADV-1: an owner-set re-run is a TRUE noop (no idempotency churn), whether
+// Twenty echoes the owner FK flat (accountOwnerId) or nested (accountOwner.id).
+Deno.test("upsertCompany: accountOwnerEmail re-run is a noop with NO PATCH (flat owner FK)", async () => {
+  const srv = companyServer({
+    members: [{ id: "member-xyz", userEmail: "owner@acme.com" }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    const input = {
+      name: "NewCo",
+      domain: "newco.com",
+      accountOwnerEmail: "owner@acme.com",
+      confirm: true,
+      dryRun: false,
+    };
+    await model.methods.upsertCompany.execute(asAny(input), asAny(ctx));
+    assertEquals(writes.at(-1)!.data.action, "created");
+    // The mock stores the POST body, so the owner FK is now flat on the record.
+    const postCount = calls.filter((c) => c.method === "POST").length;
+    assertEquals(postCount, 1);
+    // Re-run identical inputs -> owner unchanged -> noop, NO PATCH.
+    await model.methods.upsertCompany.execute(asAny(input), asAny(ctx));
+    assertEquals(writes.at(-1)!.data.action, "noop");
+    assertEquals(calls.filter((c) => c.method === "POST").length, 1);
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "owner-noop must not PATCH",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: accountOwnerEmail noop when stored owner is NESTED (accountOwner.id)", async () => {
+  // Twenty returns the owner nested, with NO flat accountOwnerId — buildCompanyWrite
+  // must read accountOwner.id so the diff is a true noop (CR-ADV-1).
+  const srv = companyServer({
+    companies: [{
+      id: "c-acme",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "acme.com" },
+      accountOwner: { id: "member-xyz" },
+    }],
+    members: [{ id: "member-xyz", userEmail: "owner@acme.com" }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.upsertCompany.execute(
+      asAny({
+        name: "Acme",
+        domain: "acme.com",
+        accountOwnerEmail: "owner@acme.com",
+        confirm: true,
+        dryRun: false,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.action, "noop");
+    assertEquals(snap.matchedVia, "domain");
+    assert(
+      !calls.some((c) => c.method === "PATCH"),
+      "nested-owner unchanged must not PATCH",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// CR-ADV-2: a hard API error on a lookup ABORTS the run — it must NEVER fall
+// through to a create. Covers both lookup seams.
+Deno.test("upsertCompany: a hard error on the name-exact lookup ABORTS (no create)", async () => {
+  const srv = companyServer({ nameError: true });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            matchBy: "name",
+            name: "Acme",
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "lookup error must not create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: a hard error on the domain page-scan fallback ABORTS (no create)", async () => {
+  // ilike errors -> page-scan fallback -> page-scan ALSO hard-errors.
+  const srv = companyServer({ ilikeError: true, pageScanError: true });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "scan error must not create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// CR-ADV-5: company-scoped customFields parity with the opportunity tests.
+Deno.test("upsertCompany: customFields fail-closed when company metadata is unreadable", async () => {
+  const srv = companyServer({ metaError: true });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            customFields: { region: "US" },
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "fail-closed",
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "fail-closed must not create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: customFields SELECT bad value is rejected", async () => {
+  const srv = companyServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            customFields: { tier: "NOPE" },
+            confirm: true,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "Valid options",
+    );
+    assert(
+      !calls.some((c) => c.method === "POST"),
+      "bad SELECT must not create",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: reserved IDENTITY customFields keys are rejected", async () => {
+  const cases: Array<Record<string, unknown>> = [
+    { name: "Hijack" },
+    { domainName: "evil.com" },
+    { accountOwnerId: "00000000-0000-0000-0000-000000000000" },
+  ];
+  for (const customFields of cases) {
+    const srv = companyServer();
+    const { calls, restore } = stubCompanyFetch(srv.handler);
+    const { ctx } = makeCaptureCtx();
+    try {
+      await assertRejects(
+        () =>
+          model.methods.upsertCompany.execute(
+            asAny({
+              name: "NewCo",
+              domain: "newco.com",
+              customFields,
+              confirm: true,
+              dryRun: false,
+            }),
+            asAny(ctx),
+          ),
+        Error,
+        "reserved",
+      );
+      assert(
+        !calls.some((c) => c.method === "POST"),
+        "reserved key must not create",
+      );
+    } finally {
+      restore();
+    }
+  }
+});
+
+// --- reconcileCompanies -----------------------------------------------------
+Deno.test("reconcileCompanies: per-entry isolation — one bad row never aborts the batch", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcileCompanies.execute(
+      asAny({
+        entries: [
+          { name: "Good", domain: "good.com" },
+          { name: "BadNoDomain" }, // name-only miss -> aborts THIS entry only
+        ],
+        source: "crm/companies.yaml",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = CompanyReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.processed, 2);
+    const e0 = snap.entries[0];
+    const e1 = snap.entries[1];
+    assertEquals(e0.ok, true);
+    assertEquals(e0.action, "planned-create");
+    assertEquals(e1.ok, false);
+    assert(
+      e1.error && e1.error.length > 0,
+      "bad entry carries a redacted error",
+    );
+    assertEquals(snap.converged, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcileCompanies: an over-cap batch is refused unless maxEntries is raised", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.reconcileCompanies.execute(
+          asAny({
+            entries: [
+              { name: "A", domain: "a.com" },
+              { name: "B", domain: "b.com" },
+            ],
+            source: "x",
+            confirm: false,
+            dryRun: true,
+            maxEntries: 1,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "over the cap",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcileCompanies: a clean re-run converges to all-noop", async () => {
+  const srv = companyServer({
+    companies: [{
+      id: "c-acme",
+      name: "Acme",
+      domainName: { primaryLinkUrl: "acme.com" },
+    }],
+  });
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcileCompanies.execute(
+      asAny({
+        entries: [{ name: "Acme", domain: "acme.com" }],
+        source: "crm/companies.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.converged, true);
+    assertEquals((snap.counts as Record<string, number>).noop, 1);
+  } finally {
+    restore();
+  }
+});
+
+// CR-ADV-4: an empty desired-state list is trivially converged (not false).
+Deno.test("reconcileCompanies: an EMPTY batch is converged", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcileCompanies.execute(
+      asAny({
+        entries: [],
+        source: "crm/companies.yaml",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = writes.at(-1)!.data;
+    assertEquals(snap.processed, 0);
+    assertEquals(snap.converged, true);
+  } finally {
+    restore();
+  }
+});
+
+// CR-SEC-1: an OUTER failure (e.g. resource persist) rejects with a token-scrubbed
+// error — SEC-8 parity with upsertCompany/exportCompanies.
+Deno.test("reconcileCompanies: an outer failure rejects with a redacted error", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const SECRET = "sk-reconcile-secret-token";
+  const ctx = {
+    globalArgs: { baseUrl: "https://crm.example.com", apiToken: SECRET },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: () => {
+      throw new Error(`persist failed with ${SECRET}`);
+    },
+  };
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.reconcileCompanies.execute(
+          asAny({
+            entries: [{ name: "Acme", domain: "acme.com" }],
+            source: "x",
+            confirm: false,
+            dryRun: true,
+            maxEntries: 100,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+    );
+    assert(
+      !err.message.includes(SECRET),
+      "the apiToken must be scrubbed from the outer error",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- exportCompanies --------------------------------------------------------
+Deno.test("exportCompanies: emits companyList with ids + legalName, scrubs PII", async () => {
+  const srv = companyServer({
+    companies: [
+      {
+        id: "c-1",
+        name: "Acme",
+        domainName: { primaryLinkUrl: "https://www.acme.com" },
+        legalName: "Acme, Inc.",
+        // PII / relations that MUST be scrubbed:
+        accountOwner: { userEmail: "owner@acme.com" },
+        people: [{ emails: { primaryEmail: "jane@acme.com" } }],
+      },
+      { id: "c-2", name: "Globex" },
+    ],
+  });
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.exportCompanies.execute(
+      asAny({ maxCompanies: 1000 }),
+      asAny(ctx),
+    );
+    const w = writes.find((w) => w.type === "companyList")!;
+    assertEquals(w.name, "companies-export");
+    const items = w.data.items as Array<Record<string, unknown>>;
+    assertEquals(items.length, 2);
+    assertEquals(items[0].id, "c-1");
+    assertEquals(items[0].domain, "acme.com"); // canonical host
+    assertEquals(items[0].legalName, "Acme, Inc.");
+    // Only the four whitelisted keys — nothing person/owner-bearing.
+    assertEquals(Object.keys(items[0]).sort(), [
+      "domain",
+      "id",
+      "legalName",
+      "name",
+    ]);
+    assert(
+      !JSON.stringify(w.data).includes("owner@acme.com"),
+      "account-owner email scrubbed",
+    );
+    assert(
+      !JSON.stringify(w.data).includes("jane@acme.com"),
+      "person email scrubbed",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("upsertCompany: refuses a live write without confirm", async () => {
+  const srv = companyServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.upsertCompany.execute(
+          asAny({
+            name: "NewCo",
+            domain: "newco.com",
+            confirm: false,
+            dryRun: false,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "confirm:true",
+    );
   } finally {
     restore();
   }

@@ -119,6 +119,49 @@ const GlobalArgsSchema = z.object({
     .describe(
       'OPTIONAL keyed-HMAC secret for note reconciliation (TWENTY-NOTE-RECONCILE). Resolve from a vault via CEL (e.g. vault.get("twenty", "note-hash-hmac-key")); NEVER hard-code. The repo-side notes-drift report reads the SAME vault key so both sides HMAC byte-identically (SEC-1, the sole ext<->report coupling). Empty (default) = note-hash surfacing still works (listNotes returns any already-stored hash — no key needed), but POPULATION is gated: population is ENABLED by provisioning the note.noteHash field, and when that field IS provisioned createNote/updateNote FAIL CLOSED on an empty key (refuse the write) rather than store a zero-confidentiality empty-keyed hash (SEC-5/ADV-10). SENSITIVE: logged length-only, never snapshotted, redacted in errors — same discipline as apiToken (SEC-6). push_leads/ensureNoteForLead never hash, so the lead sink is unaffected by this key.',
     ),
+  // --- Email SEND subsystem (TWENTY-EMAIL send) -----------------------------
+  // The API_KEY apiToken above is FORBIDDEN on runWorkflowVersion + myConnected-
+  // Accounts (both need a workspace-member USER context). The send path mints a
+  // fresh USER access token per run from these vaulted credentials (login ->
+  // access token), uses it, and discards it (no refresh/rotation/write-back).
+  sendUserEmail: z
+    .string()
+    .default("")
+    .meta({ sensitive: true })
+    .describe(
+      'Email of the ONE workspace-member service user whose connected mailboxes own ALL brand identities. Resolve from a vault via CEL (e.g. vault.get("twenty", "send-user-email")); NEVER hard-code. Empty (default) = the send subsystem is unconfigured and sendEmail/listConnectedAccounts fail closed. SENSITIVE.',
+    ),
+  sendUserPassword: z
+    .string()
+    .default("")
+    .meta({ sensitive: true })
+    .describe(
+      'Password of the send service user (sendUserEmail). Resolve from a vault via CEL (e.g. vault.get("twenty", "send-user-password")); NEVER hard-code, log, or snapshot. Used ONLY to mint a per-run USER access token; discarded immediately. SENSITIVE.',
+    ),
+  brandConnectedAccounts: z
+    .record(z.string(), z.string())
+    .default({})
+    .describe(
+      "Fail-closed identity map: brand DOMAIN (e.g. shrug.host) -> the connectedAccountId (UUID) of the mailbox that sends AS that brand. Load-validated at first send (validateBrandMap): every value MUST be a non-empty UUID with no duplicate ids; empty (default) = no brand can be resolved so every sendEmail refuses. At send time the chosen id is re-validated against the LIVE myConnectedAccounts list AND its account domain must equal the brand key (F3/F14) — this is what prevents the wrong-brand-fallback bug.",
+    ),
+  lineOfBusinessBrand: z
+    .record(z.string(), z.string())
+    .default({})
+    .describe(
+      "OPTIONAL default-brand map: Opportunity lineOfBusiness SELECT value (UPPER_SNAKE) -> brand domain (a key of brandConnectedAccounts). Consulted ONLY when fromBrand is ABSENT and the target is an Opportunity with a NON-EMPTY lineOfBusiness (F5); every other target requires an explicit fromBrand. An explicit-but-unmapped fromBrand is a hard refuse and NEVER consults this default (F4). Empty (default) = no default, fromBrand always required (F16-safe).",
+    ),
+  sendWorkflowName: z
+    .string()
+    .default("Send Email")
+    .describe(
+      "Name of the Twenty native 'Send Email' workflow whose ACTIVE/published version sendEmail invokes. Resolved to lastPublishedVersionId at send time (F12 — never pin a version id). The workflow's send-email step MUST author connectedAccountId/to/subject/body as trigger-payload variable references (see design doc); that authoring is a Twenty-side dependency, not built here.",
+    ),
+  twentyOrigin: z
+    .string()
+    .default("")
+    .describe(
+      "Origin passed to the login/token mutations when minting the USER access token. Empty (default) = fall back to baseUrl (the default workspace on twenty-local). Set explicitly for a multi-workspace host.",
+    ),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
@@ -440,6 +483,38 @@ export function normalizeDomainHost(raw: unknown): string | null {
   return s || null;
 }
 
+/**
+ * Canonical COMPANY host for domain dedup (TWENTY-COMPANY-UPSERT, ADV-1).
+ * {@link normalizeDomainHost} reduces a domain-ish value to a bare host but
+ * deliberately does NOT strip a leading `www.` — so `acme.com` and
+ * `https://www.acme.com` normalize to DIFFERENT hosts (`acme.com` vs
+ * `www.acme.com`) and a blind compare false-negatives (and would duplicate).
+ * This strips a single leading `www.` AFTER normalizeDomainHost so BOTH match
+ * sides reduce to the same registrable-host form. A bare `www.<tld>` (nothing
+ * left after the strip) is treated as unusable (null). Not PSL-aware — a full
+ * registrable-domain reduction (e.g. collapsing `shop.acme.co.uk` -> `acme.co.uk`)
+ * needs the public-suffix list; the leading-`www.` strip covers the dominant
+ * real-world stored-URL variant (scheme + `www.`) this dedup exists to close.
+ */
+export function canonicalCompanyHost(raw: unknown): string | null {
+  const host = normalizeDomainHost(raw);
+  if (!host) return null;
+  const stripped = host.replace(/^www\./, "");
+  return stripped || null;
+}
+
+/**
+ * Canonical COMPANY name for dedup/compare (TWENTY-COMPANY-UPSERT): lowercase,
+ * collapse internal whitespace to single spaces, trim. Used to compare an input
+ * name against a stored name for exact-canonical equality (case/whitespace
+ * insensitive) so a name match — or a domain-hit's name-conflict check — is not
+ * foiled by trivial spacing/case drift. Empty string when nothing usable.
+ */
+export function canonicalCompanyName(raw: unknown): string {
+  if (raw == null) return "";
+  return String(raw).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 /** True if the (validated) domain is a consumer/free-mail domain to skip. */
 export function isBlockedDomain(
   domain: string,
@@ -524,15 +599,20 @@ const BEARER_RE = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
  * "no secret / no raw PII / no attacker-influenced input" guarantee even when
  * Twenty echoes the offending value (or the transport echoes the request URL)
  * back in a 4xx. Pass `token` (e.g. cfg.apiToken) to also mask exact literal
- * occurrences of the secret.
+ * occurrences of the secret. Pass `moreSecrets` (TE-1) to mask ADDITIONAL literal
+ * secrets — the send path passes cfg.sendUserPassword and the minted user token
+ * so neither can survive into a captured send-path error/report.
  */
 export function redactError(
   raw: unknown,
   maxLen = 300,
   token?: string,
+  moreSecrets?: Array<string | undefined | null>,
 ): string {
   let s = raw instanceof Error ? raw.message : String(raw ?? "");
-  if (token && token.length >= 4) s = s.split(token).join("[redacted]");
+  for (const sec of [token, ...(moreSecrets ?? [])]) {
+    if (sec && sec.length >= 4) s = s.split(sec).join("[redacted]");
+  }
   s = s
     .replace(BEARER_RE, "Bearer [redacted]")
     .replace(FILTER_QUERY_RE, "$1[redacted]")
@@ -614,6 +694,12 @@ const LeadRecordSchema = z.object({
     .describe(
       "Structured label/value extras (Needs/Reason/Timing/Via) rendered as their own labeled lines in the Note. Kept OUT of the free-text message so they are not markdown-escaped into a run-on. Optional on input; the KV adapter populates it.",
     ),
+  client_ip: z
+    .string()
+    .optional()
+    .describe(
+      "Submitter source IP from the contact worker, carried through solely for the spam-classifier IP-rotation velocity signal (classifyLead). Never written to Twenty; never surfaced in the audit (reasons are coded, not raw IPs).",
+    ),
 }).passthrough();
 type LeadRecord = z.infer<typeof LeadRecordSchema>;
 
@@ -684,6 +770,9 @@ export function leadFromKvRecord(raw: Record<string, unknown>): LeadRecord {
   }
   if (source) details.push({ label: "Via", value: source });
   const message = str(raw.message).trim();
+  // Carry the source IP through for classifyLead's IP-rotation velocity signal
+  // only (the adapter otherwise drops it). Accept either wire spelling.
+  const clientIp = (str(raw.client_ip) || str(raw.clientIp)).trim();
 
   return {
     id: str(raw.id),
@@ -697,6 +786,7 @@ export function leadFromKvRecord(raw: Record<string, unknown>): LeadRecord {
     status: str(raw.status) || "new",
     geo,
     details,
+    ...(clientIp ? { client_ip: clientIp } : {}),
   };
 }
 
@@ -844,6 +934,370 @@ export function selectBatch(
     remaining: Math.max(0, eligible.length - batch.length),
     eligible: eligible.length,
   };
+}
+
+// --- Lead spam classification (shadow mode) ---------------------------------
+
+/**
+ * Per-lead spam verdict from {@link classifyLead}. `reasons` are PII-FREE coded
+ * tokens (never raw email/name/message/IP text) so they are safe to surface in
+ * the push_leads audit, which carries no raw PII beyond the opaque leadId.
+ */
+export interface SpamVerdict {
+  leadId: string;
+  score: number;
+  reasons: string[];
+  flagged: boolean;
+}
+
+/**
+ * Score at/above which a lead is flagged. SHADOW MODE: flagged leads are
+ * reported (score + reasons) but still synced - nothing is quarantined. Tuned
+ * (design/lead-spam-filter.md section 6) so a single signal class is never
+ * enough alone: windowed repeat-email velocity (+3) needs one corroborator, and
+ * a solicitation phrase (+2) plus a free-mail domain (+1) still falls short -
+ * which protects a legitimate repeat submitter and a plain free-mail inquiry
+ * while the Robertjisib set clears easily (velocity 3 + localpart 2 + rotation 2).
+ */
+export const SPAM_SCORE_THRESHOLD = 4;
+
+/** Window for the cross-lead velocity signals (design section 2: "within a
+ * short window"). A burst clusters; a loyal customer contacting months apart
+ * does not accumulate velocity. */
+const SPAM_VELOCITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+// High-precision solicitation phrases ONLY. Deliberately EXCLUDES dual-use B2B
+// vocabulary (cooperation / collaborate / bare "seo" / "marketing services" /
+// "rank your") that a legitimate freelancer inquiry would use - those produced
+// a threshold-boundary false positive from a plain gmail lead (review H3).
+const SPAM_SOLICITATION_RE =
+  /\b(know your price|your prices?|back ?link|link building|guest post|crypto|bitcoin|forex|binary option|investment opportunity|loan offer)\b/i;
+const SPAM_REFERRAL_RE =
+  /\b(sent me|referred (by|me)|recommend(ed)? (by|me|us)|found you (via|through|on)|came from|heard about you|fediverse|mastodon|word of mouth)\b/i;
+
+/** Count letter<->digit class transitions across a string's alnum runs. */
+function alnumClassTransitions(s: string): number {
+  let transitions = 0;
+  let prev: "a" | "d" | null = null;
+  for (const ch of s.toLowerCase()) {
+    let cls: "a" | "d" | null = null;
+    if (ch >= "a" && ch <= "z") cls = "a";
+    else if (ch >= "0" && ch <= "9") cls = "d";
+    else {
+      prev = null; // a separator breaks the run
+      continue;
+    }
+    if (prev !== null && cls !== prev) transitions++;
+    prev = cls;
+  }
+  return transitions;
+}
+
+/**
+ * True when an email localpart looks machine-generated, e.g. "gregoryj8tl2g":
+ * long, mixes letters and digits, and flips between the two several times.
+ * "neil", "weatherman", "john.doe", "jsmith2024" do NOT trip it.
+ */
+export function localpartLooksMachine(email: string): boolean {
+  const at = email.indexOf("@");
+  const lp = (at === -1 ? email : email.slice(0, at)).toLowerCase();
+  if (lp.length < 8) return false;
+  if (!/[a-z]/.test(lp) || !/\d/.test(lp)) return false;
+  return alnumClassTransitions(lp) >= 3;
+}
+
+/** Normalized key for name-identity velocity: trimmed, lower-cased, internal
+ * whitespace collapsed. Empty when the name is blank (so a nameless lead never
+ * clusters with another nameless lead). */
+function normalizeNameKey(name: string | null | undefined): string {
+  return (name ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * True when a NAME field is a single machine-handle token rather than a human
+ * name: no whitespace, >=12 chars, carries an embedded >=4-digit run, and its
+ * letters are all-caps or vowel-starved (< 0.3 vowel ratio). Catches the
+ * "NARYTHY911194NEYRTHYT" gibberish-handle campaign. A real name is multi-word
+ * (has whitespace) or short, so "Neil Hanlon", "WEATHER MAN", "Robertjisib",
+ * and "jsmith2024" do NOT trip it.
+ */
+export function nameLooksGibberish(name: string): boolean {
+  const n = (name ?? "").trim();
+  if (/\s/.test(n)) return false; // multi-word => not this single-token pattern
+  if (n.length < 12) return false;
+  if (!/\d{4,}/.test(n)) return false; // embedded long digit run
+  const letters = n.replace(/[^A-Za-z]/g, "");
+  if (letters.length < 8) return false;
+  const allCaps = n === n.toUpperCase();
+  const vowels = (letters.match(/[aeiou]/gi) ?? []).length;
+  return allCaps || vowels / letters.length < 0.3;
+}
+
+/**
+ * Fraction of a string's letters that belong to a clearly NON-LATIN script
+ * (Cyrillic/Greek/CJK/Arabic/...). Latin-with-diacritics (Vietnamese, Czech,
+ * Turkish) is Latin script and does NOT count - so a legitimate diacritic-dense
+ * Latin message is not mistaken for a foreign-script spam body (review L1).
+ */
+function nonLatinScriptRatio(s: string): number {
+  let letters = 0;
+  let nonLatin = 0;
+  for (const ch of s) {
+    if (/\p{L}/u.test(ch)) {
+      letters++;
+      if (!/\p{Script=Latin}/u.test(ch)) nonLatin++;
+    }
+  }
+  return letters === 0 ? 0 : nonLatin / letters;
+}
+
+/**
+ * True when a raw phone is present but is the design's mis-prefixed
+ * domestic-trunk case: a bare 11-digit number starting with 8, NOT entered
+ * internationally (no leading '+' or '00'). Such a number's real dialable form
+ * is +7..., so normalizePhone's best-effort "+8..." is bogus. A number entered
+ * as E.164 (+84 Vietnam, +81 Japan, ...) is trusted on STRUCTURE alone and is
+ * never flagged for its shape (review M2). Low-weight, never load-bearing.
+ */
+export function phoneLooksBogus(rawPhone: string): boolean {
+  const raw = String(rawPhone).trim();
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length < 7) return false; // absent / too short -> not a signal
+  const enteredIntl = raw.startsWith("+") || digits.startsWith("00");
+  // Bare 11-digit trunk-8 number not entered internationally -> mis-prefixed
+  // domestic trunk (its real form is +7...). Exclude leading digit pairs that
+  // ARE real zone-8 country codes (81 JP, 82 KR, 84 VN, 86 CN), which collide
+  // at this length when pasted without a '+' (review M2 cycle 2).
+  if (!enteredIntl && /^8\d{10}$/.test(digits) && !/^8[1246]/.test(digits)) {
+    return true;
+  }
+  const norm = normalizePhone(rawPhone);
+  if (/^\+1[2-9]\d{9}$/.test(norm)) return false; // clean NANP
+  return !/^\+[1-9]\d{7,14}$/.test(norm); // only structurally invalid E.164
+}
+
+/**
+ * Score a corpus of leads for spam. SHADOW MODE: pure, no I/O, no quarantine -
+ * it only annotates. Velocity signals (repeat email, IP rotation) are computed
+ * across the WHOLE corpus but WINDOWED to leads near each other in time
+ * (design: "within a short window"), so pass the full set, not just the
+ * processed page. Returns a verdict per lead keyed by the validated leadId.
+ *
+ * The strong signals are deliberately LANGUAGE-INDEPENDENT: the Robertjisib set
+ * is one solicitation template in six languages, so English-phrase matching
+ * alone misses five of six - windowed repeat-email velocity, machine-generated
+ * localpart and IP rotation catch all six. Surface aesthetics (all-caps body,
+ * quirky domain, null contact_type) do NOT contribute: a real fediverse
+ * referral (WEATHER MAN) trips all three. A referral mention discounts the
+ * score, but only absent hard bot-farm evidence (velocity/rotation) so the
+ * discount cannot be weaponized to smuggle a burst through. A known-customer
+ * domain hard-passes. Self-contained so it can be lifted to a standalone
+ * classifier (design options B/C) without a rewrite.
+ *
+ * Accepted residual risks for the SHADOW phase (documented, not silently
+ * inherited; revisit before ENFORCE / weight retuning):
+ *   - Slow-drip evasion: a spammer pacing submissions >1 window apart never
+ *     accumulates velocity; the per-lead signals (localpart/phone/solicitation)
+ *     are the only backstop then. This is the deliberate cost of windowing out
+ *     the loyal-customer false positive.
+ *   - Windowing is pairwise (relative to each lead's own timestamp), not
+ *     transitive, so members of a burst spaced near the window edge can score
+ *     unevenly. Harmless at the current margin; matters only if weights change.
+ *   - A null/unparseable received_at clusters with all other null-timestamp
+ *     leads for the same email with no time bound (biases toward over-flagging,
+ *     not toward an evasion), so the signal's precision depends on upstream
+ *     timestamp quality.
+ */
+export function classifyLead(
+  corpus: LeadRecord[],
+  opts: {
+    threshold?: number;
+    freemailDomains?: readonly string[];
+    knownDomains?: readonly string[];
+  } = {},
+): Map<string, SpamVerdict> {
+  const threshold = opts.threshold ?? SPAM_SCORE_THRESHOLD;
+  // Lowercase the freemail list so a mixed-case operator entry still matches
+  // (isBlockedDomain compares a lowercased domain against the list verbatim;
+  // review INFO-7, now that the list is operator-facing via opts).
+  const freemail = (opts.freemailDomains ?? DEFAULT_EMAIL_DOMAIN_BLOCKLIST).map(
+    (
+      d,
+    ) => d.toLowerCase(),
+  );
+  const known = new Set((opts.knownDomains ?? []).map((d) => d.toLowerCase()));
+
+  // Velocity index: per normalized email, every occurrence's timestamp + IP.
+  // Signals are WINDOWED below (design: "within a short window") so a burst
+  // clusters but a loyal customer contacting months apart does not accumulate
+  // velocity (review H2).
+  const byEmail = new Map<string, { t: number | null; ip: string }[]>();
+  for (const l of corpus) {
+    const email = validateEmail(l.email);
+    if (!email) continue;
+    const parsed = Date.parse(l.received_at ?? "");
+    const t = Number.isNaN(parsed) ? null : parsed;
+    const ip = (l.client_ip ?? "").trim();
+    let arr = byEmail.get(email);
+    if (!arr) {
+      arr = [];
+      byEmail.set(email, arr);
+    }
+    arr.push({ t, ip });
+  }
+
+  // Name-identity index (design section 2: "same email/NAME"): per normalized
+  // name, every occurrence's timestamp + email. The spam tell is one persona
+  // reused across DISTINCT burner emails (the Robertjisib wave rotates the gmail
+  // address each time, defeating email velocity); counting distinct emails in a
+  // window - not raw repeats - is what keeps a single human resubmitting from
+  // one address (same name, one email) from clustering with themselves.
+  const byName = new Map<string, { t: number | null; email: string }[]>();
+  for (const l of corpus) {
+    const nameKey = normalizeNameKey(l.name);
+    if (!nameKey) continue;
+    const email = validateEmail(l.email);
+    if (!email) continue; // a nameless/emailless lead can't corroborate identity
+    const parsed = Date.parse(l.received_at ?? "");
+    const t = Number.isNaN(parsed) ? null : parsed;
+    let arr = byName.get(nameKey);
+    if (!arr) {
+      arr = [];
+      byName.set(nameKey, arr);
+    }
+    arr.push({ t, email });
+  }
+
+  const out = new Map<string, SpamVerdict>();
+  for (const l of corpus) {
+    const leadId = validateLeadId(l.id);
+    if (!leadId) continue;
+    const reasons: string[] = [];
+    let score = 0;
+    const email = validateEmail(l.email);
+    const dom = email ? domainOfEmail(email) : null;
+
+    // Known-customer hard-pass (design section 2): a returning customer must
+    // never be quarantined, regardless of score. Empty by default; the IN
+    // clients / Twenty People join that POPULATES this is the ENFORCE-phase
+    // task (design section 5.2) - it must be wired before spamFilter=true.
+    if (dom && known.has(dom)) {
+      out.set(leadId, {
+        leadId,
+        score: 0,
+        reasons: ["known-customer-hardpass"],
+        flagged: false,
+      });
+      continue;
+    }
+
+    // Windowed velocity (cross-lead).
+    let windowCount = 1;
+    let windowIps = 0;
+    if (email) {
+      const parsed = Date.parse(l.received_at ?? "");
+      const t0 = Number.isNaN(parsed) ? null : parsed;
+      const peers = byEmail.get(email)!;
+      const near = peers.filter((p) =>
+        (t0 === null || p.t === null)
+          ? (t0 === null && p.t === null)
+          : Math.abs(p.t - t0) <= SPAM_VELOCITY_WINDOW_MS
+      );
+      windowCount = near.length;
+      windowIps = new Set(near.map((p) => p.ip).filter(Boolean)).size;
+      if (windowCount >= 3) {
+        score += 3;
+        reasons.push(`identity-repeat:${windowCount}`);
+      } else if (windowCount === 2) {
+        score += 1;
+        reasons.push("identity-repeat:2");
+      }
+      if (windowIps >= 2) {
+        score += 2;
+        reasons.push(`ip-rotation:${windowIps}`);
+      }
+    }
+
+    // Name-identity velocity: one persona reused across DISTINCT emails in the
+    // window is a bot rotating burner addresses (the Robertjisib wave), which
+    // email velocity can't see. Counting distinct emails - not raw name repeats
+    // - means a single human resubmitting from one address never clusters, and a
+    // months-apart loyal customer stays a singleton (both windowed, review H2).
+    // Weighted like email velocity (+1 for a pair, +3 for a burst) so it can
+    // never flag on its own - it only corroborates (dup/H2/H3 FP guards).
+    const nameKey = normalizeNameKey(l.name);
+    if (nameKey && email) {
+      const parsed = Date.parse(l.received_at ?? "");
+      const t0 = Number.isNaN(parsed) ? null : parsed;
+      const near = byName.get(nameKey)!.filter((p) =>
+        (t0 === null || p.t === null)
+          ? (t0 === null && p.t === null)
+          : Math.abs(p.t - t0) <= SPAM_VELOCITY_WINDOW_MS
+      );
+      const distinctEmails = new Set(near.map((p) => p.email)).size;
+      if (distinctEmails >= 3) {
+        score += 3;
+        reasons.push(`name-repeat:${distinctEmails}`);
+      } else if (distinctEmails === 2) {
+        score += 1;
+        reasons.push("name-repeat:2");
+      }
+    }
+
+    // Per-lead signals.
+    if (email && localpartLooksMachine(email)) {
+      score += 2;
+      reasons.push("localpart-machine-generated");
+    }
+    if (nameLooksGibberish(l.name ?? "")) {
+      score += 2;
+      reasons.push("name-gibberish");
+    }
+    if (phoneLooksBogus(l.phone ?? "")) {
+      score += 1;
+      reasons.push("phone-unnormalizable");
+    }
+    const msg = l.message ?? "";
+    const solicitation = SPAM_SOLICITATION_RE.test(msg);
+    if (solicitation) {
+      score += 2;
+      reasons.push("solicitation-template");
+    }
+    // The nonlatin signal is a MISMATCH signal (ASCII name vs foreign-script
+    // body), so it requires a non-empty ASCII name (review L3).
+    const name = (l.name ?? "").trim();
+    const nameIsAscii = name !== "" &&
+      [...name].every((c) => (c.codePointAt(0) ?? 0) < 128);
+    if (nameIsAscii && nonLatinScriptRatio(msg) >= 0.5) {
+      score += 2;
+      reasons.push("nonlatin-body-ascii-name");
+    }
+    if (solicitation && dom && isBlockedDomain(dom, freemail)) {
+      score += 1;
+      reasons.push("freemail-plus-solicitation");
+    }
+
+    // Ham discount: a referral mention is a HAM signal (the WEATHER MAN guard),
+    // but it may only RESCUE a borderline lead - it can never cancel a score
+    // that the spam signals have ALREADY driven to the flag threshold. So the
+    // discount applies only when the pre-discount score is below threshold.
+    // This blocks the evasion where a spammer appends "a friend sent me" to an
+    // otherwise clearly-spam lead (single-shot OR a velocity burst) to zero it
+    // out, while still discounting a genuine one-off referral whose score was
+    // never going to flag (reviews H1 cycle 1 + cycle 2).
+    if (SPAM_REFERRAL_RE.test(msg)) {
+      if (score < threshold) {
+        score -= 5;
+        reasons.push("referral-mention-discount");
+      } else {
+        reasons.push("referral-mention-ignored-corroborated");
+      }
+    }
+
+    if (score < 0) score = 0;
+    out.set(leadId, { leadId, score, reasons, flagged: score >= threshold });
+  }
+  return out;
 }
 
 // --- Idempotency helpers (I/O, shared by base methods + push_leads) ---------
@@ -1036,6 +1490,33 @@ async function findOpportunityByLeadId(
     buildFilterPath("/rest/opportunities", "leadId", leadId),
   );
   return unwrapList(json, "opportunities")[0] ?? null;
+}
+
+/**
+ * Strict leadId->opportunity resolution for the SEND path (EMAIL-TE-4): THROWS on
+ * an ambiguous (>1) match instead of silently taking [0]. A duplicate leadId must
+ * never let the send pick one opportunity and drive the wrong-brand LoB default —
+ * a duplicate is an operator/data error, so fail loud. Read methods keep the
+ * tolerant {@link findOpportunityByLeadId} first-match.
+ */
+async function findOpportunityByLeadIdStrict(
+  cfg: TwentyCfg,
+  leadId: string,
+): Promise<Record<string, unknown> | null> {
+  const list = unwrapList(
+    await twentyRequest(
+      cfg,
+      "GET",
+      buildFilterPath("/rest/opportunities", "leadId", leadId),
+    ),
+    "opportunities",
+  );
+  if (list.length > 1) {
+    throw new Error(
+      `Ambiguous leadId '${leadId}': ${list.length} opportunities match (send refused)`,
+    );
+  }
+  return list[0] ?? null;
 }
 
 interface CreateOpportunityInput {
@@ -1978,6 +2459,441 @@ async function listOpportunitiesFiltered(
   return { items: page.items, truncated: page.truncated };
 }
 
+// --- Email/thread read helpers (TWENTY-EMAIL) -------------------------------
+//
+// Twenty's message tables are channel-neutral: messageThread, message
+// (subject/text/receivedAt/createdAt, receivedAt NULLABLE), messageParticipant
+// (join keys personId/workspaceMemberId, NEVER a company link — company is
+// transitive via person), messageThreadTarget (MORPH_RELATION with distinct
+// join columns targetPersonId/targetCompanyId/targetOpportunityId), and
+// messageChannelMessageAssociation (direction INCOMING|OUTGOING, joined by
+// messageId; the association.message link is NULLABLE). connectedAccount and
+// messageChannel are NOT REST-visible, so direction is sourced from the
+// association (F8), never a connectedAccount handle comparison.
+//
+// PII discipline (F6/F7, mirrors mapNoteView/personRef): these helpers surface
+// JOIN KEYS + non-sensitive scalars ONLY — never a raw handle/displayName, a
+// subject text, or a message text/body. Subject/body are represented as
+// presence + length. Participants resolve to personId/workspaceMemberId.
+
+type MessageDirection = "INCOMING" | "OUTGOING" | "unknown";
+
+/** A participant reduced to join keys only (NO handle/displayName — F6). */
+interface ThreadParticipantKey {
+  personId?: string;
+  workspaceMemberId?: string;
+  /** from/to/cc/bcc — a Twenty enum, not PII; kept to distinguish sender. */
+  role?: string;
+}
+
+/** A body-free per-message view (subject/body as presence+length — F6). */
+interface MessageView {
+  id: string;
+  direction: MessageDirection;
+  subjectPresent: boolean;
+  subjectLength: number;
+  bodyLength: number;
+  participants: ThreadParticipantKey[];
+  receivedAt?: string;
+  createdAt?: string;
+}
+
+// The REST plural for the direction-carrying association object.
+const MSG_ASSOC_PLURAL = "messageChannelMessageAssociations";
+
+/**
+ * The message's effective chronology timestamp: receivedAt when present, else
+ * the non-null createdAt fallback (F15 — receivedAt is NULLABLE for unsynced /
+ * outbound rows). ISO-8601 strings sort lexicographically, so callers order by
+ * this coalesced value client-side rather than trusting a nullable-column sort.
+ * Returns "" only when a row somehow carries neither timestamp.
+ */
+export function messageTs(m: Record<string, unknown>): string {
+  const r = m.receivedAt;
+  if (r != null && String(r) !== "") return String(r);
+  const c = m.createdAt;
+  if (c != null && String(c) !== "") return String(c);
+  return "";
+}
+
+/**
+ * The genuinely-last message of a set by coalesced {@link messageTs} (F15),
+ * with the id as a stable tiebreaker. Null-safe: a null-receivedAt row whose
+ * createdAt is later correctly wins over an earlier receivedAt row. Returns
+ * null for an empty set.
+ */
+export function pickLastMessage(
+  items: Array<Record<string, unknown>>,
+): Record<string, unknown> | null {
+  let best: Record<string, unknown> | null = null;
+  let bestTs = "";
+  let bestId = "";
+  for (const m of items) {
+    const ts = messageTs(m);
+    const id = String(m.id ?? "");
+    if (best === null || ts > bestTs || (ts === bestTs && id > bestId)) {
+      best = m;
+      bestTs = ts;
+      bestId = id;
+    }
+  }
+  return best;
+}
+
+/**
+ * Derive a thread's follow-up state from its last message. Direction is
+ * AUTHORITATIVE (from the association, F8) — an unknown direction yields
+ * 'unknown' rather than a guess (a wrong guess could imply an errant outbound).
+ * OUTGOING last => we are waiting on them: 'sent-unanswered' while fresh,
+ * 'dormant' once older than dormantDays. INCOMING last => 'awaiting-us'. No
+ * messages => 'empty'. Pure (no I/O) so the state machine is unit-testable.
+ */
+export function deriveThreadState(
+  lastDirection: MessageDirection,
+  ageDays: number | null,
+  dormantDays: number,
+  messageCount: number,
+): "awaiting-us" | "sent-unanswered" | "dormant" | "empty" | "unknown" {
+  if (messageCount <= 0) return "empty";
+  if (lastDirection === "unknown") return "unknown";
+  if (lastDirection === "INCOMING") return "awaiting-us";
+  // OUTGOING: we sent last.
+  if (ageDays != null && ageDays > dormantDays) return "dormant";
+  return "sent-unanswered";
+}
+
+/**
+ * Direction for a message from messageChannelMessageAssociation.direction,
+ * joined by messageId (F8). Returns 'unknown' when no association exists or the
+ * association carries no direction (the association.message link is nullable) —
+ * NEVER a guess. messageId is a server-derived UUID; guarded with isFilterSafe
+ * before any filter interpolation (F11) as defense-in-depth.
+ */
+async function fetchMessageDirection(
+  cfg: TwentyCfg,
+  messageId: string,
+): Promise<MessageDirection> {
+  if (!isFilterSafe(messageId)) return "unknown";
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    buildFilterPath(`/rest/${MSG_ASSOC_PLURAL}`, "messageId", messageId),
+  );
+  const assoc = unwrapList(json, MSG_ASSOC_PLURAL)[0];
+  const d = assoc?.direction;
+  if (d === "INCOMING" || d === "OUTGOING") return d;
+  return "unknown";
+}
+
+/**
+ * A message's participants reduced to join keys (F6): personId /
+ * workspaceMemberId (+ the non-PII role enum). NEVER the raw handle or
+ * displayName. There is no company link on messageParticipant (company is
+ * transitive via person). messageId guarded with isFilterSafe (F11).
+ */
+async function fetchMessageParticipantKeys(
+  cfg: TwentyCfg,
+  messageId: string,
+): Promise<ThreadParticipantKey[]> {
+  if (!isFilterSafe(messageId)) return [];
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    buildFilterPath("/rest/messageParticipants", "messageId", messageId),
+  );
+  const list = unwrapList(json, "messageParticipants");
+  const out: ThreadParticipantKey[] = [];
+  for (const p of list) {
+    const key: ThreadParticipantKey = {};
+    if (p.personId != null && p.personId !== "") {
+      key.personId = String(p.personId);
+    }
+    if (p.workspaceMemberId != null && p.workspaceMemberId !== "") {
+      key.workspaceMemberId = String(p.workspaceMemberId);
+    }
+    if (p.role != null && p.role !== "") key.role = String(p.role);
+    // Never emit handle/displayName (F6). A role-only external participant is
+    // kept so the message's shape is visible, but carries no identifying data.
+    if (key.personId || key.workspaceMemberId || key.role) out.push(key);
+  }
+  return out;
+}
+
+/** Page a thread's messages (filter=messageThreadId). Gap-free createdAt,id
+ * order for the cursor; chronology (receivedAt-coalesced) is applied
+ * client-side (F15). threadId must be validated + filter-safe by the caller. */
+async function fetchThreadMessagesPage(
+  cfg: TwentyCfg,
+  threadId: string,
+  cap: number,
+  startingAfter?: string,
+): Promise<ListPage> {
+  return await listFiltered(
+    cfg,
+    "messages",
+    [`messageThreadId[eq]:${encodeURIComponent(threadId)}`],
+    cap,
+    LIST_ORDER,
+    startingAfter,
+  );
+}
+
+// Recent-first message order for LAST-MESSAGE / STATUS derivation (EMAIL-ORD-1).
+// receivedAt is the primary chronology but NULLABLE (unsynced/outbound rows), so
+// DescNullsLast keeps null-receivedAt rows from sorting to the front; createdAt +
+// id give a gap-free descending tiebreak. Fetching newest-first means the HEAD
+// page holds the true last message even when a thread exceeds the per-call cap —
+// a plain ascending read (LIST_ORDER) returned the OLDEST N and inverted the
+// derived direction/status. Constant DSL (bracket-modifier order_by; commas are
+// the literal key separator, no injection risk).
+// Lead with the NON-NULL createdAt (ORD-1-R): receivedAt is nullable (a
+// just-sent OUTBOUND reply commonly has receivedAt=null), and a
+// receivedAt-led DescNullsLast would bury that true-newest message past the
+// cap, re-inverting the threadStatus verdict. A createdAt-led head holds the
+// true last message EXCEPT when receivedAt and createdAt diverge across the cap
+// boundary (future-dated/clock-skewed or late-backfilled rows where
+// receivedAt > createdAt) — pickLastMessage orders by the coalesced
+// (receivedAt ?? createdAt) value, so that rare case can still pick a
+// head-page neighbour; every such read is capped and therefore flagged
+// truncated=true (a lower-confidence verdict), never presented as authoritative.
+// A fuller fix needs server-side ordering on the coalesced value (no single
+// Twenty column) or a full-thread read. Mirrors THREAD_RECENT_ORDER.
+const MSG_RECENT_ORDER =
+  "createdAt[DescNullsLast],receivedAt[DescNullsLast],id[DescNullsLast]";
+
+/** Page a thread's messages NEWEST-first for last-message/status derivation
+ * (EMAIL-ORD-1). The head page holds the true last even past the cap; callers
+ * pick it with {@link pickLastMessage} and MUST surface page.truncated/hasMore so
+ * a capped read never presents as authoritative. getThread keeps the ascending
+ * {@link fetchThreadMessagesPage} for its full oldest->newest listing. threadId
+ * must be validated + filter-safe by the caller. */
+async function fetchThreadRecentMessagesPage(
+  cfg: TwentyCfg,
+  threadId: string,
+  cap: number,
+  startingAfter?: string,
+): Promise<ListPage> {
+  return await listFiltered(
+    cfg,
+    "messages",
+    [`messageThreadId[eq]:${encodeURIComponent(threadId)}`],
+    cap,
+    MSG_RECENT_ORDER,
+    startingAfter,
+  );
+}
+
+/**
+ * Enrich raw message records into body-free {@link MessageView}s, resolving
+ * direction (association) and participant join keys per message. Returns the
+ * raw record + coalesced ts alongside each view so callers can order
+ * client-side (F15) without re-reading.
+ */
+async function enrichThreadMessages(
+  cfg: TwentyCfg,
+  rawItems: Array<Record<string, unknown>>,
+): Promise<
+  Array<{ raw: Record<string, unknown>; view: MessageView; ts: string }>
+> {
+  const out: Array<
+    { raw: Record<string, unknown>; view: MessageView; ts: string }
+  > = [];
+  for (const m of rawItems) {
+    const id = validateUuid(m.id);
+    const direction = id ? await fetchMessageDirection(cfg, id) : "unknown";
+    const participants = id ? await fetchMessageParticipantKeys(cfg, id) : [];
+    const subject = m.subject != null ? String(m.subject) : "";
+    const text = m.text != null ? String(m.text) : "";
+    const view: MessageView = {
+      id: String(m.id ?? ""),
+      direction,
+      subjectPresent: subject.length > 0,
+      subjectLength: subject.length,
+      bodyLength: text.length,
+      participants,
+    };
+    if (m.receivedAt != null && String(m.receivedAt) !== "") {
+      view.receivedAt = String(m.receivedAt);
+    }
+    if (m.createdAt != null && String(m.createdAt) !== "") {
+      view.createdAt = String(m.createdAt);
+    }
+    out.push({ raw: m, view, ts: messageTs(m) });
+  }
+  return out;
+}
+
+// Recent-first order for a workspace-wide thread scan (createdAt is non-null,
+// so DescNullsLast == plain descending; id tiebreaker keeps the cursor
+// gap-free). Bracket-modifier order_by form per the Phase-0 findings.
+const THREAD_RECENT_ORDER = "createdAt[DescNullsLast],id[DescNullsLast]";
+
+type ThreadTargetKind =
+  | "opportunity"
+  | "person"
+  | "company"
+  | "leadId"
+  | "workspace";
+
+/** A resolved messageThreadTarget filter selection (F18). */
+interface ResolvedThreadTarget {
+  kind: ThreadTargetKind;
+  id?: string;
+  resolvedKind?: "opportunity" | "person" | "company";
+  resolvedId?: string;
+  field?: "targetOpportunityId" | "targetPersonId" | "targetCompanyId";
+  found: boolean;
+}
+
+interface ThreadTargetArgs {
+  opportunityId?: string;
+  personId?: string;
+  companyId?: string;
+  leadId?: string;
+}
+
+/**
+ * Resolve the caller's target into the correct polymorphic messageThreadTarget
+ * filter field + a VALIDATED UUID (F18/F11): opportunity->targetOpportunityId,
+ * person->targetPersonId, company->targetCompanyId. At most one target may be
+ * given (else throw). A leadId is resolved to its opportunity first, then its
+ * person (mirrors findOpportunityByLeadId/findPersonByLeadId); found:false when
+ * neither exists. No target => a recent workspace-wide scan. Every resolvedId
+ * is UUID-validated here so it can never interpolate an unvalidated id into a
+ * filter, and an opportunity id can never filter a person field.
+ */
+async function resolveThreadTarget(
+  cfg: TwentyCfg,
+  args: ThreadTargetArgs,
+  // EMAIL-TE-4: the send path passes strictLeadId to REFUSE an ambiguous
+  // leadId->opportunity match; read methods leave it off (tolerant first-match).
+  opts?: { strictLeadId?: boolean },
+): Promise<ResolvedThreadTarget> {
+  const has = (v: unknown) => v != null && String(v).trim() !== "";
+  const provided: ThreadTargetKind[] = [];
+  if (has(args.opportunityId)) provided.push("opportunity");
+  if (has(args.personId)) provided.push("person");
+  if (has(args.companyId)) provided.push("company");
+  if (has(args.leadId)) provided.push("leadId");
+  if (provided.length > 1) {
+    throw new Error(
+      "Provide at most one of opportunityId|personId|companyId|leadId",
+    );
+  }
+  if (provided.length === 0) return { kind: "workspace", found: true };
+
+  const which = provided[0];
+  if (which === "opportunity" || which === "person" || which === "company") {
+    const raw = which === "opportunity"
+      ? args.opportunityId
+      : which === "person"
+      ? args.personId
+      : args.companyId;
+    const id = validateUuid(raw);
+    if (!id) throw new Error(`Invalid ${which}Id (must be a UUID)`);
+    const field = which === "opportunity"
+      ? "targetOpportunityId"
+      : which === "person"
+      ? "targetPersonId"
+      : "targetCompanyId";
+    return {
+      kind: which,
+      id,
+      resolvedKind: which,
+      resolvedId: id,
+      field,
+      found: true,
+    };
+  }
+
+  // leadId: resolve to the opportunity first, else the person.
+  const leadId = validateLeadId(args.leadId);
+  if (!leadId) throw new Error("Invalid leadId");
+  const opp = opts?.strictLeadId
+    ? await findOpportunityByLeadIdStrict(cfg, leadId)
+    : await findOpportunityByLeadId(cfg, leadId);
+  const oppId = opp ? validateUuid(opp.id) : null;
+  if (oppId) {
+    return {
+      kind: "leadId",
+      id: leadId,
+      resolvedKind: "opportunity",
+      resolvedId: oppId,
+      field: "targetOpportunityId",
+      found: true,
+    };
+  }
+  const person = await findPersonByLeadId(cfg, leadId);
+  const personId = person ? validateUuid(person.id) : null;
+  if (personId) {
+    return {
+      kind: "leadId",
+      id: leadId,
+      resolvedKind: "person",
+      resolvedId: personId,
+      field: "targetPersonId",
+      found: true,
+    };
+  }
+  return { kind: "leadId", id: leadId, found: false };
+}
+
+/**
+ * Resolve the set of thread ids for a target (F18): a filtered
+ * messageThreadTarget scan per the correct join column, or a recent
+ * workspace-wide messageThread scan when there is no target. Thread ids are
+ * UUID-validated before use. Returns the ListPage so the caller surfaces the
+ * paging/completeness envelope.
+ */
+async function fetchThreadIdsForTarget(
+  cfg: TwentyCfg,
+  resolved: ResolvedThreadTarget,
+  cap: number,
+  startingAfter?: string,
+): Promise<{ ids: string[]; page: ListPage }> {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  if (resolved.kind === "workspace") {
+    const page = await listFiltered(
+      cfg,
+      "messageThreads",
+      [],
+      cap,
+      THREAD_RECENT_ORDER,
+      startingAfter,
+    );
+    for (const t of page.items) {
+      const tid = validateUuid(t.id);
+      if (tid && !seen.has(tid)) {
+        seen.add(tid);
+        ids.push(tid);
+      }
+    }
+    return { ids, page };
+  }
+  const field = resolved.field;
+  const rid = resolved.resolvedId;
+  if (!field || !rid || !isFilterSafe(rid)) {
+    throw new Error("Unresolvable or unsafe thread target");
+  }
+  const page = await listFiltered(
+    cfg,
+    "messageThreadTargets",
+    [`${field}[eq]:${encodeURIComponent(rid)}`],
+    cap,
+    LIST_ORDER,
+    startingAfter,
+  );
+  for (const t of page.items) {
+    const tid = validateUuid(t.messageThreadId);
+    if (tid && !seen.has(tid)) {
+      seen.add(tid);
+      ids.push(tid);
+    }
+  }
+  return { ids, page };
+}
+
 // GraphQL field selection for an Opportunity row — the allowlisted analytics
 // fields only (never name/contacts). `amount` is Twenty's CURRENCY composite,
 // selected as its {amountMicros, currencyCode} subfields so mapOppView's
@@ -2123,6 +3039,458 @@ async function fetchOpportunityMeta(
   };
 }
 
+// --- Email SEND subsystem (TWENTY-EMAIL send) -------------------------------
+//
+// Sending is Twenty's native "Send Email" workflow action, invoked via the
+// runWorkflowVersion mutation with a resolved, NON-EMPTY connectedAccountId in
+// the trigger payload (F1). Two hard facts drive this design:
+//
+//  1. The API_KEY apiToken is FORBIDDEN on runWorkflowVersion + myConnected-
+//     Accounts (both carry a UserAuthGuard). So the send path mints a per-run
+//     workspace-member USER access token from vaulted email+password (login ->
+//     access token), uses it as the Bearer for those two calls, and discards it.
+//  2. runWorkflowVersion is fire-and-forget: it returns ONLY {workflowRunId} —
+//     no synchronous messageId/threadId (F13). Send success is NOT synchronously
+//     confirmable; sendRun records the workflowRunId + inputs, never a sent id.
+//
+// Fail-closed identity is the whole point: an empty/ambiguous connectedAccountId,
+// an unmapped explicit fromBrand (F4), a non-opp/null-LoB target with no explicit
+// fromBrand (F5), a live-missing id (F3), or a domain mismatch (F3) each REFUSE
+// before any send. PII discipline mirrors the read layer: the sendRun audit
+// stores JOIN KEYS + connectedAccountId + a hashed recipient (never the raw `to`)
+// + subject/body LENGTHS (never the text) (F6/F7).
+
+/** Full lowercase-hex SHA-256 of `input` (used for dedup keys + recipient hash). */
+export async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * The DOMAIN part of a mail handle (lowercased), or "" — the ONLY slice of a
+ * connected-account handle we ever keep (brand-matching + the PII-conservative
+ * connectedAccountList snapshot). Never returns the local-part / full handle.
+ */
+export function handleDomain(handle: unknown): string {
+  if (handle == null) return "";
+  const s = String(handle).trim().toLowerCase();
+  const at = s.lastIndexOf("@");
+  if (at === -1) return "";
+  return s.slice(at + 1);
+}
+
+/**
+ * Validate the brand->connectedAccountId map at load (F14): every value must be a
+ * non-empty UUID and no two brands may point at the SAME connectedAccountId
+ * (duplicate = ambiguous identity). Returns a human error string, or null when
+ * the map is valid (an empty map is valid — it just means no brand resolves).
+ */
+export function validateBrandMap(map: Record<string, unknown>): string | null {
+  const seen = new Map<string, string>();
+  for (const [brand, raw] of Object.entries(map ?? {})) {
+    const cid = validateUuid(raw);
+    if (!cid) {
+      return `brandConnectedAccounts['${brand}'] is not a non-empty UUID`;
+    }
+    const prior = seen.get(cid);
+    if (prior) {
+      return `brandConnectedAccounts['${brand}'] duplicates the connectedAccountId already mapped to '${prior}'`;
+    }
+    seen.set(cid, brand);
+  }
+  return null;
+}
+
+/** Outcome of the pure brand->connectedAccountId resolution (F3/F4/F5/F14). */
+export type BrandResolution =
+  | {
+    ok: true;
+    brand: string;
+    connectedAccountId: string;
+    source: "explicit" | "lob-default";
+  }
+  | { ok: false; reason: string };
+
+/**
+ * Resolve exactly one connectedAccountId to send from, fail-closed (pure, so the
+ * refusal matrix is unit-testable without I/O):
+ *  - explicit fromBrand: MUST be in brandMap (F4 — an unmapped explicit brand is a
+ *    HARD REFUSE, never a fall-through to the LoB default). Its mapped id must be a
+ *    non-empty UUID (an empty/ambiguous id is a HARD REFUSE).
+ *  - absent fromBrand: the per-lineOfBusiness default applies ONLY to an
+ *    Opportunity target with a NON-EMPTY lineOfBusiness (F5). Every other target
+ *    (person/company/leadId-> person/null-LoB opp/workspace) REFUSES.
+ * The live existence + domain-match re-check (F3) happens at send time, not here.
+ */
+export function resolveBrandForSend(input: {
+  fromBrand?: string;
+  targetKind: string | null;
+  lineOfBusiness?: string | null;
+  brandMap: Record<string, string>;
+  lobMap: Record<string, string>;
+}): BrandResolution {
+  const brandMap = input.brandMap ?? {};
+  const fromBrand = (input.fromBrand ?? "").trim();
+  if (fromBrand) {
+    if (!Object.prototype.hasOwnProperty.call(brandMap, fromBrand)) {
+      return {
+        ok: false,
+        reason:
+          `fromBrand '${fromBrand}' is not in brandConnectedAccounts — hard refuse (F4), never falls through to a default`,
+      };
+    }
+    const cid = validateUuid(brandMap[fromBrand]);
+    if (!cid) {
+      return {
+        ok: false,
+        reason:
+          `brandConnectedAccounts['${fromBrand}'] is empty/ambiguous (not a UUID) — hard refuse`,
+      };
+    }
+    return {
+      ok: true,
+      brand: fromBrand,
+      connectedAccountId: cid,
+      source: "explicit",
+    };
+  }
+  // No explicit brand: the LoB default is opp-only, non-empty-LoB-only (F5).
+  const lob = (input.lineOfBusiness ?? "").trim();
+  if (input.targetKind === "opportunity" && lob) {
+    const lobMap = input.lobMap ?? {};
+    const brand = (lobMap[lob] ?? "").trim();
+    if (!brand) {
+      return {
+        ok: false,
+        reason:
+          `lineOfBusiness '${lob}' has no lineOfBusinessBrand default — supply an explicit fromBrand`,
+      };
+    }
+    const cid = validateUuid(brandMap[brand]);
+    if (!cid) {
+      return {
+        ok: false,
+        reason:
+          `default brand '${brand}' (from lineOfBusiness '${lob}') has no valid connectedAccountId — hard refuse`,
+      };
+    }
+    return { ok: true, brand, connectedAccountId: cid, source: "lob-default" };
+  }
+  return {
+    ok: false,
+    reason:
+      "no fromBrand and no per-lineOfBusiness default applies (target is not an Opportunity with a non-empty lineOfBusiness) — explicit fromBrand required (F5)",
+  };
+}
+
+// --- USER-token GraphQL transport (send/auth only) --------------------------
+// A DELIBERATE mutation-capable POST — distinct from the read-only, guarded
+// twentyGraphQL. `query` is always an in-code constant literal built in this
+// module; never caller-supplied. Throws (caller redacts) on non-2xx or a GraphQL
+// `errors` array. Never echoes the request body (which may carry credentials).
+
+async function postGraphQLRaw(
+  url: string,
+  query: string,
+  variables: Record<string, unknown>,
+  bearer?: string,
+  // TE-1/TE-2: when set, thrown errors carry ONLY status/statusText under this
+  // label — NEVER the response body slice or GraphQL errors[].message text. The
+  // auth mint (sendUserPassword) and workflow send (raw to/subject/body) submit
+  // secrets/PII in the request; Twenty may echo them in a 4xx body, and Rule 11
+  // captures thrown errors into durable reports — so those callers pass a label.
+  label?: string,
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...(bearer ? { "Authorization": `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    if (label) {
+      // Drop the body entirely — status/statusText only.
+      throw new Error(`${label}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    // The response body may echo submitted values; slice + let the caller redact.
+    throw new Error(
+      `Twenty send GraphQL failed: ${resp.status} ${resp.statusText} — ${
+        text.slice(0, 200)
+      }`,
+    );
+  }
+  const json = (text ? JSON.parse(text) : {}) as {
+    data?: Record<string, unknown>;
+    errors?: Array<{ message?: string }>;
+  };
+  if (json.errors && json.errors.length > 0) {
+    if (label) {
+      // GraphQL errors[].message can echo the submitted input — suppress it.
+      throw new Error(`${label}: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const msg = json.errors.map((e) => e?.message ?? "").join("; ");
+    throw new Error(`Twenty send GraphQL errors: ${msg.slice(0, 200)}`);
+  }
+  return json.data ?? {};
+}
+
+const LOGIN_TOKEN_MUTATION =
+  `mutation($email:String!,$password:String!,$origin:String!){ getLoginTokenFromCredentials(input:{email:$email,password:$password}, origin:$origin){ loginToken } }`;
+const AUTH_TOKENS_MUTATION =
+  `mutation($loginToken:String!,$origin:String!){ getAuthTokensFromLoginToken(input:{loginToken:$loginToken}, origin:$origin){ tokens { accessOrWorkspaceAgnosticToken { token expiresAt } refreshToken { token expiresAt } } } }`;
+const MY_CONNECTED_ACCOUNTS_QUERY =
+  `query { myConnectedAccounts { id handle provider authFailedAt archivedAt } }`;
+const RUN_WORKFLOW_VERSION_MUTATION =
+  `mutation($input:RunWorkflowVersionInput!){ runWorkflowVersion(input:$input){ workflowRunId } }`;
+
+/**
+ * Mint a fresh, per-run workspace-member USER access token (F1b) from the vaulted
+ * send credentials via the two public core-/graphql mutations
+ * (getLoginTokenFromCredentials -> getAuthTokensFromLoginToken). Returns the
+ * 30-min `accessOrWorkspaceAgnosticToken` (carries user context); the refresh
+ * token is intentionally discarded (no rotation/write-back). FAIL-CLOSED: any
+ * missing credential or missing token throws — a caller must NEVER fall through
+ * to a send on a mint failure. The password/token are never logged or persisted;
+ * thrown messages carry neither.
+ */
+export async function mintUserAccessToken(cfg: GlobalArgs): Promise<string> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const origin = (cfg.twentyOrigin ?? "").trim() || base;
+  const email = (cfg.sendUserEmail ?? "").trim();
+  const password = cfg.sendUserPassword ?? "";
+  if (!email || !password) {
+    throw new Error(
+      "send subsystem is not configured: sendUserEmail/sendUserPassword are empty (fail-closed)",
+    );
+  }
+  const d1 = await postGraphQLRaw(
+    `${base}/graphql`,
+    LOGIN_TOKEN_MUTATION,
+    {
+      email,
+      password,
+      origin,
+    },
+    undefined,
+    "credential mint failed",
+  );
+  const loginToken =
+    (d1.getLoginTokenFromCredentials as Record<string, unknown> | undefined)
+      ?.loginToken;
+  if (!loginToken || typeof loginToken !== "string") {
+    throw new Error("token mint step 1 returned no loginToken (fail-closed)");
+  }
+  const d2 = await postGraphQLRaw(
+    `${base}/graphql`,
+    AUTH_TOKENS_MUTATION,
+    {
+      loginToken,
+      origin,
+    },
+    undefined,
+    "credential mint failed",
+  );
+  const tokens =
+    (d2.getAuthTokensFromLoginToken as Record<string, unknown> | undefined)
+      ?.tokens as Record<string, unknown> | undefined;
+  const access = (
+    tokens?.accessOrWorkspaceAgnosticToken as
+      | Record<string, unknown>
+      | undefined
+  )?.token;
+  if (!access || typeof access !== "string") {
+    throw new Error("token mint step 2 returned no access token (fail-closed)");
+  }
+  return access;
+}
+
+/** A live connected account reduced to non-sensitive fields (domain-only). */
+export interface ConnectedAccountLite {
+  id: string;
+  provider: string;
+  /** DOMAIN of the handle only — never the local-part / full handle (F6). */
+  domain: string;
+  authFailed: boolean;
+  archived: boolean;
+}
+
+/**
+ * The calling USER's own connected accounts via /metadata `myConnectedAccounts`
+ * (SELF-SCOPED — there is no admin "list all"; the design assumes ONE sending
+ * service user owns every brand mailbox, so its accounts enumerate them all).
+ * Reduces each row to id/provider/domain-only + authFailed/archived booleans; the
+ * raw handle is split at '@' and discarded (F6).
+ */
+export async function fetchConnectedAccounts(
+  cfg: GlobalArgs,
+  userToken: string,
+): Promise<ConnectedAccountLite[]> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const data = await postGraphQLRaw(
+    `${base}/metadata`,
+    MY_CONNECTED_ACCOUNTS_QUERY,
+    {},
+    userToken,
+  );
+  const rows = Array.isArray(data.myConnectedAccounts)
+    ? (data.myConnectedAccounts as Array<Record<string, unknown>>)
+    : [];
+  return rows.map((r) => ({
+    id: String(r.id ?? ""),
+    provider: String(r.provider ?? ""),
+    domain: handleDomain(r.handle),
+    authFailed: r.authFailedAt != null && String(r.authFailedAt) !== "",
+    archived: r.archivedAt != null && String(r.archivedAt) !== "",
+  }));
+}
+
+/**
+ * Resolve the ACTIVE/published version id of the named Send-Email workflow over
+ * REST + the API_KEY token (F12 — never pin a version id). GET /rest/workflows
+ * filtered by name, read lastPublishedVersionId. Returns null when the workflow
+ * is absent or has no published version (the caller REFUSES the send).
+ */
+export async function resolveActiveWorkflowVersionId(
+  cfg: GlobalArgs,
+  workflowName: string,
+): Promise<string | null> {
+  const name = sanitizeText(workflowName, 120);
+  if (!name || !isFilterSafe(name)) return null;
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    buildFilterPath("/rest/workflows", "name", name),
+  );
+  const list = unwrapList(json, "workflows");
+  // EMAIL-WF-1: a duplicate workflow NAME is ambiguous — refuse loudly rather
+  // than taking the first row (an operator mistake could point the send at the
+  // wrong workflow). The caller refuses the send on the thrown error.
+  if (list.length > 1) {
+    throw new Error(
+      `Ambiguous Send-Email workflow name '${name}': ${list.length} matches (refused)`,
+    );
+  }
+  for (const wf of list) {
+    const vid = validateUuid(wf.lastPublishedVersionId);
+    if (vid) return vid;
+  }
+  return null;
+}
+
+/**
+ * Invoke the Send-Email workflow version via runWorkflowVersion (core /graphql,
+ * USER token). The caller `payload` becomes the manual-trigger output the send
+ * step reads connectedAccountId/to/subject/body from (F1). Returns ONLY the
+ * workflowRunId (fire-and-forget; no messageId/threadId — F13).
+ */
+export async function runSendWorkflow(
+  cfg: GlobalArgs,
+  userToken: string,
+  workflowVersionId: string,
+  payload: Record<string, unknown>,
+): Promise<string> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const data = await postGraphQLRaw(
+    `${base}/graphql`,
+    RUN_WORKFLOW_VERSION_MUTATION,
+    { input: { workflowVersionId, payload } },
+    userToken,
+    // TE-2: the payload carries raw to/subject/body — never ride it back through
+    // a thrown/sliced response body.
+    "send enqueue failed",
+  );
+  const runId = (data.runWorkflowVersion as Record<string, unknown> | undefined)
+    ?.workflowRunId;
+  if (!runId || typeof runId !== "string") {
+    throw new Error("runWorkflowVersion returned no workflowRunId");
+  }
+  return runId;
+}
+
+/**
+ * The DURABLE, cross-run dedup marker id for a dedupKey (F9/F10). The dedupKey is
+ * hashed so the marker is ALWAYS filter-safe hex regardless of a caller-supplied
+ * key, and namespaced under `send-` so it never collides with a lead marker. The
+ * marker is a body-free Note stored in the Note TITLE as `sent:<markerId>` and
+ * queried by that title (EMAIL-DEDUP-1) — deliberately NOT on the leadId field,
+ * so a leadId-keyed reconciliation can never mistake it for a real lead note.
+ */
+export async function sendDedupMarkerId(dedupKey: string): Promise<string> {
+  return "send-" + await sha256Hex(dedupKey);
+}
+
+/**
+ * Compute the dedupKey when the caller supplies none (F9): a hash over the
+ * recipient + connectedAccountId + reply-thread + a COARSE (UTC-day) time bucket
+ * + subject + body. A deliberate identical resend within the same day needs a
+ * distinct caller-supplied dedupKey (documented). `now` is injectable for tests.
+ */
+export async function computeDedupKey(input: {
+  to: string;
+  connectedAccountId: string;
+  inReplyToThreadId?: string;
+  subject: string;
+  body: string;
+  now?: Date;
+}): Promise<string> {
+  const bucket = (input.now ?? new Date()).toISOString().slice(0, 10); // UTC day
+  const parts = [
+    input.to,
+    input.connectedAccountId,
+    input.inReplyToThreadId ?? "",
+    bucket,
+    input.subject,
+    input.body,
+  ];
+  // TE-3: JSON.stringify gives an unambiguous, injective field boundary (fields
+  // are already sanitized) so distinct part sets can never merge - replaces a
+  // raw-NUL join that was ASCII-illegal and tooling-hostile.
+  return await sha256Hex(JSON.stringify(parts));
+}
+
+/**
+ * Query the durable dedup store for a prior send of `markerId` (a Note marker).
+ * EMAIL-DEDUP-1: markers live in the Note TITLE namespace (`sent:<markerId>`), NOT
+ * the leadId custom field, so a leadId-keyed lead reconciliation
+ * (findNoteByLeadId / listNotes' leadId filter / notes-drift) can never mistake a
+ * dedup marker for a lead note. We therefore query the title exact-match, never
+ * leadId. The title value is a constant `sent:` prefix + a filter-safe hex marker,
+ * URL-encoded by buildFilterPath.
+ */
+async function findPriorSend(
+  cfg: GlobalArgs,
+  markerId: string,
+): Promise<Record<string, unknown> | null> {
+  if (!isFilterSafe(markerId)) return null;
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    buildFilterPath("/rest/notes", "title", `sent:${markerId}`),
+  );
+  return unwrapList(json, "notes")[0] ?? null;
+}
+
+/** Write the durable dedup marker AFTER a successful enqueue (body-free Note). */
+async function writeSendMarker(
+  cfg: GlobalArgs,
+  markerId: string,
+): Promise<void> {
+  // EMAIL-DEDUP-1: write the marker in the TITLE only (`sent:<markerId>`) and do
+  // NOT set the leadId custom field — that keeps dedup markers OUT of the leadId
+  // Note namespace so a leadId-keyed reconciliation cannot mistake them for lead
+  // notes. findPriorSend queries this title. Body-free.
+  await twentyRequest(cfg, "POST", "/rest/notes", {
+    title: `sent:${markerId}`,
+  });
+}
+
 // --- Generic record upsert: strict controls (TWENTY-RECORD-UPSERT) ----------
 // v1 object allowlist. ONLY these CUSTOM objects may be written by the generic
 // upsertRecord; any other object (standard OR unlisted custom) is rejected
@@ -2184,6 +3552,33 @@ const OPP_CUSTOMFIELDS_RESERVED = new Set<string>([
   "channelPartner",
 ]);
 
+// upsertCompany.customFields reserved keys (TWENTY-COMPANY-UPSERT, ADV-8/SEC-3):
+// every Company field owned by a typed upsertCompany argument, the composite
+// field owners those typed args write (domainName / linkedinLink / xLink /
+// address), and the base system fields (UPSERT_RESERVED_FIELDS). A customFields
+// key in this set is a HARD reject pre-write — the generic escape hatch can
+// never shadow a typed arg's validation/encoding or rewrite an identity field.
+const COMPANY_CUSTOMFIELDS_RESERVED = new Set<string>([
+  ...UPSERT_RESERVED_FIELDS, // id, createdAt, updatedAt, deletedAt, position
+  "name",
+  "domainName",
+  "accountOwnerId",
+  "accountOwner",
+  "legalName",
+  "employees",
+  "idealCustomerProfile",
+  "addressCity",
+  "addressState",
+  "addressCountry",
+  "addressStreet1",
+  "addressStreet2",
+  "addressPostcode",
+  // Composite owners written by the typed address/link args.
+  "address",
+  "linkedinLink",
+  "xLink",
+]);
+
 /**
  * Resolve the write-relevant metadata for ONE object by nameSingular: its REST
  * plural (read from metadata, never guessed) and a name→{type, SELECT-option
@@ -2192,7 +3587,7 @@ const OPP_CUSTOMFIELDS_RESERVED = new Set<string>([
  * validate SELECT values against the LIVE enum before a write. Throws if the
  * object is absent from workspace metadata.
  *
- * NOTE (isCustom — live-verified 2026-09-16 against crm.shrug.pw, Twenty
+ * NOTE (isCustom — live-verified 2026-09-16 against the Twenty instance, Twenty
  * v2.38.x): the `/rest/metadata/objects` rows carry NO `isCustom` flag. The row
  * keys are id / universalIdentifier / applicationId / nameSingular / namePlural
  * / label* / description / icon / isRemote / isActive / isSystem / isUI* /
@@ -3470,6 +4865,15 @@ const LeadResultSchema = z.object({
     "Emergency isEmergency marker PATCH failed (non-fatal; retried on re-run)",
   ),
   error: z.string().optional(),
+  spamScore: z.number().optional().describe(
+    "Shadow-mode spam score from classifyLead (>= threshold => would be quarantined in the future enforce phase; NOT quarantined now).",
+  ),
+  spamReasons: z.array(z.string()).optional().describe(
+    "PII-free coded reasons behind spamScore (e.g. identity-repeat:6, localpart-machine-generated). Never raw lead text.",
+  ),
+  spamFlagged: z.boolean().optional().describe(
+    "Shadow verdict: spamScore >= threshold. Reported only; the lead still synced this phase.",
+  ),
 });
 
 const PushRunSchema = z.object({
@@ -3492,12 +4896,18 @@ const PushRunSchema = z.object({
     kvUnparseable: z.number().optional().describe(
       "kvEntries dropped as non-JSON / empty (never silently ignored)",
     ),
+    spamFlagged: z.number().optional().describe(
+      "Shadow-mode count of leads classifyLead WOULD quarantine at the current threshold. NOT quarantined in this phase - the leads still synced.",
+    ),
     perLead: z.array(
       z.object({
         leadId: z.string(),
         action: z.string(),
         status: z.string(),
         emergency: z.boolean(),
+        spamScore: z.number().optional(),
+        spamReasons: z.array(z.string()).optional(),
+        spamFlagged: z.boolean().optional(),
       }),
     ),
   }),
@@ -5045,6 +6455,12 @@ const CompanyViewSchema = z.object({
   id: z.string(),
   name: z.string(),
   domain: z.string().optional(),
+  legalName: z
+    .string()
+    .optional()
+    .describe(
+      "Company legal name — emitted by exportCompanies for the YAML back-sync; omitted by listCompanies (which carries id/name/domain only)",
+    ),
   createdAt: z.string().optional(),
 });
 
@@ -5134,6 +6550,204 @@ const NoteListSchema = z.object({
   }),
   items: z.array(NoteViewSchema),
   retrievedAt: z.iso.datetime(),
+});
+
+// --- Email/thread read snapshots (TWENTY-EMAIL) -----------------------------
+// Body-free by construction (F6/F7): subject/body are presence + length, NEVER
+// text; participants are join keys (personId/workspaceMemberId), NEVER handles.
+
+const MessageDirectionSchema = z.enum(["INCOMING", "OUTGOING", "unknown"]);
+
+const ThreadParticipantSchema = z.object({
+  personId: z.string().optional(),
+  workspaceMemberId: z.string().optional(),
+  role: z
+    .string()
+    .optional()
+    .describe("from/to/cc/bcc — a Twenty enum, not PII"),
+});
+
+const ThreadTargetSchema = z.object({
+  kind: z.enum(["opportunity", "person", "company", "leadId", "workspace"]),
+  id: z.string().optional().describe("The requested target id (or leadId)"),
+  resolvedKind: z.enum(["opportunity", "person", "company"]).optional(),
+  resolvedId: z
+    .string()
+    .optional()
+    .describe("The UUID actually filtered on (a leadId resolves to this)"),
+  found: z
+    .boolean()
+    .describe("False when a leadId did not resolve to any opp/person"),
+});
+
+const ThreadSummarySchema = z.object({
+  id: z.string(),
+  subjectPresent: z.boolean(),
+  subjectLength: z.number().describe(
+    "Length of the last message subject, NOT the text",
+  ),
+  messageCount: z.number().describe(
+    "Messages read for this thread (bounded by messageLimit)",
+  ),
+  lastInboundAt: z.string().optional().describe(
+    "Coalesced ts of the newest INCOMING message",
+  ),
+  lastOutboundAt: z.string().optional().describe(
+    "Coalesced ts of the newest OUTGOING message",
+  ),
+  truncated: z.boolean().optional().describe(
+    "True when this thread's message read hit the cap (ORD-1-R) — the last-in/out timestamps are from a partial (newest-first) read, not the whole thread",
+  ),
+  participants: z.array(ThreadParticipantSchema),
+});
+
+const ThreadListSchema = z.object({
+  baseUrl: z.string(),
+  target: ThreadTargetSchema,
+  count: z.number().describe("Threads summarized this call"),
+  truncated: z.boolean(),
+  hasMore: z.boolean(),
+  nextCursor: z.string().optional(),
+  totalCount: z.number().optional(),
+  incomplete: z.boolean(),
+  stopReason: ListStopReasonSchema,
+  items: z.array(ThreadSummarySchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+const MessageViewSchema = z.object({
+  id: z.string(),
+  direction: MessageDirectionSchema,
+  subjectPresent: z.boolean(),
+  subjectLength: z.number().describe("Subject length, NEVER the subject text"),
+  bodyLength: z.number().describe("Body length, NEVER the body text"),
+  participants: z.array(ThreadParticipantSchema),
+  receivedAt: z.string().optional(),
+  createdAt: z.string().optional(),
+});
+
+const ThreadDetailSchema = z.object({
+  baseUrl: z.string(),
+  threadId: z.string(),
+  count: z.number().describe("Messages returned this call"),
+  truncated: z.boolean(),
+  hasMore: z.boolean(),
+  nextCursor: z.string().optional(),
+  totalCount: z.number().optional(),
+  incomplete: z.boolean(),
+  stopReason: ListStopReasonSchema,
+  messages: z
+    .array(MessageViewSchema)
+    .describe("Oldest->newest by coalesced receivedAt/createdAt (F15)"),
+  retrievedAt: z.iso.datetime(),
+});
+
+const ThreadStatusSchema = z.object({
+  threadId: z.string(),
+  state: z.enum([
+    "awaiting-us",
+    "sent-unanswered",
+    "dormant",
+    "empty",
+    "unknown",
+  ]),
+  lastDirection: MessageDirectionSchema,
+  lastMessageAt: z.string().optional(),
+  ageDays: z.number().optional(),
+  messageCount: z.number(),
+  truncated: z.boolean().optional().describe(
+    "True when the message read hit the cap (ORD-1-R) — the verdict is from a partial (newest-first) read; treat as lower-confidence",
+  ),
+});
+
+const ThreadStatusReportSchema = z.object({
+  baseUrl: z.string(),
+  target: ThreadTargetSchema.optional(),
+  threadId: z.string().optional().describe(
+    "Set when a single thread was scoped",
+  ),
+  dormantDays: z.number(),
+  count: z.number(),
+  items: z.array(ThreadStatusSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Email SEND snapshots (TWENTY-EMAIL send) -------------------------------
+// PII-conservative by construction (F6/F7): the connected-account list keeps the
+// DOMAIN only (never the full handle); the sendRun audit keeps JOIN KEYS +
+// connectedAccountId + a hashed recipient + subject/body LENGTHS, never the raw
+// `to` / subject / body text.
+
+const ConnectedAccountLiteSchema = z.object({
+  id: z.string(),
+  provider: z.string(),
+  domain: z
+    .string()
+    .describe(
+      "Handle DOMAIN only (for brand-matching) — NEVER the full handle",
+    ),
+  authFailed: z.boolean(),
+  archived: z.boolean(),
+});
+
+const ConnectedAccountListSchema = z.object({
+  baseUrl: z.string(),
+  count: z.number(),
+  items: z.array(ConnectedAccountLiteSchema),
+  retrievedAt: z.iso.datetime(),
+});
+
+const SendRunSchema = z.object({
+  baseUrl: z.string(),
+  target: ThreadTargetSchema.describe(
+    "Target join keys (kind + validated ids)",
+  ),
+  personId: z.string().optional().describe(
+    "Recipient person join key when known",
+  ),
+  opportunityId: z.string().optional(),
+  companyId: z.string().optional(),
+  fromBrand: z.string().describe("The resolved brand domain sent AS"),
+  brandSource: z.enum(["explicit", "lob-default"]),
+  connectedAccountId: z
+    .string()
+    .describe("The mailbox id sent from — NOT the mailbox email address (F7)"),
+  workflowVersionId: z.string().describe(
+    "Resolved active Send-Email version (F12)",
+  ),
+  dedupKey: z
+    .string()
+    .describe("Opaque hashed dedup marker id (F9/F10) — not the raw inputs"),
+  toHash: z
+    .string()
+    .describe(
+      "SHA-256 of the recipient address — the raw `to` is NEVER stored (F7)",
+    ),
+  subjectLength: z.number().describe(
+    "Subject length, NEVER the subject text (F7)",
+  ),
+  bodyLength: z.number().describe("Body length, NEVER the body text (F7)"),
+  status: z.enum(["planned", "sent", "skipped"]),
+  dryRun: z.boolean(),
+  wouldSend: z.boolean().describe(
+    "True on a dry plan that would send when confirmed",
+  ),
+  sent: z.boolean(),
+  skipped: z.boolean().describe(
+    "True on a durable dedup hit (idempotent no-op)",
+  ),
+  dedupRecorded: z
+    .boolean()
+    .describe(
+      "True only when a live send wrote the durable dedup marker (never on dryRun — F10)",
+    ),
+  workflowRunId: z
+    .string()
+    .optional()
+    .describe(
+      "Async run id from runWorkflowVersion (F13) — NOT a sent-message id",
+    ),
+  at: z.iso.datetime(),
 });
 
 // Gated note-BODY read (TWENTY-NOTE-BODY-READ): the sanctioned, per-id,
@@ -5509,6 +7123,95 @@ const PersonUpsertSchema = z.object({
   retrievedAt: z.iso.datetime(),
 });
 
+// --- Company upsert snapshot (TWENTY-COMPANY-UPSERT) ------------------------
+// One candidate surfaced on an ambiguous/near match. PII-free by construction:
+// company id/name/domain ONLY (never account-owner email or any person field).
+const CompanyCandidateSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  domain: z.string().optional(),
+});
+
+const COMPANY_UPSERT_ACTIONS = [
+  "planned-create",
+  "planned-update",
+  "planned-conflict",
+  "created",
+  "updated",
+  "noop",
+  "conflict",
+] as const;
+
+export const CompanyUpsertSchema = z.object({
+  baseUrl: z.string(),
+  found: z.boolean().describe("An existing company matched (id/domain/name)"),
+  action: z.enum(COMPANY_UPSERT_ACTIONS),
+  dryRun: z.boolean(),
+  id: z.string().optional(),
+  name: z.string().describe("The input company name (sanitized)"),
+  domain: z.string().optional().describe("Canonical bare host, if supplied"),
+  legalName: z.string().optional(),
+  matchedVia: z
+    .enum(["id", "domain", "name"])
+    .optional()
+    .describe("How the existing record was matched, when found"),
+  fieldsSet: z
+    .array(z.string())
+    .describe(
+      "Which Company fields the write actually set/changed (none on noop/conflict)",
+    ),
+  candidates: z
+    .array(CompanyCandidateSchema)
+    .optional()
+    .describe(
+      "Non-exact / ambiguous matches surfaced on planned-conflict/conflict (id+name+domain only; no PII)",
+    ),
+  accountOwnerResolved: z
+    .boolean()
+    .optional()
+    .describe(
+      "True when accountOwnerEmail resolved to a workspace member (the id is written; the email NEVER enters this snapshot)",
+    ),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Company reconcile snapshot (TWENTY-COMPANY-UPSERT, Section 2a) ---------
+const CompanyReconcileEntrySchema = z.object({
+  index: z.number().int().describe(
+    "0-based position in the desired-state list",
+  ),
+  name: z.string().optional(),
+  domain: z.string().optional(),
+  ok: z.boolean().describe("False when this entry errored (isolated)"),
+  action: z.enum(COMPANY_UPSERT_ACTIONS).optional(),
+  found: z.boolean().optional(),
+  id: z.string().optional(),
+  matchedVia: z.enum(["id", "domain", "name"]).optional(),
+  fieldsSet: z.array(z.string()).optional(),
+  candidates: z.array(CompanyCandidateSchema).optional(),
+  error: z
+    .string()
+    .optional()
+    .describe("Redacted per-entry error (one bad row never aborts the batch)"),
+});
+
+export const CompanyReconcileSchema = z.object({
+  baseUrl: z.string(),
+  source: z.string().describe("Provenance label for the desired-state list"),
+  dryRun: z.boolean(),
+  total: z.number().int().describe("Entries in the desired-state list"),
+  processed: z.number().int(),
+  cap: z.number().int().describe("Per-run entry cap in effect"),
+  counts: z
+    .record(z.string(), z.number())
+    .describe("Tally of actions + errors across processed entries"),
+  converged: z
+    .boolean()
+    .describe("True when every processed entry is action==noop (clean re-run)"),
+  entries: z.array(CompanyReconcileEntrySchema),
+  retrievedAt: z.iso.datetime(),
+});
+
 // --- Execute context --------------------------------------------------------
 
 interface MethodLogger {
@@ -5545,6 +7248,11 @@ interface PerLead {
   noteEnsured: boolean;
   markerFailed?: boolean;
   error?: string;
+  // Shadow-mode spam annotation (classifyLead). Reported, never acted on in
+  // this phase: the lead still syncs regardless of spamFlagged.
+  spamScore?: number;
+  spamReasons?: string[];
+  spamFlagged?: boolean;
 }
 
 /**
@@ -5690,11 +7398,789 @@ async function syncPlannedLead(
   };
 }
 
+// --- Company upsert core (TWENTY-COMPANY-UPSERT) ----------------------------
+
+/** PATCH a Company by id with only the provided fields (non-destructive). */
+async function updateCompany(
+  cfg: TwentyCfg,
+  id: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return unwrapRecord(
+    await twentyRequest(cfg, "PATCH", `/rest/companies/${id}`, body),
+    "updateCompany",
+  );
+}
+
+/** Create a Company with the full assembled body. */
+async function createCompanyFull(
+  cfg: TwentyCfg,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return unwrapRecord(
+    await twentyRequest(cfg, "POST", "/rest/companies", body),
+    "createCompany",
+  );
+}
+
+/**
+ * BROAD company fetch for domain dedup (ADV-1): stored domainName values are
+ * often full-URL / www-prefixed, so a server `eq` on the bare host misses them
+ * and would duplicate. Fetch a candidate SET whose stored domain contains the
+ * canonical host substring, then the caller compares client-side after
+ * {@link canonicalCompanyHost} on BOTH sides for exact-canonical equality.
+ *
+ * Tries an `ilike` substring filter on the nested `domainName.primaryLinkUrl`
+ * first (fast path); on ANY error — the operator may be unsupported on that
+ * nested LINKS subfield (spec openQuestion, could not be verified live without a
+ * raw filtered GET) — falls back to a BOUNDED full page-scan filtered
+ * client-side. Either way the result is operator-independent and correct.
+ */
+/**
+ * Host-boundary match for the broad-domain re-narrow (ADV-3). A stored canonical
+ * host `h` counts as a near-candidate for `canonHost` ONLY when it is the same
+ * host, a true subdomain of it, or a registrable parent of it — never an
+ * arbitrary substring. This keeps `notacme.com` and `acme.com.au` from being
+ * treated as candidates for `acme.com` (which would force a spurious
+ * planned-conflict) while still catching `www.acme.com` (canonicalizes equal)
+ * and `sub.acme.com`. Errs SAFE: a real same-registrable collision still blocks
+ * a create, so we never duplicate.
+ */
+function hostMatchesDomainScope(h: string, canonHost: string): boolean {
+  return h === canonHost ||
+    h.endsWith("." + canonHost) ||
+    canonHost.endsWith("." + h);
+}
+
+async function findCompaniesBroadByDomain(
+  cfg: TwentyCfg,
+  canonHost: string,
+): Promise<Array<Record<string, unknown>>> {
+  const enc = encodeURIComponent(`%${canonHost}%`);
+  try {
+    const json = await twentyRequest(
+      cfg,
+      "GET",
+      `/rest/companies?filter=domainName.primaryLinkUrl[ilike]:${enc}&limit=${PAGE_SIZE}`,
+    );
+    const list = unwrapList(json, "companies");
+    // Defensive client-side re-narrow: keep rows whose canonical host matches on
+    // a host boundary (ilike can match loosely / raw-URL noise); a bare
+    // substring would misclassify notacme.com / acme.com.au as candidates.
+    return list.filter((c) => {
+      const h = canonicalCompanyHost(
+        (c.domainName as { primaryLinkUrl?: unknown } | undefined)
+          ?.primaryLinkUrl,
+      );
+      return h != null && hostMatchesDomainScope(h, canonHost);
+    });
+  } catch (_e) {
+    // Fallback: bounded full scan, filter client-side by canonical-host substring.
+    const page = await listFiltered(
+      cfg,
+      "companies",
+      [],
+      MAX_LIST_CAP,
+      LIST_ORDER,
+    );
+    return page.items.filter((c) => {
+      const h = canonicalCompanyHost(
+        (c.domainName as { primaryLinkUrl?: unknown } | undefined)
+          ?.primaryLinkUrl,
+      );
+      return h != null && hostMatchesDomainScope(h, canonHost);
+    });
+  }
+}
+
+/**
+ * Find companies by exact (filter-safe) name, compared CLIENT-SIDE after
+ * {@link canonicalCompanyName} (lower/collapse-space). Unlike the legacy
+ * {@link findOneCompanyByName}, a real API/network error here ABORTS (throws) —
+ * it is NOT swallowed to null, so a transient error can never masquerade as "no
+ * match" and fall through to a create (ADV-2). Caller must pass an
+ * already-filter-safe name.
+ */
+async function findCompaniesByNameExact(
+  cfg: TwentyCfg,
+  name: string,
+): Promise<Array<Record<string, unknown>>> {
+  const canon = canonicalCompanyName(name);
+  const json = await twentyRequest(
+    cfg,
+    "GET",
+    buildFilterPath("/rest/companies", "name", name),
+  );
+  return unwrapList(json, "companies").filter(
+    (c) => canonicalCompanyName(c.name) === canon,
+  );
+}
+
+/**
+ * Fetch the workspace members (bounded) for accountOwnerEmail resolution. A
+ * small set in practice; paged defensively without an order_by (the member
+ * object's sortable fields are not asserted here). Read-only.
+ */
+async function fetchWorkspaceMembers(
+  cfg: TwentyCfg,
+): Promise<Array<Record<string, unknown>>> {
+  const out: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 10; page++) {
+    const path = `/rest/workspaceMembers?limit=${PAGE_SIZE}` +
+      (cursor ? `&starting_after=${encodeURIComponent(cursor)}` : "");
+    const json = await twentyRequest(cfg, "GET", path);
+    for (const m of unwrapList(json, "workspaceMembers")) out.push(m);
+    const pageInfo = (json as {
+      pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+    }).pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo.endCursor) break;
+    if (pageInfo.endCursor === cursor) break;
+    cursor = pageInfo.endCursor;
+  }
+  return out;
+}
+
+/** A memoizing company-metadata loader (fail-closed-aware), shared per run. */
+function makeCompanyMetaLoader(cfg: TwentyCfg) {
+  let cache:
+    | {
+      meta: {
+        plural: string;
+        fields: Map<string, { type: string; options: string[] }>;
+      } | null;
+      readable: boolean;
+    }
+    | undefined;
+  return async () => {
+    if (cache) return cache;
+    try {
+      cache = {
+        meta: await fetchUpsertObjectMeta(cfg, "company"),
+        readable: true,
+      };
+    } catch (_e) {
+      cache = { meta: null, readable: false };
+    }
+    return cache;
+  };
+}
+
+/** A memoizing workspace-members loader, shared across a reconcile batch. */
+function makeMembersLoader(cfg: TwentyCfg) {
+  let cache: Array<Record<string, unknown>> | undefined;
+  return async () => {
+    if (!cache) cache = await fetchWorkspaceMembers(cfg);
+    return cache;
+  };
+}
+
+/** The typed inputs upsertCompany/reconcileCompanies accept per company. */
+export interface CompanyUpsertInput {
+  matchBy?: "id" | "domain" | "name" | "auto";
+  id?: string;
+  name: string;
+  domain?: string;
+  legalName?: string;
+  addressCity?: string;
+  addressState?: string;
+  addressCountry?: string;
+  addressStreet1?: string;
+  addressStreet2?: string;
+  addressPostcode?: string;
+  employees?: number;
+  linkedinUrl?: string;
+  xUrl?: string;
+  idealCustomerProfile?: boolean;
+  accountOwnerEmail?: string;
+  customFields?: Record<string, string | number | boolean>;
+}
+
+type CompanyAction = (typeof COMPANY_UPSERT_ACTIONS)[number];
+
+export interface CompanyUpsertResult {
+  found: boolean;
+  action: CompanyAction;
+  id?: string;
+  name: string;
+  domain?: string;
+  legalName?: string;
+  matchedVia?: "id" | "domain" | "name";
+  fieldsSet: string[];
+  candidates?: Array<{ id: string; name?: string; domain?: string }>;
+  accountOwnerResolved?: boolean;
+}
+
+/** PII-free candidate view for conflict surfaces (id/name/domain only). */
+function companyCandidate(
+  rec: Record<string, unknown>,
+): { id: string; name?: string; domain?: string } {
+  const out: { id: string; name?: string; domain?: string } = {
+    id: String(rec.id ?? ""),
+  };
+  if (rec.name != null && rec.name !== "") out.name = String(rec.name);
+  const h = canonicalCompanyHost(
+    (rec.domainName as { primaryLinkUrl?: unknown } | undefined)
+      ?.primaryLinkUrl,
+  );
+  if (h) out.domain = h;
+  return out;
+}
+
+/** The normalized desired-state used to diff a write (post-sanitize). */
+interface CompanyDesired {
+  name: string;
+  domainCanon?: string;
+  legalName?: string;
+  employees?: number;
+  idealCustomerProfile?: boolean;
+  linkedinUrl?: string;
+  xUrl?: string;
+  accountOwnerId?: string;
+  address?: Record<string, string>;
+  customFields: Record<string, string | number | boolean>;
+}
+
+/**
+ * Assemble a non-destructive Company write body + the list of fields it sets.
+ * On CREATE (existing null) every provided field is written. On UPDATE a field
+ * is written ONLY when it differs from the stored value (so a re-run with the
+ * same inputs is a true noop, ADV-5); composites (domainName/linkedinLink/xLink/
+ * address) are MERGED with the stored object so a partial update never nulls a
+ * sibling subfield. `nameToWrite` is decided by the caller (rename policy).
+ */
+function buildCompanyWrite(
+  existing: Record<string, unknown> | null,
+  desired: CompanyDesired,
+  nameToWrite: string | undefined,
+): { body: Record<string, unknown>; fieldsSet: string[] } {
+  const body: Record<string, unknown> = {};
+  const fieldsSet: string[] = [];
+  const create = !existing;
+
+  if (nameToWrite !== undefined) {
+    body.name = nameToWrite;
+    fieldsSet.push("name");
+  }
+
+  // domainName (LINKS composite) — merge, write only when the canonical host changes.
+  if (desired.domainCanon) {
+    const cur = canonicalCompanyHost(
+      (existing?.domainName as { primaryLinkUrl?: unknown } | undefined)
+        ?.primaryLinkUrl,
+    );
+    if (create || cur !== desired.domainCanon) {
+      body.domainName = {
+        ...((existing?.domainName as Record<string, unknown>) ?? {}),
+        primaryLinkUrl: desired.domainCanon,
+      };
+      fieldsSet.push("domain");
+    }
+  }
+
+  // Scalars.
+  if (desired.legalName !== undefined) {
+    if (create || String(existing?.legalName ?? "") !== desired.legalName) {
+      body.legalName = desired.legalName;
+      fieldsSet.push("legalName");
+    }
+  }
+  if (desired.employees !== undefined) {
+    const cur = existing?.employees;
+    if (create || Number(cur) !== desired.employees) {
+      body.employees = desired.employees;
+      fieldsSet.push("employees");
+    }
+  }
+  if (desired.idealCustomerProfile !== undefined) {
+    if (
+      create ||
+      Boolean(existing?.idealCustomerProfile) !== desired.idealCustomerProfile
+    ) {
+      body.idealCustomerProfile = desired.idealCustomerProfile;
+      fieldsSet.push("idealCustomerProfile");
+    }
+  }
+  if (desired.accountOwnerId !== undefined) {
+    // Twenty may return the owner FK either flat (`accountOwnerId`) or nested
+    // under the resolved relation (`accountOwner.id`). Read EITHER so a re-run
+    // with accountOwnerEmail set is a true noop when the owner is unchanged.
+    const curOwnerId = String(
+      existing?.accountOwnerId ??
+        (existing?.accountOwner as { id?: unknown } | undefined)?.id ??
+        "",
+    );
+    if (create || curOwnerId !== desired.accountOwnerId) {
+      body.accountOwnerId = desired.accountOwnerId;
+      fieldsSet.push("accountOwner");
+    }
+  }
+
+  // LINKS composites.
+  for (
+    const [field, val] of [
+      ["linkedinLink", desired.linkedinUrl],
+      ["xLink", desired.xUrl],
+    ] as const
+  ) {
+    if (val === undefined) continue;
+    const cur = String(
+      (existing?.[field] as { primaryLinkUrl?: unknown } | undefined)
+        ?.primaryLinkUrl ?? "",
+    );
+    if (create || cur !== val) {
+      body[field] = {
+        ...((existing?.[field] as Record<string, unknown>) ?? {}),
+        primaryLinkUrl: val,
+      };
+      fieldsSet.push(field === "linkedinLink" ? "linkedinUrl" : "xUrl");
+    }
+  }
+
+  // ADDRESS composite — merge provided subfields; write when any differs.
+  if (desired.address && Object.keys(desired.address).length) {
+    const existingAddr =
+      (existing?.address as Record<string, unknown> | undefined) ?? {};
+    const merged: Record<string, unknown> = { ...existingAddr };
+    let changed = create;
+    for (const [k, v] of Object.entries(desired.address)) {
+      if (String(existingAddr[k] ?? "") !== v) changed = true;
+      merged[k] = v;
+    }
+    if (changed) {
+      body.address = merged;
+      fieldsSet.push("address");
+    }
+  }
+
+  // customFields (already validated scalars).
+  for (const [k, v] of Object.entries(desired.customFields)) {
+    const cur = existing?.[k];
+    const same = typeof v === "number"
+      ? Number(cur) === v
+      : typeof v === "boolean"
+      ? Boolean(cur) === v
+      : String(cur ?? "") === String(v);
+    if (create || !same) {
+      body[k] = v;
+      fieldsSet.push(k);
+    }
+  }
+
+  return { body, fieldsSet };
+}
+
+/**
+ * The idempotent single-company upsert primitive shared by the upsertCompany
+ * method and the reconcileCompanies fan-out. Does all I/O via `cfg`; writes NO
+ * resource (callers snapshot the returned {@link CompanyUpsertResult}). Match
+ * precedence id -> domain -> name; create requires a domain AND zero broad-fetch
+ * candidates; a name-only miss, an unmatched explicit id, an unresolved
+ * accountOwner, and a fail-closed customFields violation all THROW (abort);
+ * ambiguity / near-candidate / domain-hit-name-mismatch resolve to a no-write
+ * conflict/planned-conflict result carrying candidates. `dryRun` plans only.
+ */
+async function upsertCompanyCore(
+  cfg: TwentyCfg,
+  input: CompanyUpsertInput,
+  dryRun: boolean,
+  loadMeta: ReturnType<typeof makeCompanyMetaLoader>,
+  loadMembers: ReturnType<typeof makeMembersLoader>,
+): Promise<CompanyUpsertResult> {
+  const matchBy = input.matchBy ?? "auto";
+  const name = sanitizeText(input.name, 200);
+  if (!name) throw new Error("name is required");
+
+  // Domain: canonicalize + validate shape up front.
+  let domainCanon: string | undefined;
+  if (input.domain != null && String(input.domain).trim()) {
+    const host = canonicalCompanyHost(input.domain);
+    if (!host || !validateDomain(host) || !isFilterSafe(host)) {
+      throw new Error(`Invalid domain '${sanitizeText(input.domain, 120)}'`);
+    }
+    domainCanon = host;
+  }
+
+  // Explicit id: validate the UUID shape before any path interpolation.
+  let idInput: string | undefined;
+  if (input.id != null && String(input.id).trim()) {
+    const u = validateUuid(input.id);
+    if (!u) throw new Error("Invalid id (must be a UUID)");
+    idInput = u;
+  }
+  if (matchBy === "id" && !idInput) {
+    throw new Error("matchBy=id requires a valid id");
+  }
+  if (matchBy === "domain" && !domainCanon) {
+    throw new Error("matchBy=domain requires a domain");
+  }
+
+  // Typed scalar fields (sanitize / validate; empty => unset/leave-unchanged).
+  const legalName = input.legalName != null
+    ? (sanitizeText(input.legalName, 200) || undefined)
+    : undefined;
+  let employees: number | undefined;
+  if (input.employees != null) {
+    const n = Number(input.employees);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error("employees must be a non-negative integer");
+    }
+    employees = n;
+  }
+  const linkedinUrl = input.linkedinUrl != null
+    ? (sanitizeText(input.linkedinUrl, 500) || undefined)
+    : undefined;
+  const xUrl = input.xUrl != null
+    ? (sanitizeText(input.xUrl, 500) || undefined)
+    : undefined;
+  const idealCustomerProfile = input.idealCustomerProfile;
+  const address: Record<string, string> = {};
+  for (
+    const [arg, field] of [
+      [input.addressStreet1, "addressStreet1"],
+      [input.addressStreet2, "addressStreet2"],
+      [input.addressCity, "addressCity"],
+      [input.addressState, "addressState"],
+      [input.addressCountry, "addressCountry"],
+      [input.addressPostcode, "addressPostcode"],
+    ] as const
+  ) {
+    if (arg != null) {
+      const s = sanitizeText(arg, 200);
+      if (s) address[field] = s;
+    }
+  }
+
+  // customFields — FAIL-CLOSED (reject whole map if metadata unreadable).
+  const validatedCustomFields: Record<string, string | number | boolean> = {};
+  const rawCustomFields = input.customFields ?? {};
+  if (Object.keys(rawCustomFields).length) {
+    const { meta, readable } = await loadMeta();
+    if (!readable || !meta) {
+      throw new Error(
+        "customFields supplied but company field metadata is unreadable — refusing to write (fail-closed)",
+      );
+    }
+    for (const [k, v] of Object.entries(rawCustomFields)) {
+      const key = String(k).trim();
+      if (!FIELD_NAME_RE.test(key)) {
+        throw new Error(
+          `Invalid customFields key '${
+            sanitizeText(key, 80)
+          }': must be a camelCase identifier (letter-led, alphanumeric)`,
+        );
+      }
+      const safeKey = sanitizeText(key, 80);
+      if (COMPANY_CUSTOMFIELDS_RESERVED.has(key)) {
+        throw new Error(
+          `customFields key '${safeKey}' is reserved — set it via its typed argument, not customFields`,
+        );
+      }
+      if (v === null) {
+        throw new Error(
+          `customFields key '${safeKey}' is null; null is not permitted (omit the key to leave the field unchanged)`,
+        );
+      }
+      const fMeta = meta.fields.get(key);
+      if (!fMeta) {
+        throw new Error(
+          `Unknown customFields key '${safeKey}' on company (fail-closed; refusing to write an unrecognized field)`,
+        );
+      }
+      if (!UPSERT_SCALAR_TYPES.has(fMeta.type)) {
+        throw new Error(
+          `customFields key '${safeKey}' has non-scalar type '${fMeta.type}' (allowed: ${
+            [...UPSERT_SCALAR_TYPES].join(", ")
+          }); composite fields are not supported`,
+        );
+      }
+      if (typeof v === "number" && !Number.isFinite(v)) {
+        throw new Error(
+          `customFields key '${safeKey}' is a non-finite number (Infinity/NaN); only finite numeric values are permitted`,
+        );
+      }
+      let out: string | number | boolean = v;
+      if (typeof v === "string") {
+        const s = sanitizeText(v, UPSERT_FIELD_TEXT_CAP);
+        if (!s) continue; // empty-string => omit (leave unchanged)
+        out = s;
+      }
+      if (fMeta.type === "SELECT") {
+        const token = String(out);
+        if (fMeta.options.length && !fMeta.options.includes(token)) {
+          throw new Error(
+            `Invalid value '${token}' for SELECT customFields key '${safeKey}'. Valid options: ${
+              fMeta.options.join(", ")
+            }`,
+          );
+        }
+      }
+      validatedCustomFields[key] = out;
+    }
+  }
+
+  // accountOwnerEmail -> opaque workspaceMemberId. The email is validated +
+  // filter-safe-guarded and NEVER enters the result snapshot (SEC-5/SEC-10);
+  // an unresolved owner ABORTS (ADV-9).
+  let accountOwnerId: string | undefined;
+  let accountOwnerResolved: boolean | undefined;
+  if (
+    input.accountOwnerEmail != null && String(input.accountOwnerEmail).trim()
+  ) {
+    const email = validateEmail(input.accountOwnerEmail);
+    if (!email) throw new Error("Invalid accountOwnerEmail");
+    if (!isFilterSafe(email)) {
+      throw new Error("accountOwnerEmail has filter-unsafe characters");
+    }
+    const members = await loadMembers();
+    const match = members.find(
+      (m) => String(m.userEmail ?? "").toLowerCase() === email,
+    );
+    if (!match || !match.id) {
+      throw new Error(
+        "accountOwnerEmail did not resolve to a workspace member",
+      );
+    }
+    accountOwnerId = String(match.id);
+    accountOwnerResolved = true;
+  }
+
+  const desired: CompanyDesired = {
+    name,
+    domainCanon,
+    legalName,
+    employees,
+    idealCustomerProfile,
+    linkedinUrl,
+    xUrl,
+    accountOwnerId,
+    ...(Object.keys(address).length ? { address } : {}),
+    customFields: validatedCustomFields,
+  };
+
+  // --- MATCH precedence: id -> domain -> name --------------------------------
+  let existing: Record<string, unknown> | null = null;
+  let matchedVia: "id" | "domain" | "name" | undefined;
+
+  if (idInput || matchBy === "id") {
+    existing = await getCompanyById(cfg, idInput!);
+    if (!existing) throw new Error(`company id not found: ${idInput}`); // ADV-12
+    matchedVia = "id";
+  } else if (domainCanon && matchBy !== "name") {
+    const cands = await findCompaniesBroadByDomain(cfg, domainCanon);
+    const exact = cands.filter(
+      (c) =>
+        canonicalCompanyHost(
+          (c.domainName as { primaryLinkUrl?: unknown } | undefined)
+            ?.primaryLinkUrl,
+        ) === domainCanon,
+    );
+    if (exact.length > 1) {
+      return {
+        found: true,
+        action: "conflict",
+        name,
+        ...(domainCanon ? { domain: domainCanon } : {}),
+        ...(legalName ? { legalName } : {}),
+        matchedVia: "domain",
+        fieldsSet: [],
+        candidates: exact.map(companyCandidate),
+        ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+      };
+    }
+    if (exact.length === 1) {
+      existing = exact[0];
+      matchedVia = "domain";
+    } else {
+      // Zero exact. Create ONLY when the broad fetch returned ZERO candidates;
+      // otherwise a near-candidate blocks the create (planned-conflict, ADV-1).
+      if (cands.length > 0) {
+        return {
+          found: false,
+          action: "planned-conflict",
+          name,
+          domain: domainCanon,
+          ...(legalName ? { legalName } : {}),
+          fieldsSet: [],
+          candidates: cands.map(companyCandidate),
+          ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+        };
+      }
+      // existing stays null -> CREATE path below.
+    }
+  } else {
+    // NAME fallback (only reachable with no id and no usable domain match path).
+    if (!isFilterSafe(name)) {
+      throw new Error(
+        "Refusing to create a company: name has filter-unsafe characters and no domain to dedup/create by",
+      );
+    }
+    const matches = await findCompaniesByNameExact(cfg, name);
+    if (matches.length > 1) {
+      return {
+        found: true,
+        action: "conflict",
+        name,
+        ...(legalName ? { legalName } : {}),
+        matchedVia: "name",
+        fieldsSet: [],
+        candidates: matches.map(companyCandidate),
+        ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+      };
+    }
+    if (matches.length === 1) {
+      existing = matches[0];
+      matchedVia = "name";
+    } else {
+      // Name-only miss with no domain: no stable key -> refuse to create.
+      throw new Error(
+        "Refusing to create a company without a domain: a name-only entry has no stable dedup key (provide a domain)",
+      );
+    }
+  }
+
+  // --- Domain-hit name-conflict guard (ADV-4): never silently rename ---------
+  if (
+    existing && matchedVia === "domain" &&
+    canonicalCompanyName(name) !== canonicalCompanyName(existing.name)
+  ) {
+    return {
+      found: true,
+      action: "conflict",
+      id: String(existing.id ?? ""),
+      name,
+      domain: domainCanon,
+      ...(legalName ? { legalName } : {}),
+      matchedVia: "domain",
+      fieldsSet: [],
+      candidates: [companyCandidate(existing)],
+      ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+    };
+  }
+
+  // --- CREATE ---------------------------------------------------------------
+  if (!existing) {
+    // Reachable only on the domain-create path (domainCanon set, zero candidates).
+    const nameToWrite = name;
+    const { body, fieldsSet } = buildCompanyWrite(null, desired, nameToWrite);
+    if (dryRun) {
+      return {
+        found: false,
+        action: "planned-create",
+        name,
+        domain: domainCanon,
+        ...(legalName ? { legalName } : {}),
+        fieldsSet,
+        ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+      };
+    }
+    try {
+      const created = await createCompanyFull(cfg, body);
+      return {
+        found: false,
+        action: "created",
+        id: String(created.id ?? ""),
+        name,
+        domain: domainCanon,
+        ...(legalName ? { legalName } : {}),
+        fieldsSet,
+        ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+      };
+    } catch (e) {
+      // Create-race convergence (PU-1): a concurrent run may have created the
+      // same domain between our broad fetch and POST — converge onto it.
+      const raced = (await findCompaniesBroadByDomain(cfg, domainCanon!))
+        .filter(
+          (c) =>
+            canonicalCompanyHost(
+              (c.domainName as { primaryLinkUrl?: unknown } | undefined)
+                ?.primaryLinkUrl,
+            ) === domainCanon,
+        );
+      if (raced.length === 1) {
+        const rec = raced[0];
+        const id = String(rec.id ?? "");
+        // Converged onto a domain match: never silent-rename (nameToWrite undefined).
+        const { body: ub, fieldsSet: uf } = buildCompanyWrite(
+          rec,
+          desired,
+          undefined,
+        );
+        if (uf.length) await updateCompany(cfg, id, ub);
+        return {
+          found: true,
+          action: uf.length ? "updated" : "noop",
+          id,
+          name,
+          domain: domainCanon,
+          ...(legalName ? { legalName } : {}),
+          matchedVia: "domain",
+          fieldsSet: uf,
+          ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+        };
+      }
+      throw e;
+    }
+  }
+
+  // --- UPDATE / NOOP --------------------------------------------------------
+  const id = String(existing.id ?? "");
+  // Rename policy: never on a domain match (conflict-guarded above); on an id or
+  // name match write the name only when it canonically differs (idempotent).
+  const nameToWrite = matchedVia !== "domain" &&
+      canonicalCompanyName(name) !== canonicalCompanyName(existing.name)
+    ? name
+    : undefined;
+  const { body, fieldsSet } = buildCompanyWrite(existing, desired, nameToWrite);
+  const storedDomain = canonicalCompanyHost(
+    (existing.domainName as { primaryLinkUrl?: unknown } | undefined)
+      ?.primaryLinkUrl,
+  ) ?? domainCanon;
+  if (fieldsSet.length === 0) {
+    return {
+      found: true,
+      action: "noop",
+      id,
+      name,
+      ...(storedDomain ? { domain: storedDomain } : {}),
+      ...(legalName ? { legalName } : {}),
+      matchedVia,
+      fieldsSet,
+      ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+    };
+  }
+  if (dryRun) {
+    return {
+      found: true,
+      action: "planned-update",
+      id,
+      name,
+      ...(storedDomain ? { domain: storedDomain } : {}),
+      ...(legalName ? { legalName } : {}),
+      matchedVia,
+      fieldsSet,
+      ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+    };
+  }
+  await updateCompany(cfg, id, body);
+  return {
+    found: true,
+    action: "updated",
+    id,
+    name,
+    ...(storedDomain ? { domain: storedDomain } : {}),
+    ...(legalName ? { legalName } : {}),
+    matchedVia,
+    fieldsSet,
+    ...(accountOwnerResolved ? { accountOwnerResolved } : {}),
+  };
+}
+
 // --- Model ------------------------------------------------------------------
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.09.19.1",
+  version: "2026.11.07.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -5839,6 +8325,23 @@ export const model = {
       toVersion: "2026.09.19.1",
       description:
         "Add opportunity view UPSERT (TWENTY-VIEW-UPSERT): the additive, reconciling upsertOpportunityView / upsertOpportunityViews methods (create / adopt+rename / reconcile-filters / present no-op / fail-closed refuse) + the viewEnsured2 snapshot with the extended action set. The create-only ensureOpportunityViews + its viewEnsured snapshot are UNCHANGED (ADV-6). Reconcile is keyed on (fieldMetadataId, subFieldName, operand, viewFilterGroupId), writes the UI stringified value form, verifies every write with a read-back, never mutates a non-isCustom/locked/system view, and never blind-deletes a viewFilterGroup. globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.09.21.1",
+      description:
+        "Add the email READ + SEND surface (TWENTY-EMAIL). READ: read-only listThreads / getThread / threadStatus over Twenty's message tables (messageThread/message/messageParticipant/messageThreadTarget + messageChannelMessageAssociation) + threadList/threadDetail/threadStatus snapshots — all BODY-FREE (F6), direction authoritative from the association (F8), receivedAt-null-safe ordering (F15), every filtered id UUID-validated + filter-safe with the correct polymorphic field (F11/F18). SEND: listConnectedAccounts (USER-token, domain-only connectedAccountList snapshot) + sendEmail (dry-by-default, confirm-gated, fail-closed brand pinning via runWorkflowVersion) + the connectedAccountList/sendRun snapshots — the sendRun audit is PII-conservative (join keys + connectedAccountId + hashed recipient + subject/body lengths, never raw text; F6/F7). Sending mints a per-run workspace-member USER access token (the API_KEY token is forbidden on runWorkflowVersion/myConnectedAccounts; F1b) from vaulted credentials. globalArguments gains SIX new OPTIONAL/defaulted fields — sendUserEmail, sendUserPassword (both SENSITIVE, empty default), brandConnectedAccounts ({} default, load-validated at first send), lineOfBusinessBrand ({} default), sendWorkflowName ('Send Email' default), twentyOrigin ('' default = baseUrl) — so this remains a no-op attribute migration: existing instances lazily acquire the defaults and behave identically (the send methods refuse fail-closed until the credentials + brand map are set).",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Add the curated Company write surface (TWENTY-COMPANY-UPSERT): upsertCompany (idempotent, dryRun-DEFAULT, confirm-gated; id->domain->name match with www/registrable-host canonical dedup and a zero-candidate create-guard; non-destructive composite-merge updates; fail-closed customFields; accountOwnerEmail->opaque workspaceMemberId with the email kept out of the snapshot), reconcileCompanies (declarative fan-out over a desired-state list" +
+        " with per-entry isolation, a mandatory entry cap, no reconcile-delete, and noop convergence), and exportCompanies (scrubbed id/name/domain/legalName back-sync). Adds the companyUpsert + companyReconcile resources and an optional legalName on the company view; reuses the existing companyList resource for the export. globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -5993,6 +8496,41 @@ export const model = {
       lifetime: "3d",
       garbageCollection: 25,
     },
+    "threadList": {
+      description:
+        "Snapshot from listThreads: per-thread BODY-FREE summaries (id, subject presence+length, participant join keys, last in/out timestamps, message count) for a record target or a recent workspace scan. No handles/subjects/bodies (F6).",
+      schema: ThreadListSchema,
+      lifetime: "3d",
+      garbageCollection: 5,
+    },
+    "threadDetail": {
+      description:
+        "Snapshot from getThread: one thread's oldest->newest BODY-FREE message views (id, direction, subject/body presence+length, participant join keys, timestamps). No subject/body text (F6).",
+      schema: ThreadDetailSchema,
+      lifetime: "3d",
+      garbageCollection: 5,
+    },
+    "threadStatus": {
+      description:
+        "Snapshot from threadStatus: per-thread follow-up verdicts (awaiting-us/sent-unanswered/dormant/empty/unknown) + last direction/age. PII-free (ids + timestamps + verdict only).",
+      schema: ThreadStatusReportSchema,
+      lifetime: "3d",
+      garbageCollection: 10,
+    },
+    "connectedAccountList": {
+      description:
+        "Snapshot from listConnectedAccounts: the send service user's own mailboxes reduced to id/provider/DOMAIN-only + authFailed/archived booleans (the brand-pinning source of truth). PII-conservative — never the full handle/local-part (F6).",
+      schema: ConnectedAccountListSchema,
+      lifetime: "3d",
+      garbageCollection: 10,
+    },
+    "sendRun": {
+      description:
+        "Audit of a sendEmail run (planned/sent/skipped): target JOIN KEYS, connectedAccountId (NOT a mailbox email), fromBrand, workflowVersionId, opaque dedupKey, hashed recipient, subject/body LENGTHS, and the async workflowRunId. NEVER the raw `to`/subject/body text (F6/F7). Async send is not synchronously confirmable (F13).",
+      schema: SendRunSchema,
+      lifetime: "infinite",
+      garbageCollection: 200,
+    },
     "stageOption": {
       description:
         "Result of an ensureStageOption run: the target picklist, the option, the action taken, and the full option set",
@@ -6020,6 +8558,20 @@ export const model = {
       schema: PersonUpsertSchema,
       lifetime: "infinite",
       garbageCollection: 100,
+    },
+    "companyUpsert": {
+      description:
+        "Result of an upsertCompany run: the action (plan/commit/conflict), the matched/created company id, which fields were set, and any conflict candidates (id/name/domain only — no account-owner email or person PII)",
+      schema: CompanyUpsertSchema,
+      lifetime: "infinite",
+      garbageCollection: 100,
+    },
+    "companyReconcile": {
+      description:
+        "Audit of a reconcileCompanies fan-out: per-entry plan/outcome (isolated; one bad row never aborts), action tallies, the entry cap in effect, and whether the batch converged to all-noop. No raw PII (company id/name/domain + redacted per-entry errors).",
+      schema: CompanyReconcileSchema,
+      lifetime: "3d",
+      garbageCollection: 25,
     },
     "objectEnsured": {
       description:
@@ -8297,6 +10849,815 @@ export const model = {
         }
       },
     },
+    listThreads: {
+      description:
+        "Fan-out read (repo rule 6): summarize the email threads for ONE record (opportunityId | personId | companyId | leadId) via the polymorphic messageThreadTarget join (targetOpportunityId/targetPersonId/targetCompanyId — F18), or a recent workspace-wide scan when no target is given. A leadId resolves to its opportunity (then person) first. Per thread returns BODY-FREE fields only (F6): id, subject presence+length (NOT text), participant JOIN KEYS (personId/workspaceMemberId — NOT emails), last-inbound/last-outbound coalesced timestamps, and message count. Direction is authoritative from messageChannelMessageAssociation (F8). Records a `threadList` snapshot. No writes.",
+      arguments: z.object({
+        opportunityId: z.string().optional().describe(
+          "Opportunity UUID target — at most one of the four targets",
+        ),
+        personId: z.string().optional().describe("Person UUID target"),
+        companyId: z.string().optional().describe("Company UUID target"),
+        leadId: z.string().optional().describe(
+          "Lead marker target (resolved to its opportunity, then person)",
+        ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(30)
+          .describe(
+            `Soft per-call floor (1..${MAX_LIST_CAP}) for the thread page`,
+          ),
+        messageLimit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe(
+            "Per-thread cap on messages read to derive counts/last in-out",
+          ),
+        startingAfter: z
+          .string()
+          .optional()
+          .describe("Cursor from a prior call's nextCursor"),
+      }),
+      execute: async (
+        args: {
+          opportunityId?: string;
+          personId?: string;
+          companyId?: string;
+          leadId?: string;
+          limit: number;
+          messageLimit: number;
+          startingAfter?: string;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          const msgCap = Math.min(
+            Math.max(1, Math.floor(args.messageLimit)),
+            MAX_LIST_CAP,
+          );
+          const startingAfter = args.startingAfter
+            ? String(args.startingAfter)
+            : undefined;
+          const resolved = await resolveThreadTarget(cfg, args);
+          const target: Record<string, unknown> = {
+            kind: resolved.kind,
+            found: resolved.found,
+          };
+          if (resolved.id !== undefined) target.id = resolved.id;
+          if (resolved.resolvedKind !== undefined) {
+            target.resolvedKind = resolved.resolvedKind;
+          }
+          if (resolved.resolvedId !== undefined) {
+            target.resolvedId = resolved.resolvedId;
+          }
+          const retrievedAt = new Date().toISOString();
+          const h = await listInstanceHash({
+            kind: resolved.kind,
+            id: resolved.id ?? null,
+            rid: resolved.resolvedId ?? null,
+            after: startingAfter ?? null,
+          });
+          const instanceName = `threads-${h}`;
+
+          // A leadId that resolved to nothing: emit an empty, found:false snap.
+          if (!resolved.found) {
+            const handle = await context.writeResource(
+              "threadList",
+              instanceName,
+              {
+                baseUrl: cfg.baseUrl,
+                target,
+                count: 0,
+                truncated: false,
+                hasMore: false,
+                incomplete: false,
+                stopReason: "complete",
+                items: [],
+                retrievedAt,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          const { ids, page } = await fetchThreadIdsForTarget(
+            cfg,
+            resolved,
+            cap,
+            startingAfter,
+          );
+
+          const items: Array<Record<string, unknown>> = [];
+          for (const threadId of ids) {
+            if (!isFilterSafe(threadId)) continue;
+            // EMAIL-ORD-1: read NEWEST-first so the head page holds the true last
+            // (and its lastInbound/lastOutbound) even when the thread exceeds the
+            // per-thread cap; an ascending read returned the oldest N and inverted
+            // the derived direction.
+            const mp = await fetchThreadRecentMessagesPage(
+              cfg,
+              threadId,
+              msgCap,
+            );
+            const enriched = await enrichThreadMessages(cfg, mp.items);
+            const last = pickLastMessage(mp.items);
+            const subject = last && last.subject != null
+              ? String(last.subject)
+              : "";
+            let lastInboundAt: string | undefined;
+            let lastOutboundAt: string | undefined;
+            const partSeen = new Set<string>();
+            const participants: Array<Record<string, unknown>> = [];
+            for (const e of enriched) {
+              if (e.view.direction === "INCOMING") {
+                if (lastInboundAt === undefined || e.ts > lastInboundAt) {
+                  lastInboundAt = e.ts || lastInboundAt;
+                }
+              } else if (e.view.direction === "OUTGOING") {
+                if (lastOutboundAt === undefined || e.ts > lastOutboundAt) {
+                  lastOutboundAt = e.ts || lastOutboundAt;
+                }
+              }
+              for (const p of e.view.participants) {
+                const idKey = p.personId ?? p.workspaceMemberId;
+                if (!idKey || partSeen.has(idKey)) continue;
+                partSeen.add(idKey);
+                const rec: Record<string, unknown> = {};
+                if (p.personId) rec.personId = p.personId;
+                if (p.workspaceMemberId) {
+                  rec.workspaceMemberId = p.workspaceMemberId;
+                }
+                if (p.role) rec.role = p.role;
+                participants.push(rec);
+              }
+            }
+            const summary: Record<string, unknown> = {
+              id: threadId,
+              subjectPresent: subject.length > 0,
+              subjectLength: subject.length,
+              messageCount: mp.items.length,
+              participants,
+            };
+            if (lastInboundAt) summary.lastInboundAt = lastInboundAt;
+            if (lastOutboundAt) summary.lastOutboundAt = lastOutboundAt;
+            // EMAIL-ORD-1: a capped per-thread read is only a window on the
+            // newest messages — flag it so a partial summary never reads as
+            // authoritative (do NOT silently discard mp.truncated/hasMore).
+            if (mp.truncated || mp.hasMore) summary.truncated = true;
+            items.push(summary);
+          }
+
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            target,
+            count: items.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            items,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "threadList",
+            instanceName,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    getThread: {
+      description:
+        "Fan-out read (repo rule 6): the full message list for ONE thread (filter=messageThreadId), presented oldest->newest by coalesced receivedAt/createdAt (F15 — receivedAt is NULLABLE; createdAt is the non-null fallback). Per message returns BODY-FREE fields only (F6): id, direction (authoritative from messageChannelMessageAssociation — F8), subject presence+length (NOT text), body length (NOT text), participant JOIN KEYS, and timestamps. Records a `threadDetail` snapshot. No writes.",
+      arguments: z.object({
+        threadId: z.string().describe("messageThread UUID"),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(200)
+          .describe(
+            `Soft per-call floor (1..${MAX_LIST_CAP}) for the message page`,
+          ),
+        startingAfter: z
+          .string()
+          .optional()
+          .describe("Cursor from a prior call's nextCursor"),
+      }),
+      execute: async (
+        args: { threadId: string; limit: number; startingAfter?: string },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        const threadId = validateUuid(args.threadId);
+        if (!threadId) throw new Error("Invalid threadId (must be a UUID)");
+        if (!isFilterSafe(threadId)) {
+          throw new Error("Unsafe threadId filter value");
+        }
+        try {
+          const cap = Math.min(
+            Math.max(1, Math.floor(args.limit)),
+            MAX_LIST_CAP,
+          );
+          const startingAfter = args.startingAfter
+            ? String(args.startingAfter)
+            : undefined;
+          const page = await fetchThreadMessagesPage(
+            cfg,
+            threadId,
+            cap,
+            startingAfter,
+          );
+          const enriched = await enrichThreadMessages(cfg, page.items);
+          // Present oldest->newest by coalesced ts (F15), id as the tiebreaker.
+          enriched.sort((a, b) => {
+            if (a.ts < b.ts) return -1;
+            if (a.ts > b.ts) return 1;
+            return a.view.id < b.view.id ? -1 : a.view.id > b.view.id ? 1 : 0;
+          });
+          const messages = enriched.map((e) => e.view);
+          const retrievedAt = new Date().toISOString();
+          const instanceName = startingAfter
+            ? `thread-${threadId}-${await listInstanceHash({
+              after: startingAfter,
+            })}`
+            : `thread-${threadId}`;
+          const snap: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            threadId,
+            count: messages.length,
+            truncated: page.truncated,
+            hasMore: page.hasMore,
+            incomplete: page.incomplete,
+            stopReason: page.stopReason,
+            messages,
+            retrievedAt,
+          };
+          if (page.nextCursor !== undefined) snap.nextCursor = page.nextCursor;
+          if (page.totalCount !== undefined) snap.totalCount = page.totalCount;
+          const handle = await context.writeResource(
+            "threadDetail",
+            instanceName,
+            snap,
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    threadStatus: {
+      description:
+        "Derive each thread's follow-up state (awaiting-us | sent-unanswered | dormant | empty | unknown) for ONE thread (threadId) OR every thread of a record target (opportunityId | personId | companyId | leadId). Direction is AUTHORITATIVE from messageChannelMessageAssociation.direction joined by messageId (F8) — a message with no association yields direction 'unknown' and the thread state 'unknown' (never a guess). The last message is the true last by coalesced receivedAt/createdAt (F15). OUTGOING last => 'sent-unanswered' until older than dormantDays, then 'dormant'; INCOMING last => 'awaiting-us'. Records a `threadStatus` snapshot. No writes.",
+      arguments: z.object({
+        threadId: z
+          .string()
+          .optional()
+          .describe(
+            "Single messageThread UUID (mutually exclusive with a target)",
+          ),
+        opportunityId: z.string().optional(),
+        personId: z.string().optional(),
+        companyId: z.string().optional(),
+        leadId: z.string().optional(),
+        dormantDays: z
+          .number()
+          .int()
+          .positive()
+          .default(7)
+          .describe(
+            "Outbound-last age (days) beyond which a thread is dormant",
+          ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(30)
+          .describe(
+            `Soft per-call floor (1..${MAX_LIST_CAP}) for the thread page`,
+          ),
+        messageLimit: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_LIST_CAP)
+          .default(60)
+          .describe("Per-thread cap on messages read to find the last message"),
+      }),
+      execute: async (
+        args: {
+          threadId?: string;
+          opportunityId?: string;
+          personId?: string;
+          companyId?: string;
+          leadId?: string;
+          dormantDays: number;
+          limit: number;
+          messageLimit: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const dormantDays = Math.max(1, Math.floor(args.dormantDays));
+          const msgCap = Math.min(
+            Math.max(1, Math.floor(args.messageLimit)),
+            MAX_LIST_CAP,
+          );
+          const hasTarget = [
+            args.opportunityId,
+            args.personId,
+            args.companyId,
+            args.leadId,
+          ].some((v) => v != null && String(v).trim() !== "");
+
+          // Derive one thread's status (validated id only reaches a filter).
+          const statusOf = async (
+            tid: string,
+          ): Promise<Record<string, unknown>> => {
+            // EMAIL-ORD-1: NEWEST-first so the head page carries the true last
+            // message even past msgCap (an ascending read returned the oldest N
+            // and inverted the status verdict).
+            const mp = await fetchThreadRecentMessagesPage(cfg, tid, msgCap);
+            const messageCount = mp.items.length;
+            if (messageCount === 0) {
+              return {
+                threadId: tid,
+                state: "empty",
+                lastDirection: "unknown",
+                messageCount: 0,
+              };
+            }
+            const last = pickLastMessage(mp.items);
+            const lastId = last ? validateUuid(last.id) : null;
+            const lastDirection: MessageDirection = lastId
+              ? await fetchMessageDirection(cfg, lastId)
+              : "unknown";
+            const ts = last ? messageTs(last) : "";
+            let ageDays: number | null = null;
+            const parsed = ts ? Date.parse(ts) : NaN;
+            if (!Number.isNaN(parsed)) {
+              ageDays = (Date.now() - parsed) / 86_400_000;
+            }
+            const state = deriveThreadState(
+              lastDirection,
+              ageDays,
+              dormantDays,
+              messageCount,
+            );
+            const rec: Record<string, unknown> = {
+              threadId: tid,
+              state,
+              lastDirection,
+              messageCount,
+            };
+            if (ts) rec.lastMessageAt = ts;
+            if (ageDays != null) rec.ageDays = Math.round(ageDays * 100) / 100;
+            // EMAIL-ORD-1: the read was capped — the derived state comes from the
+            // newest-first head, but flag the partial read so it is not taken as
+            // an authoritative whole-thread verdict (never silently drop
+            // mp.truncated/hasMore).
+            if (mp.truncated || mp.hasMore) rec.truncated = true;
+            return rec;
+          };
+
+          const retrievedAt = new Date().toISOString();
+
+          if (args.threadId != null && String(args.threadId).trim() !== "") {
+            if (hasTarget) {
+              throw new Error(
+                "Provide either threadId OR a record target, not both",
+              );
+            }
+            const tid = validateUuid(args.threadId);
+            if (!tid) throw new Error("Invalid threadId (must be a UUID)");
+            if (!isFilterSafe(tid)) {
+              throw new Error("Unsafe threadId filter value");
+            }
+            const item = await statusOf(tid);
+            const handle = await context.writeResource(
+              "threadStatus",
+              `thread-status-${tid}`,
+              {
+                baseUrl: cfg.baseUrl,
+                threadId: tid,
+                dormantDays,
+                count: 1,
+                items: [item],
+                retrievedAt,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          // Target set: resolve the target's threads, status each.
+          const resolved = await resolveThreadTarget(cfg, args);
+          const target: Record<string, unknown> = {
+            kind: resolved.kind,
+            found: resolved.found,
+          };
+          if (resolved.id !== undefined) target.id = resolved.id;
+          if (resolved.resolvedKind !== undefined) {
+            target.resolvedKind = resolved.resolvedKind;
+          }
+          if (resolved.resolvedId !== undefined) {
+            target.resolvedId = resolved.resolvedId;
+          }
+          const h = await listInstanceHash({
+            kind: resolved.kind,
+            id: resolved.id ?? null,
+            rid: resolved.resolvedId ?? null,
+          });
+          const instanceName = `thread-status-${h}`;
+
+          const items: Array<Record<string, unknown>> = [];
+          if (resolved.found) {
+            const cap = Math.min(
+              Math.max(1, Math.floor(args.limit)),
+              MAX_LIST_CAP,
+            );
+            const { ids } = await fetchThreadIdsForTarget(cfg, resolved, cap);
+            for (const tid of ids) {
+              if (!isFilterSafe(tid)) continue;
+              items.push(await statusOf(tid));
+            }
+          }
+          const handle = await context.writeResource(
+            "threadStatus",
+            instanceName,
+            {
+              baseUrl: cfg.baseUrl,
+              target,
+              dormantDays,
+              count: items.length,
+              items,
+              retrievedAt,
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    listConnectedAccounts: {
+      description:
+        "Read (USER-token): the send service user's own connected mailboxes via /metadata myConnectedAccounts — the fail-closed brand-pinning source of truth. Mints a per-run USER access token (the API_KEY token is FORBIDDEN here), then records a PII-CONSERVATIVE connectedAccountList snapshot: per account id + provider + handle DOMAIN ONLY (split at '@', local-part discarded) + authFailed/archived booleans. NEVER the full handle. Assumes ONE sending service user owns ALL brand mailboxes (self-scoped; there is no admin list-all). No writes.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        // Hoisted so the catch can scrub the minted token from a captured error.
+        let userToken: string | undefined;
+        try {
+          userToken = await mintUserAccessToken(cfg);
+          const accounts = await fetchConnectedAccounts(cfg, userToken);
+          const retrievedAt = new Date().toISOString();
+          const handle = await context.writeResource(
+            "connectedAccountList",
+            "connected-accounts",
+            {
+              baseUrl: cfg.baseUrl,
+              count: accounts.length,
+              items: accounts,
+              retrievedAt,
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          // TE-1: also mask the send password + minted user token.
+          throw new Error(
+            redactError(e, 300, cfg.apiToken, [
+              cfg.sendUserPassword,
+              userToken,
+            ]),
+          );
+        }
+      },
+    },
+    sendEmail: {
+      description:
+        "Send an email AS a pinned brand via Twenty's native 'Send Email' workflow (runWorkflowVersion) — dry-by-default, confirm-gated, FAIL-CLOSED identity. Resolves exactly ONE connectedAccountId (explicit fromBrand -> per-lineOfBusiness default for opp targets only; F4/F5) and, before sending, re-validates it against the LIVE myConnectedAccounts list AND asserts its account domain equals the brand (F3) — an empty/ambiguous id, unmapped fromBrand, or domain mismatch each REFUSE. Mints a per-run USER access token (F1b). The recipient is validateEmail'd (F11); subject/body are control-char sanitized but UTF-8-PRESERVED (F19). Idempotent via a durable dedup marker keyed on to+connectedAccountId+replyThread+day+subject+body (or a caller dedupKey; F9/F10) — a hit is `skipped`. DEDUP BOUNDARIES (EMAIL-DEDUP-2): the default `day` component is a UTC-CALENDAR-DAY bucket, so a retry that crosses UTC midnight computes a NEW key and MAY re-send (dedup is at-least-once across a midnight boundary); pass an explicit `dedupKey` to pin idempotency across that boundary. Marker semantics are also at-least-once by design — a crash between enqueue and marker-write lets a retry re-send rather than risk a lost mail. Ordering: check-dedup -> send -> record. A live send REQUIRES confirm:true AND dryRun:false; dryRun (default) returns the fully-resolved plan and records NO dedup marker. runWorkflowVersion is fire-and-forget: sendRun records the async workflowRunId, never a sent-message id (F13). The sendRun audit stores JOIN KEYS + connectedAccountId + a hashed recipient + subject/body LENGTHS only — never the raw to/subject/body (F6/F7).",
+      arguments: z.object({
+        opportunityId: z.string().optional().describe(
+          "Opportunity UUID target — at most one of the four targets",
+        ),
+        personId: z.string().optional().describe("Person UUID target"),
+        companyId: z.string().optional().describe("Company UUID target"),
+        leadId: z.string().optional().describe(
+          "Lead marker target (resolved to its opportunity, then person)",
+        ),
+        to: z.string().optional().describe(
+          "Explicit recipient email. Absent => resolve from a Person target's primary email. validateEmail'd either way (F11).",
+        ),
+        subject: z.string().default("").describe(
+          "Email subject (UTF-8 preserved)",
+        ),
+        body: z.string().default("").describe(
+          "Email body, plaintext (UTF-8 preserved)",
+        ),
+        fromBrand: z.string().optional().describe(
+          "Brand DOMAIN to send AS (a key of brandConnectedAccounts). An explicit-but-unmapped value is a HARD REFUSE (F4); only an ABSENT value may consult the per-lineOfBusiness default (opp targets only, F5).",
+        ),
+        inReplyToThreadId: z.string().optional().describe(
+          "Existing messageThread to reply on (threading + dedup component)",
+        ),
+        dedupKey: z.string().optional().describe(
+          "Caller-supplied idempotency key. Absent => computed from to+connectedAccountId+replyThread+UTC-day+subject+body (F9). A deliberate identical resend needs a distinct key.",
+        ),
+        confirm: z.boolean().optional().describe(
+          "Execute the send. A live send requires confirm:true AND dryRun:false.",
+        ),
+        dryRun: z.boolean().optional().describe(
+          "Plan without sending (default true). Returns the fully-resolved plan and records NO dedup marker.",
+        ),
+      }),
+      execute: async (
+        args: {
+          opportunityId?: string;
+          personId?: string;
+          companyId?: string;
+          leadId?: string;
+          to?: string;
+          subject: string;
+          body: string;
+          fromBrand?: string;
+          inReplyToThreadId?: string;
+          dedupKey?: string;
+          confirm?: boolean;
+          dryRun?: boolean;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        // Hoisted so the catch can scrub the minted token from a captured error.
+        let userToken: string | undefined;
+        try {
+          const dryRun = args.dryRun !== false; // default true
+          const confirm = args.confirm === true;
+          if (!dryRun && !confirm) {
+            throw new Error(
+              "A live send requires confirm:true AND dryRun:false (refused)",
+            );
+          }
+          // F14: validate the brand map at (first-send) load, fail-closed.
+          const brandMap = (cfg.brandConnectedAccounts ?? {}) as Record<
+            string,
+            string
+          >;
+          const lobMap = (cfg.lineOfBusinessBrand ?? {}) as Record<
+            string,
+            string
+          >;
+          const mapErr = validateBrandMap(brandMap);
+          if (mapErr) {
+            throw new Error(`brandConnectedAccounts invalid: ${mapErr}`);
+          }
+
+          // Resolve the target (validates ids; leadId -> opp/person). TE-4:
+          // strictLeadId REFUSES an ambiguous (>1) leadId->opportunity match so a
+          // duplicate leadId can never silently pick one opp and drive the
+          // wrong-brand LoB default. Read methods keep the tolerant first-match.
+          const resolved = await resolveThreadTarget(cfg, args, {
+            strictLeadId: true,
+          });
+          if (resolved.kind !== "workspace" && !resolved.found) {
+            throw new Error("Target did not resolve to any record (refused)");
+          }
+          const targetKind = resolved.resolvedKind ?? resolved.kind;
+
+          // F5 default path needs the opp's lineOfBusiness (only when no explicit
+          // fromBrand AND the target is an opportunity).
+          let lineOfBusiness: string | null = null;
+          const fromBrand = (args.fromBrand ?? "").trim();
+          if (
+            !fromBrand && targetKind === "opportunity" && resolved.resolvedId
+          ) {
+            const oj = await twentyRequest(
+              cfg,
+              "GET",
+              `/rest/opportunities/${resolved.resolvedId}`,
+            );
+            const opp = ((oj as { data?: Record<string, unknown> })?.data
+              ?.opportunity as Record<string, unknown> | undefined) ?? {};
+            lineOfBusiness = opp.lineOfBusiness != null
+              ? String(opp.lineOfBusiness)
+              : null;
+          }
+
+          // Fail-closed brand -> connectedAccountId resolution (F3/F4/F5/F14).
+          const br = resolveBrandForSend({
+            fromBrand,
+            targetKind,
+            lineOfBusiness,
+            brandMap,
+            lobMap,
+          });
+          if (!br.ok) throw new Error(br.reason);
+          const { brand, connectedAccountId, source } = br;
+
+          // Resolve + validate the recipient (F11): explicit `to`, else a Person
+          // target's primary email. Attacker-influenced either way => validateEmail.
+          let to = validateEmail(args.to);
+          if (!to && targetKind === "person" && resolved.resolvedId) {
+            const pj = await twentyRequest(
+              cfg,
+              "GET",
+              `/rest/people/${resolved.resolvedId}`,
+            );
+            const person = ((pj as { data?: Record<string, unknown> })?.data
+              ?.person as Record<string, unknown> | undefined) ?? {};
+            const emails = person.emails as Record<string, unknown> | undefined;
+            to = validateEmail(emails?.primaryEmail);
+          }
+          if (!to || !isFilterSafe(to)) {
+            throw new Error(
+              "Could not resolve a valid recipient email (F11 — refused)",
+            );
+          }
+
+          // UTF-8-preserving sanitize (F19): strips control chars/markup, keeps
+          // accented/non-Latin text.
+          const subject = sanitizeText(args.subject, 300);
+          const body = sanitizeText(args.body, 20000);
+
+          // Mint a per-run USER token (F1b), fail-closed on any error.
+          userToken = await mintUserAccessToken(cfg);
+
+          // F3 run-time re-validation: the id must exist LIVE and its domain must
+          // equal the brand — this is what stops the wrong-brand fallback bug.
+          const accounts = await fetchConnectedAccounts(cfg, userToken);
+          const acct = accounts.find((a) => a.id === connectedAccountId);
+          if (!acct) {
+            throw new Error(
+              "Chosen connectedAccountId is not in the live myConnectedAccounts list (F3 — refused)",
+            );
+          }
+          if (acct.domain !== brand) {
+            throw new Error(
+              `Connected account domain does not match brand '${brand}' (F3 domain mismatch — refused)`,
+            );
+          }
+          if (acct.archived || acct.authFailed) {
+            throw new Error(
+              "Chosen connected account is archived or in an auth-failed state (refused)",
+            );
+          }
+
+          // F12: resolve the ACTIVE Send-Email workflow version (never pinned).
+          const workflowVersionId = await resolveActiveWorkflowVersionId(
+            cfg,
+            cfg.sendWorkflowName ?? "Send Email",
+          );
+          if (!workflowVersionId) {
+            throw new Error(
+              `Send-Email workflow '${
+                cfg.sendWorkflowName ?? "Send Email"
+              }' has no active/published version (F12 — refused)`,
+            );
+          }
+
+          // Dedup identity (F9) + PII-safe audit values (F7).
+          const dedupKey = (args.dedupKey ?? "").trim() ||
+            await computeDedupKey({
+              to,
+              connectedAccountId,
+              inReplyToThreadId: args.inReplyToThreadId,
+              subject,
+              body,
+            });
+          const markerId = await sendDedupMarkerId(dedupKey);
+          const toHash = await sha256Hex(to);
+
+          const target: Record<string, unknown> = {
+            kind: resolved.kind,
+            found: resolved.found,
+          };
+          if (resolved.id !== undefined) target.id = resolved.id;
+          if (resolved.resolvedKind !== undefined) {
+            target.resolvedKind = resolved.resolvedKind;
+          }
+          if (resolved.resolvedId !== undefined) {
+            target.resolvedId = resolved.resolvedId;
+          }
+
+          const retrievedAt = new Date().toISOString();
+          const base: Record<string, unknown> = {
+            baseUrl: cfg.baseUrl,
+            target,
+            fromBrand: brand,
+            brandSource: source,
+            connectedAccountId,
+            workflowVersionId,
+            dedupKey: markerId,
+            toHash,
+            subjectLength: subject.length,
+            bodyLength: body.length,
+            at: retrievedAt,
+          };
+          if (targetKind === "person" && resolved.resolvedId) {
+            base.personId = resolved.resolvedId;
+          } else if (targetKind === "opportunity" && resolved.resolvedId) {
+            base.opportunityId = resolved.resolvedId;
+          } else if (targetKind === "company" && resolved.resolvedId) {
+            base.companyId = resolved.resolvedId;
+          }
+
+          const record = async (extra: Record<string, unknown>) => {
+            const h = await listInstanceHash({ markerId, at: retrievedAt });
+            return await context.writeResource("sendRun", `send-${h}`, {
+              ...base,
+              ...extra,
+            });
+          };
+
+          // dryRun (default): fully-resolved plan, NO dedup marker, NO send (F10).
+          if (dryRun) {
+            const handle = await record({
+              status: "planned",
+              dryRun: true,
+              wouldSend: true,
+              sent: false,
+              skipped: false,
+              dedupRecorded: false,
+            });
+            return { dataHandles: [handle] };
+          }
+
+          // Live send. Ordering: check-dedup -> send -> record (F10).
+          const prior = await findPriorSend(cfg, markerId);
+          if (prior) {
+            const handle = await record({
+              status: "skipped",
+              dryRun: false,
+              wouldSend: true,
+              sent: false,
+              skipped: true,
+              dedupRecorded: false,
+            });
+            return { dataHandles: [handle] };
+          }
+
+          const payload: Record<string, unknown> = {
+            connectedAccountId,
+            to,
+            subject,
+            body,
+          };
+          if (args.inReplyToThreadId) {
+            const rt = validateUuid(args.inReplyToThreadId);
+            if (rt) payload.inReplyToThreadId = rt;
+          }
+          const workflowRunId = await runSendWorkflow(
+            cfg,
+            userToken,
+            workflowVersionId,
+            payload,
+          );
+          // Record the durable dedup marker AFTER a successful enqueue. Accepted
+          // crash semantic (F10): a crash between enqueue and marker-write lets a
+          // retry re-send (at-least-once) rather than risk a never-sent lost mail.
+          await writeSendMarker(cfg, markerId);
+          const handle = await record({
+            status: "sent",
+            dryRun: false,
+            wouldSend: true,
+            sent: true,
+            skipped: false,
+            dedupRecorded: true,
+            workflowRunId,
+          });
+          return { dataHandles: [handle] };
+        } catch (e) {
+          // TE-1: also mask the send password + minted user token.
+          throw new Error(
+            redactError(e, 300, cfg.apiToken, [
+              cfg.sendUserPassword,
+              userToken,
+            ]),
+          );
+        }
+      },
+    },
     getNoteBody: {
       description:
         "SR-1 EXCEPTION — reads ONE Note's body (bodyV2.markdown) across the privacy boundary that listNotes/mapNoteView deliberately withhold. confirm:true REQUIRED as an explicit acknowledgement that this crosses the note-body privacy boundary (NOT a mutation gate). noteId must be a UUID. Result is delivered via a SHORT-TTL (3d) noteBodyRead snapshot — read data.latest('noteBodyRead','note-body-<id>').attributes.body; the body is PII-at-rest bounded by that TTL. 404 => found:false. found:true with no markdown (blocknote-only/empty) => bodyMissing:true, no body. Title is emitted verbatim here (the listNotes title guard does not apply to this gated method). Discover the noteId first via listNotes (leadId-tagged) or listNotesByOpportunity.",
@@ -9098,6 +12459,16 @@ export const model = {
           allLeads,
           args.maxBatch,
         );
+        // SHADOW-MODE spam classification: score over the WHOLE corpus (so the
+        // repeat-email / IP-rotation velocity signals see every lead, not just
+        // this capped page), then annotate the processed results below. This
+        // phase only REPORTS - it never quarantines or changes a lead's fate.
+        // Uses the operator-configurable blocklist (same as planLead), not the
+        // hardcoded default (review M3). knownDomains hard-pass stays empty
+        // until the ENFORCE-phase IN/Twenty join wires it (review M1).
+        const spamVerdicts = classifyLead(allLeads, {
+          freemailDomains: cfg.emailDomainBlocklist,
+        });
         context.logger.info(
           "push_leads: {eligible} eligible, processing {n} (cap {cap}), {remaining} remaining{dry}",
           {
@@ -9144,10 +12515,28 @@ export const model = {
           }
         }
 
+        // Attach the shadow-mode spam verdict to each processed lead. Matched by
+        // batch INDEX (results are pushed 1:1 in batch order) against each
+        // lead's OWN validated id - never by the result row's leadId, which for
+        // a failed plan is the "unknown" sentinel and could collide with a real
+        // lead literally id'd "unknown" (review M4). Enriching after the write
+        // loop keeps the three results.push sites untouched and makes it
+        // unmistakable that the score never gated a lead this phase.
+        batch.forEach((lead, i) => {
+          const vid = validateLeadId(lead.id);
+          const v = vid ? spamVerdicts.get(vid) : undefined;
+          if (v && results[i]) {
+            results[i].spamScore = v.score;
+            results[i].spamReasons = v.reasons;
+            results[i].spamFlagged = v.flagged;
+          }
+        });
+
         const synced = results.filter((r) => r.status === "synced").length;
         const skipped = results.filter((r) => r.status === "skipped").length;
         const failed = results.filter((r) => r.status === "failed").length;
         const emergencies = results.filter((r) => r.emergency).length;
+        const spamFlagged = results.filter((r) => r.spamFlagged).length;
 
         const handle = await context.writeResource("pushRun", "pushRun", {
           baseUrl: cfg.baseUrl,
@@ -9165,17 +12554,28 @@ export const model = {
             emergencies,
             kvParsed: fromKv.length,
             kvUnparseable,
+            spamFlagged,
             perLead: results.map((r) => ({
               leadId: r.leadId,
               action: r.action,
               status: r.status,
               emergency: r.emergency,
+              // Shadow spam annotation surfaced in the audit summary too, not
+              // just results[] (design section 5 "reports score + reasons per
+              // lead"; review L2).
+              ...(r.spamFlagged !== undefined
+                ? {
+                  spamScore: r.spamScore,
+                  spamReasons: r.spamReasons,
+                  spamFlagged: r.spamFlagged,
+                }
+                : {}),
             })),
           },
         });
         context.logger.info(
-          "push_leads done: {synced} synced, {skipped} skipped, {failed} failed, {emergencies} emergencies",
-          { synced, skipped, failed, emergencies },
+          "push_leads done: {synced} synced, {skipped} skipped, {failed} failed, {emergencies} emergencies, {spamFlagged} spam-flagged [shadow]",
+          { synced, skipped, failed, emergencies, spamFlagged },
         );
         return { dataHandles: [handle] };
       },
@@ -10459,6 +13859,373 @@ export const model = {
           return { dataHandles: [handle] };
         } catch (e) {
           throw new Error(redactError(e));
+        }
+      },
+    },
+    upsertCompany: {
+      description:
+        "Idempotent, confirm-gated, dryRun-DEFAULT Company writer (TWENTY-COMPANY-UPSERT). Match precedence id -> domain -> name. DOMAIN dedup is client-side after canonicalizing BOTH sides (normalizeDomainHost PLUS a leading-www strip), so acme.com matches a stored https://www.acme.com; CREATE happens ONLY when a domain is supplied AND the broad host fetch returns ZERO candidates — a near-candidate yields planned-conflict (never a duplicate)," +
+        " an unmatched explicit id aborts, and a name-only miss aborts (no stable key). NAME fallback is best-effort and canonicalized; a real API error aborts (never falls through to create). A domain-hit whose stored name materially differs is a conflict (no silent rename). Updates are non-destructive (provided fields only, composites merged, never nulled); an unchanged re-run is a noop. accountOwnerEmail resolves to an opaque" +
+        " workspaceMemberId (the email never enters the snapshot/logs/errors); an unresolved owner aborts. customFields are fail-closed (reserved/unknown/non-scalar/bad-SELECT rejected at plan time via metadata). confirm:true required for a real run; dryRun defaults true and plans without writing. Snapshots a `companyUpsert` resource.",
+      arguments: z.object({
+        matchBy: z
+          .enum(["id", "domain", "name", "auto"])
+          .default("auto")
+          .describe(
+            "Match strategy. auto = id -> domain -> name precedence; or pin one.",
+          ),
+        id: z
+          .string()
+          .optional()
+          .describe(
+            "Explicit company UUID. When set (or matchBy=id) an unmatched id ABORTS (never creates).",
+          ),
+        name: z.string().describe("Company name (required)"),
+        domain: z
+          .string()
+          .optional()
+          .describe(
+            "Company domain — the preferred dedup/create key, canonicalized to a bare registrable host (www stripped). Required to CREATE.",
+          ),
+        legalName: z.string().optional().describe("Legal entity name"),
+        addressCity: z.string().optional(),
+        addressState: z.string().optional(),
+        addressCountry: z.string().optional(),
+        addressStreet1: z.string().optional(),
+        addressStreet2: z.string().optional(),
+        addressPostcode: z.string().optional(),
+        employees: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe("Headcount (non-negative integer)"),
+        linkedinUrl: z.string().optional().describe("LinkedIn profile URL"),
+        xUrl: z.string().optional().describe("X / Twitter profile URL"),
+        idealCustomerProfile: z
+          .boolean()
+          .optional()
+          .describe("ICP flag"),
+        accountOwnerEmail: z
+          .string()
+          .optional()
+          .describe(
+            "Resolve to an existing workspace member (by userEmail) and set accountOwnerId. The email is never stored/logged; an unresolved owner aborts.",
+          ),
+        customFields: z
+          .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+          .optional()
+          .describe(
+            "Generic scalar escape hatch for Company custom fields without a typed argument. Fail-closed: keys must exist + be scalar; reserved keys (every typed-arg field + composite owners + system fields) and composite/unknown types are rejected pre-write; SELECT values are live-enum validated; empty string => unset; null forbidden.",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true for a real run (writes to Twenty)"),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe("Resolve + plan, but write nothing (defaults TRUE)"),
+      }),
+      execute: async (
+        args: CompanyUpsertInput & { confirm: boolean; dryRun: boolean },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to write without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        try {
+          const loadMeta = makeCompanyMetaLoader(cfg);
+          const loadMembers = makeMembersLoader(cfg);
+          const result = await upsertCompanyCore(
+            cfg,
+            args,
+            args.dryRun,
+            loadMeta,
+            loadMembers,
+          );
+          context.logger.info(
+            "upsertCompany: {action} (company {company}){dry}",
+            {
+              action: result.action,
+              company: result.id || "-",
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+          const instanceName = result.id
+            ? `company-upsert-${result.id}`
+            : `company-upsert-${await listInstanceHash({
+              name: result.name,
+              domain: result.domain ?? null,
+            })}`;
+          const handle = await context.writeResource(
+            "companyUpsert",
+            instanceName,
+            {
+              baseUrl: cfg.baseUrl,
+              dryRun: args.dryRun,
+              ...result,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          // Scrub the token AND the account-owner email so neither can leak into
+          // a durable method-summary report even if Twenty echoes it (SEC-5/SEC-8).
+          throw new Error(
+            redactError(e, 300, cfg.apiToken, [args.accountOwnerEmail]),
+          );
+        }
+      },
+    },
+    reconcileCompanies: {
+      description:
+        "Declarative Company reconcile fan-out (TWENTY-COMPANY-UPSERT Section 2a, repo rule 6): take a desired-state LIST of company entries (authored as tracked YAML, wired in by the caller — the extension has no filesystem primitive) and upsert each in ONE execution. id-first match per entry; PER-ENTRY ISOLATION (one bad row is recorded redacted and never aborts the batch); a full per-entry plan under the default dryRun; confirm gates the" +
+        " whole batch. NO reconcile-delete (YAML-absent companies are never archived). A MANDATORY per-run entry cap (default 100) refuses an over-cap batch unless maxEntries is explicitly raised (never uncapped). A clean re-run converges to every entry action==noop. Snapshots a scoped `companyReconcile` audit.",
+      arguments: z.object({
+        entries: z
+          .array(
+            z.object({
+              matchBy: z.enum(["id", "domain", "name", "auto"]).optional(),
+              id: z.string().optional(),
+              name: z.string(),
+              domain: z.string().optional(),
+              legalName: z.string().optional(),
+              addressCity: z.string().optional(),
+              addressState: z.string().optional(),
+              addressCountry: z.string().optional(),
+              addressStreet1: z.string().optional(),
+              addressStreet2: z.string().optional(),
+              addressPostcode: z.string().optional(),
+              employees: z.number().int().nonnegative().optional(),
+              linkedinUrl: z.string().optional(),
+              xUrl: z.string().optional(),
+              idealCustomerProfile: z.boolean().optional(),
+              accountOwnerEmail: z.string().optional(),
+              customFields: z
+                .record(
+                  z.string(),
+                  z.union([z.string(), z.number(), z.boolean()]),
+                )
+                .optional(),
+            }),
+          )
+          .default([])
+          .describe("Desired-state company list (from the tracked YAML)"),
+        source: z
+          .string()
+          .default("crm/companies.yaml")
+          .describe(
+            "Provenance label recorded in the audit (not read as a file)",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to actually write the batch"),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe("Plan every entry, write nothing (defaults TRUE)"),
+        maxEntries: z
+          .number()
+          .int()
+          .positive()
+          .max(1000)
+          .default(100)
+          .describe(
+            "Per-run entry cap. A batch larger than this is refused — raise it explicitly to override (never uncapped by default).",
+          ),
+      }),
+      execute: async (
+        args: {
+          entries: CompanyUpsertInput[];
+          source: string;
+          confirm: boolean;
+          dryRun: boolean;
+          maxEntries: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to reconcile without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        try {
+          const entries = args.entries ?? [];
+          if (entries.length > args.maxEntries) {
+            throw new Error(
+              `Desired-state list has ${entries.length} entries, over the cap of ${args.maxEntries}; raise maxEntries explicitly to process more (refusing an uncapped batch)`,
+            );
+          }
+          const loadMeta = makeCompanyMetaLoader(cfg);
+          const loadMembers = makeMembersLoader(cfg);
+          const out: Array<Record<string, unknown>> = [];
+          const counts: Record<string, number> = {};
+          // An empty batch is trivially converged; any non-noop entry flips it false.
+          let converged = true;
+          for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            try {
+              const result = await upsertCompanyCore(
+                cfg,
+                entry,
+                args.dryRun,
+                loadMeta,
+                loadMembers,
+              );
+              counts[result.action] = (counts[result.action] ?? 0) + 1;
+              if (result.action !== "noop") converged = false;
+              out.push({
+                index: i,
+                name: result.name,
+                ...(result.domain ? { domain: result.domain } : {}),
+                ok: true,
+                action: result.action,
+                found: result.found,
+                ...(result.id ? { id: result.id } : {}),
+                ...(result.matchedVia ? { matchedVia: result.matchedVia } : {}),
+                fieldsSet: result.fieldsSet,
+                ...(result.candidates ? { candidates: result.candidates } : {}),
+              });
+            } catch (e) {
+              // PER-ENTRY ISOLATION: one bad row never aborts the batch.
+              counts.error = (counts.error ?? 0) + 1;
+              converged = false;
+              out.push({
+                index: i,
+                ...(entry?.name ? { name: sanitizeText(entry.name, 200) } : {}),
+                ...(entry?.domain
+                  ? { domain: canonicalCompanyHost(entry.domain) ?? undefined }
+                  : {}),
+                ok: false,
+                error: redactError(e, 300, cfg.apiToken, [
+                  entry?.accountOwnerEmail,
+                ]),
+              });
+            }
+          }
+          context.logger.info(
+            "reconcileCompanies: {processed}/{total} processed, converged={converged}{dry}",
+            {
+              processed: out.length,
+              total: entries.length,
+              converged,
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+          const handle = await context.writeResource(
+            "companyReconcile",
+            `company-reconcile-${await listInstanceHash({
+              source: args.source,
+              n: entries.length,
+            })}`,
+            {
+              baseUrl: cfg.baseUrl,
+              source: args.source,
+              dryRun: args.dryRun,
+              total: entries.length,
+              processed: out.length,
+              cap: args.maxEntries,
+              counts,
+              converged,
+              entries: out,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          // SEC-8 parity with upsertCompany/exportCompanies: scrub the token so it
+          // can never leak into a durable method-summary report on a hard error.
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    exportCompanies: {
+      description:
+        "Back-sync READ (TWENTY-COMPANY-UPSERT Section 2a): page through ALL companies and emit a scoped `companyList` DATA resource carrying {id, name, domain, legalName} WITH the Twenty id per entry — the seed for authoring the tracked crm/companies.yaml so reconcileCompanies can round-trip survivors by id. Account-owner emails and every person-linked field are SCRUBBED (id/name/domain/legalName only). The resource is short-TTL (3d) + tightly" +
+        " GC'd, not infinite-cached. Read-only; writes nothing to Twenty and nothing to the repo (YAML authoring is a separate reviewed operator step).",
+      arguments: z.object({
+        maxCompanies: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .default(1000)
+          .describe("Safety cap on how many companies to export this run"),
+      }),
+      execute: async (
+        args: { maxCompanies: number },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        try {
+          const items: Array<Record<string, unknown>> = [];
+          const seen = new Set<string>();
+          let cursor: string | undefined;
+          let truncated = false;
+          // Loop the shared bounded paginator until Twenty runs out of pages or
+          // we hit the export cap (whichever first).
+          for (let call = 0; call < 200; call++) {
+            const page = await listFiltered(
+              cfg,
+              "companies",
+              [],
+              MAX_LIST_CAP,
+              LIST_ORDER,
+              cursor,
+            );
+            for (const rec of page.items) {
+              const id = String(rec.id ?? "");
+              if (!id || seen.has(id)) continue;
+              if (items.length >= args.maxCompanies) {
+                truncated = true;
+                break;
+              }
+              seen.add(id);
+              const item: Record<string, unknown> = {
+                id,
+                name: String(rec.name ?? ""),
+              };
+              // SCRUB: only id/name/domain/legalName are emitted — no accountOwner
+              // email, no people/contacts, no custom PII-bearing fields.
+              const host = canonicalCompanyHost(
+                (rec.domainName as { primaryLinkUrl?: unknown } | undefined)
+                  ?.primaryLinkUrl,
+              );
+              if (host) item.domain = host;
+              if (rec.legalName != null && rec.legalName !== "") {
+                item.legalName = String(rec.legalName);
+              }
+              items.push(item);
+            }
+            if (truncated || !page.hasMore || page.nextCursor === undefined) {
+              break;
+            }
+            cursor = page.nextCursor;
+          }
+          const handle = await context.writeResource(
+            "companyList",
+            "companies-export",
+            {
+              baseUrl: cfg.baseUrl,
+              count: items.length,
+              truncated,
+              hasMore: false,
+              incomplete: false,
+              stopReason: truncated ? "cap-reached" : "complete",
+              filter: {},
+              items,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },
     },
