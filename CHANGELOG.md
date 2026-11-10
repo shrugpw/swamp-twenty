@@ -3,6 +3,36 @@
 All notable changes to `@shrug/twenty`. Versions are CalVer
 (`YYYY.MM.DD.micro`).
 
+## 2026.11.10.1
+
+### Added -- declarative Person write fan-out (`TWENTY-PERSON-UPSERT`)
+
+- **`upsertPersonCore`** -- the shared single-person find-or-create primitive
+  with field-diff / noop detection, mirroring `upsertCompanyCore`. Keyed on
+  `primaryEmail`: a match with no changed field returns `action:"noop"` and
+  issues NO PATCH; a match with changes PATCHes ONLY the changed provided fields
+  (never clobbering an unset field, never nulling a partial-name subfield); a
+  miss creates. Never stamps a `leadId`. An optional company link is deduped by
+  domain then exact name and created only when a domain is supplied.
+- **`upsertPerson` rewired** onto `upsertPersonCore`. Behaviour change: an
+  unchanged re-run now returns `noop` and no longer issues an unconditional
+  PATCH. The `personUpsert` action enum gains `noop`.
+- **`reconcilePeople`** -- a declarative fan-out over a desired-state person list
+  (authored as tracked YAML, wired in by the caller), upserting each entry via
+  `upsertPersonCore` in one execution. `primaryEmail`-first match; **per-entry
+  isolation** (one bad row is recorded as its `index` + a **redacted error
+  only** -- never the person name or `primaryEmail` -- and never aborts the
+  batch); a full per-entry plan under the default `dryRun`; `confirm` gates the
+  whole batch; a **mandatory per-run entry cap** (default 100) refuses an
+  over-cap batch unless `maxEntries` is explicitly raised; **no reconcile-delete**
+  (YAML-absent people are never archived); a clean re-run converges to every
+  entry `action:"noop"`.
+- **`peopleReconcile`** snapshot -- a scoped audit of a `reconcilePeople` run:
+  per-entry `index` + `action` + which fields were set + opaque
+  `personId`/`companyId`, action tallies (incl. `noop`), the entry cap in
+  effect, `converged`, and redacted per-entry errors only. **No raw PII** (no
+  person name, no `primaryEmail`).
+
 ## 2026.09.19.1
 
 ### Added -- reconciling opportunity view UPSERT (`TWENTY-VIEW-UPSERT`)

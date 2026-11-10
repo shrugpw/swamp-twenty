@@ -610,8 +610,17 @@ export function redactError(
   moreSecrets?: Array<string | undefined | null>,
 ): string {
   let s = raw instanceof Error ? raw.message : String(raw ?? "");
+  // Scrub each explicitly-provided secret down to length >= 2. These are values
+  // the caller has deliberately named as must-not-leak (apiToken, send password,
+  // minted user token, submitted email, submitted person name tokens). The >= 2
+  // floor (rather than >= 4) exists so a SHORT real name echoed in a Twenty 4xx
+  // — "Ed", "Li", "Eli", "Ann" are all real submitted names — is still redacted
+  // out of the durable audit; only 1-char tokens are skipped (too generic to
+  // scrub without wrecking the message). The generic bearer/filter/email/digit
+  // scrubbers below are unaffected. Minor cosmetic over-redaction of an
+  // incidental 2-char substring is the accepted trade for not leaking PII.
   for (const sec of [token, ...(moreSecrets ?? [])]) {
-    if (sec && sec.length >= 4) s = s.split(sec).join("[redacted]");
+    if (sec && sec.length >= 2) s = s.split(sec).join("[redacted]");
   }
   s = s
     .replace(BEARER_RE, "Bearer [redacted]")
@@ -1383,17 +1392,6 @@ function buildPersonBody(f: PersonWriteFields): Record<string, unknown> {
   if (f.city !== undefined) body.city = f.city;
   if (f.companyId) body.companyId = f.companyId;
   return body;
-}
-
-/** The Person field names actually being written (for the upsert snapshot). */
-function personFieldsSet(f: PersonWriteFields): string[] {
-  const s: string[] = [];
-  if (f.name !== undefined) s.push("name");
-  if (f.phone) s.push("phone");
-  if (f.jobTitle !== undefined) s.push("jobTitle");
-  if (f.city !== undefined) s.push("city");
-  if (f.companyId) s.push("company");
-  return s;
 }
 
 /**
@@ -7104,9 +7102,17 @@ const RelationEnsuredSchema = z.object({
 // Carries NO raw PII (no email/name/phone) — only the id, which fields were
 // set, and the company link — matching opportunityUpsert's posture.
 
-const PersonUpsertSchema = z.object({
+const PERSON_UPSERT_ACTIONS = [
+  "created",
+  "updated",
+  "noop",
+  "planned-create",
+  "planned-update",
+] as const;
+
+export const PersonUpsertSchema = z.object({
   baseUrl: z.string(),
-  action: z.enum(["created", "updated", "planned-create", "planned-update"]),
+  action: z.enum(PERSON_UPSERT_ACTIONS),
   dryRun: z.boolean(),
   personId: z.string().optional(),
   fieldsSet: z
@@ -7120,6 +7126,50 @@ const PersonUpsertSchema = z.object({
     .string()
     .optional()
     .describe("Why a company was not linked (degraded path), if applicable"),
+  retrievedAt: z.iso.datetime(),
+});
+
+// --- Person reconcile snapshot (TWENTY-PERSON-UPSERT) -----------------------
+// Per-entry audit for the reconcilePeople fan-out. Carries NO raw PII: index,
+// action, which fields were set, the opaque personId/companyId, and a REDACTED
+// per-entry error ONLY - never the person name or primaryEmail (deliberately
+// unlike companyReconcile, which echoes company name/domain; a Person entry
+// carries raw PII, so it is dropped).
+const PersonReconcileEntrySchema = z.object({
+  index: z.number().int().describe(
+    "0-based position in the desired-state list",
+  ),
+  ok: z.boolean().describe("False when this entry errored (isolated)"),
+  action: z.enum(PERSON_UPSERT_ACTIONS).optional(),
+  found: z.boolean().optional(),
+  personId: z.string().optional(),
+  fieldsSet: z.array(z.string()).optional(),
+  companyId: z.string().optional(),
+  companyLinked: z.boolean().optional(),
+  error: z
+    .string()
+    .optional()
+    .describe(
+      "Redacted per-entry error (one bad row never aborts the batch; no name/email)",
+    ),
+});
+
+export const PersonReconcileSchema = z.object({
+  baseUrl: z.string(),
+  source: z.string().describe("Provenance label for the desired-state list"),
+  dryRun: z.boolean(),
+  total: z.number().int().describe("Entries in the desired-state list"),
+  processed: z.number().int(),
+  cap: z.number().int().describe("Per-run entry cap in effect"),
+  counts: z
+    .record(z.string(), z.number())
+    .describe(
+      "Tally of actions (incl. noop) + errors across processed entries",
+    ),
+  converged: z
+    .boolean()
+    .describe("True when every processed entry is action==noop (clean re-run)"),
+  entries: z.array(PersonReconcileEntrySchema),
   retrievedAt: z.iso.datetime(),
 });
 
@@ -8176,11 +8226,320 @@ async function upsertCompanyCore(
   };
 }
 
+// --- Person upsert core (TWENTY-PERSON-UPSERT) -----------------------------
+
+/** The typed inputs upsertPerson/reconcilePeople accept per person. */
+export interface PersonUpsertInput {
+  primaryEmail: string;
+  firstName?: string;
+  lastName?: string;
+  // Full name; split into first/last when firstName/lastName are omitted.
+  name?: string;
+  phone?: string;
+  jobTitle?: string;
+  city?: string;
+  companyDomain?: string;
+  companyName?: string;
+}
+
+type PersonAction = (typeof PERSON_UPSERT_ACTIONS)[number];
+
+export interface PersonUpsertResult {
+  found: boolean;
+  action: PersonAction;
+  personId?: string;
+  fieldsSet: string[];
+  companyId?: string;
+  companyLinked: boolean;
+  companyNote?: string;
+}
+
+/** The normalized desired-state used to diff a Person write (post-sanitize). */
+interface PersonDesired {
+  nameProvided: boolean;
+  providedFirst?: string;
+  providedLast?: string;
+  phone?: string; // normalized; falsy => leave unchanged
+  jobTitle?: string; // undefined => not provided (empty is treated as unset)
+  city?: string; // undefined => not provided
+  companyId?: string; // undefined => no company resolved
+}
+
+/**
+ * Assemble a non-destructive Person write body + the list of fields it sets. On
+ * CREATE (existing null) the name is always written (empty where unset) plus
+ * every provided field. On UPDATE a field is written ONLY when it differs from
+ * the stored value (so a re-run with the same inputs is a true noop); the name
+ * is MERGED so a partial {firstName|lastName} - or a single-token `name` whose
+ * split half is empty - never nulls the other subfield (PU-2). Mirrors
+ * {@link buildCompanyWrite}.
+ */
+function buildPersonWrite(
+  existing: Record<string, unknown> | null,
+  d: PersonDesired,
+): { fields: PersonWriteFields; fieldsSet: string[] } {
+  const create = !existing;
+  const fields: PersonWriteFields = {};
+  const fieldsSet: string[] = [];
+
+  // name - always written on create; merged + diffed on update (PU-2).
+  if (create) {
+    fields.name = {
+      firstName: d.providedFirst ?? "",
+      lastName: d.providedLast ?? "",
+    };
+    fieldsSet.push("name");
+  } else if (d.nameProvided) {
+    const en =
+      (existing!.name as { firstName?: unknown; lastName?: unknown }) ?? {};
+    const curFirst = String(en.firstName ?? "");
+    const curLast = String(en.lastName ?? "");
+    // Merge: an EMPTY provided half falls back to existing so a single-token
+    // name never nulls the other subfield. Use `||`, not `??` - the empty
+    // string is exactly the case we must fall back to existing on.
+    const merged = {
+      firstName: d.providedFirst || curFirst,
+      lastName: d.providedLast || curLast,
+    };
+    if (merged.firstName !== curFirst || merged.lastName !== curLast) {
+      fields.name = merged;
+      fieldsSet.push("name");
+    }
+  }
+
+  // phone - write only when provided AND changed.
+  if (d.phone) {
+    const cur = String(
+      (existing?.phones as { primaryPhoneNumber?: unknown } | undefined)
+        ?.primaryPhoneNumber ?? "",
+    );
+    if (create || cur !== d.phone) {
+      fields.phone = d.phone;
+      fieldsSet.push("phone");
+    }
+  }
+
+  // jobTitle / city scalars - write only when provided AND changed.
+  if (d.jobTitle !== undefined) {
+    if (create || String(existing?.jobTitle ?? "") !== d.jobTitle) {
+      fields.jobTitle = d.jobTitle;
+      fieldsSet.push("jobTitle");
+    }
+  }
+  if (d.city !== undefined) {
+    if (create || String(existing?.city ?? "") !== d.city) {
+      fields.city = d.city;
+      fieldsSet.push("city");
+    }
+  }
+
+  // company link - write only when a company resolved AND it differs. Read the
+  // FK flat (`companyId`) OR nested (`company.id`), like buildCompanyWrite's
+  // accountOwner, so a re-run with the same company is a true noop.
+  if (d.companyId) {
+    const cur = String(
+      existing?.companyId ??
+        (existing?.company as { id?: unknown } | undefined)?.id ??
+        "",
+    );
+    if (create || cur !== d.companyId) {
+      fields.companyId = d.companyId;
+      fieldsSet.push("company");
+    }
+  }
+
+  return { fields, fieldsSet };
+}
+
+/**
+ * The idempotent single-person upsert primitive shared by the upsertPerson
+ * method and the reconcilePeople fan-out. Does all I/O via `cfg`; writes NO
+ * resource (callers snapshot the returned {@link PersonUpsertResult}). Keyed on
+ * primaryEmail: on a match with NO changed field returns action='noop' and
+ * issues NO PATCH; on a match WITH changes PATCHes ONLY the changed provided
+ * fields (never clobbering an unset field, never nulling a partial-name
+ * subfield); on a miss creates. NEVER stamps a leadId (curated contacts stay
+ * out of the lead namespace). An optional company link is deduped by domain
+ * then exact name and created ONLY when a domain is supplied. `dryRun` plans
+ * only. Mirrors {@link upsertCompanyCore}.
+ */
+async function upsertPersonCore(
+  cfg: TwentyCfg,
+  input: PersonUpsertInput,
+  dryRun: boolean,
+): Promise<PersonUpsertResult> {
+  const email = validateEmail(input.primaryEmail);
+  if (!email) throw new Error("Invalid email");
+
+  // Resolve the provided name parts. A single `name` splits into first/last;
+  // explicit firstName/lastName win. `nameProvided` gates whether an update
+  // touches the name at all (PU-2).
+  let providedFirst: string | undefined;
+  let providedLast: string | undefined;
+  if (input.name != null && String(input.name).trim()) {
+    const sp = splitName(input.name);
+    providedFirst = sp.firstName;
+    providedLast = sp.lastName;
+  } else {
+    if (input.firstName != null) {
+      providedFirst = sanitizeText(input.firstName, 120);
+    }
+    if (input.lastName != null) {
+      providedLast = sanitizeText(input.lastName, 120);
+    }
+  }
+  const nameProvided = providedFirst !== undefined ||
+    providedLast !== undefined;
+
+  // Non-name fields, included only when actually provided + non-empty.
+  const phone = input.phone != null ? normalizePhone(input.phone) : "";
+  const jobTitle = input.jobTitle != null
+    ? (sanitizeText(input.jobTitle, 120) || undefined)
+    : undefined;
+  const city = input.city != null
+    ? (sanitizeText(input.city, 120) || undefined)
+    : undefined;
+
+  // Company (optional): dedup by domain, else exact filter-safe name. Create
+  // ONLY when a domain is supplied; a name-only miss is left unlinked
+  // (recorded), mirroring upsertOpportunity to avoid duplicates.
+  let companyId: string | undefined;
+  let companyNote: string | undefined;
+  const companyName = sanitizeText(input.companyName, 120);
+  const companyDomain = validateDomain(input.companyDomain) ?? undefined;
+  if (companyDomain || companyName) {
+    let existingCo: Record<string, unknown> | null = null;
+    if (companyDomain) {
+      existingCo = await findOneCompanyByDomain(cfg, companyDomain);
+    }
+    if (!existingCo && companyName && isFilterSafe(companyName)) {
+      existingCo = await findOneCompanyByName(cfg, companyName);
+    }
+    if (existingCo) {
+      companyId = String(existingCo.id ?? "");
+    } else if (companyDomain && !dryRun) {
+      const co = await createCompany(cfg, {
+        name: companyName || companyDomain,
+        domain: companyDomain,
+      });
+      companyId = String(co.id ?? "");
+    } else if (!companyDomain) {
+      companyNote = companyName && !isFilterSafe(companyName)
+        ? "company not linked: name has filter-unsafe characters and no domain to dedup by"
+        : "company not linked: name-only with no domain match (not blind-created to avoid duplicates)";
+    }
+  }
+
+  const companyLinked = Boolean(companyId);
+  const desired: PersonDesired = {
+    nameProvided,
+    providedFirst,
+    providedLast,
+    ...(phone ? { phone } : {}),
+    ...(jobTitle !== undefined ? { jobTitle } : {}),
+    ...(city !== undefined ? { city } : {}),
+    ...(companyId ? { companyId } : {}),
+  };
+
+  // Idempotency lookup - decides create vs update/noop.
+  const existingPerson = await findOnePersonByEmail(cfg, email);
+
+  // --- CREATE ---------------------------------------------------------------
+  if (!existingPerson) {
+    const { fields, fieldsSet } = buildPersonWrite(null, desired);
+    if (dryRun) {
+      return {
+        found: false,
+        action: "planned-create",
+        fieldsSet,
+        ...(companyId ? { companyId } : {}),
+        companyLinked,
+        ...(companyNote ? { companyNote } : {}),
+      };
+    }
+    try {
+      const created = await createPersonCurated(cfg, email, fields);
+      const personId = String(created.record.id ?? "");
+      const setFields = fieldsSet.filter(
+        (k) => !(created.phoneDropped && k === "phone"),
+      );
+      return {
+        found: false,
+        action: "created",
+        ...(personId ? { personId } : {}),
+        fieldsSet: setFields,
+        ...(companyId ? { companyId } : {}),
+        companyLinked,
+        ...(companyNote ? { companyNote } : {}),
+      };
+    } catch (e) {
+      // PU-1: a concurrent run may have created this email between our lookup
+      // and POST - converge onto it instead of duplicating.
+      const raced = await findOnePersonByEmail(cfg, email);
+      if (!raced) throw e;
+      const personId = String(raced.id ?? "");
+      const { fields: uf, fieldsSet: us } = buildPersonWrite(raced, desired);
+      let phoneDropped = false;
+      if (us.length) {
+        const res = await updatePerson(cfg, personId, uf);
+        phoneDropped = res.phoneDropped;
+      }
+      const setFields = us.filter((k) => !(phoneDropped && k === "phone"));
+      return {
+        found: true,
+        action: us.length ? "updated" : "noop",
+        ...(personId ? { personId } : {}),
+        fieldsSet: setFields,
+        ...(companyId ? { companyId } : {}),
+        companyLinked,
+        ...(companyNote ? { companyNote } : {}),
+      };
+    }
+  }
+
+  // --- UPDATE / NOOP --------------------------------------------------------
+  const personId = String(existingPerson.id ?? "");
+  const { fields, fieldsSet } = buildPersonWrite(existingPerson, desired);
+  if (fieldsSet.length === 0) {
+    return {
+      found: true,
+      action: "noop",
+      ...(personId ? { personId } : {}),
+      fieldsSet: [],
+      ...(companyId ? { companyId } : {}),
+      companyLinked,
+      ...(companyNote ? { companyNote } : {}),
+    };
+  }
+  if (dryRun) {
+    return {
+      found: true,
+      action: "planned-update",
+      ...(personId ? { personId } : {}),
+      fieldsSet,
+      ...(companyId ? { companyId } : {}),
+      companyLinked,
+      ...(companyNote ? { companyNote } : {}),
+    };
+  }
+  const res = await updatePerson(cfg, personId, fields);
+  const setFields = fieldsSet.filter((k) => !(res.phoneDropped && k === "phone"));
+  return {
+    found: true,
+    action: "updated",
+    ...(personId ? { personId } : {}),
+    fieldsSet: setFields,
+    ...(companyId ? { companyId } : {}),
+    companyLinked,
+    ...(companyNote ? { companyNote } : {}),
+  };
+}
+
 // --- Model ------------------------------------------------------------------
 
 export const model = {
   type: "@shrug/twenty",
-  version: "2026.11.07.1",
+  version: "2026.11.10.1",
   description:
     "Drive a Twenty CRM instance over REST v1: People/Companies/Opportunities/Notes CRUD, leadId/email/domain idempotency finders, schema introspection, custom-field provisioning, and the push_leads fan-out that ingests contact-form leads (validate + sanitize + dedup + non-destructive reuse + always-Note + independent emergency path). Mutations are confirm-gated, support dryRun, and run a live reachability pre-flight.",
   globalArguments: GlobalArgsSchema,
@@ -8342,6 +8701,14 @@ export const model = {
       description:
         "Add the curated Company write surface (TWENTY-COMPANY-UPSERT): upsertCompany (idempotent, dryRun-DEFAULT, confirm-gated; id->domain->name match with www/registrable-host canonical dedup and a zero-candidate create-guard; non-destructive composite-merge updates; fail-closed customFields; accountOwnerEmail->opaque workspaceMemberId with the email kept out of the snapshot), reconcileCompanies (declarative fan-out over a desired-state list" +
         " with per-entry isolation, a mandatory entry cap, no reconcile-delete, and noop convergence), and exportCompanies (scrubbed id/name/domain/legalName back-sync). Adds the companyUpsert + companyReconcile resources and an optional legalName on the company view; reuses the existing companyList resource for the export. globalArguments is unchanged, so this is a no-op attribute migration.",
+      upgradeAttributes: (
+        old: Record<string, unknown>,
+      ): Record<string, unknown> => old,
+    },
+    {
+      toVersion: "2026.11.10.1",
+      description:
+        "Add the declarative Person write fan-out (TWENTY-PERSON-UPSERT): upsertPersonCore (the shared single-person find-or-create primitive with field-diff/noop detection - reused by upsertPerson, which now returns noop on an unchanged re-run and no longer issues an unconditional PATCH), reconcilePeople (declarative fan-out over a desired-state person list with primaryEmail-first match, per-entry isolation that records a redacted error + index ONLY - never the person name or primaryEmail, a mandatory entry cap, no reconcile-delete, and noop convergence), and the scoped peopleReconcile audit snapshot (no raw PII). Widens the personUpsert action enum to include noop. globalArguments is unchanged, so this is a no-op attribute migration.",
       upgradeAttributes: (
         old: Record<string, unknown>,
       ): Record<string, unknown> => old,
@@ -8570,6 +8937,13 @@ export const model = {
       description:
         "Audit of a reconcileCompanies fan-out: per-entry plan/outcome (isolated; one bad row never aborts), action tallies, the entry cap in effect, and whether the batch converged to all-noop. No raw PII (company id/name/domain + redacted per-entry errors).",
       schema: CompanyReconcileSchema,
+      lifetime: "3d",
+      garbageCollection: 25,
+    },
+    "peopleReconcile": {
+      description:
+        "Audit of a reconcilePeople fan-out: per-entry plan/outcome (isolated; one bad row never aborts), action tallies (incl. noop), the entry cap in effect, and whether the batch converged to all-noop. NO raw PII - index + action + fieldsSet + opaque personId/companyId + redacted per-entry errors only (never the person name or primaryEmail).",
+      schema: PersonReconcileSchema,
       lifetime: "3d",
       garbageCollection: 25,
     },
@@ -13664,177 +14038,34 @@ export const model = {
             "Refusing to write without confirm:true (use dryRun:true to plan)",
           );
         }
-        const email = validateEmail(args.email);
-        if (!email) throw new Error("Invalid email");
 
         // PU-5: the ENTIRE flow is wrapped so an ambiguous-email throw or any 4xx
         // that echoes a submitted value is redacted before it reaches logs.
         try {
-          // Resolve the provided name parts. A single `name` splits into
-          // first/last; explicit firstName/lastName win. `nameProvided` gates
-          // whether an update touches the name at all (PU-2).
-          let providedFirst: string | undefined;
-          let providedLast: string | undefined;
-          if (args.name != null && String(args.name).trim()) {
-            const sp = splitName(args.name);
-            providedFirst = sp.firstName;
-            providedLast = sp.lastName;
-          } else {
-            if (args.firstName != null) {
-              providedFirst = sanitizeText(args.firstName, 120);
-            }
-            if (args.lastName != null) {
-              providedLast = sanitizeText(args.lastName, 120);
-            }
-          }
-          const nameProvided = providedFirst !== undefined ||
-            providedLast !== undefined;
-
-          // Non-name fields, included only when actually provided + non-empty.
-          const phone = args.phone != null ? normalizePhone(args.phone) : "";
-          const jobTitle = args.jobTitle != null
-            ? sanitizeText(args.jobTitle, 120)
-            : undefined;
-          const city = args.city != null
-            ? sanitizeText(args.city, 120)
-            : undefined;
-
-          // Company (optional): dedup by domain, else exact filter-safe name.
-          // Create ONLY when a domain is supplied; a name-only miss is left
-          // unlinked (recorded), mirroring upsertOpportunity to avoid duplicates.
-          let companyId: string | undefined;
-          let companyNote: string | undefined;
-          const companyName = sanitizeText(args.companyName, 120);
-          const companyDomain = validateDomain(args.companyDomain) ?? undefined;
-          if (companyDomain || companyName) {
-            let existingCo: Record<string, unknown> | null = null;
-            if (companyDomain) {
-              existingCo = await findOneCompanyByDomain(cfg, companyDomain);
-            }
-            if (!existingCo && companyName && isFilterSafe(companyName)) {
-              existingCo = await findOneCompanyByName(cfg, companyName);
-            }
-            if (existingCo) {
-              companyId = String(existingCo.id ?? "");
-            } else if (companyDomain && !args.dryRun) {
-              const co = await createCompany(cfg, {
-                name: companyName || companyDomain,
-                domain: companyDomain,
-              });
-              companyId = String(co.id ?? "");
-            } else if (!companyDomain) {
-              companyNote = companyName && !isFilterSafe(companyName)
-                ? "company not linked: name has filter-unsafe characters and no domain to dedup by"
-                : "company not linked: name-only with no domain match (not blind-created to avoid duplicates)";
-            }
-          }
-
-          // PU-2: build the name field. On create, use the provided parts (empty
-          // where unset). On update, MERGE with the existing record so a partial
-          // {firstName|lastName} never nulls the other subfield; omit name
-          // entirely when the caller provided none.
-          const nameFieldFor = (
-            existing: Record<string, unknown> | null,
-          ): { firstName: string; lastName: string } | undefined => {
-            if (!existing) {
-              return {
-                firstName: providedFirst ?? "",
-                lastName: providedLast ?? "",
-              };
-            }
-            if (!nameProvided) return undefined;
-            const en =
-              (existing.name as { firstName?: unknown; lastName?: unknown }) ??
-                {};
-            // Merge, treating an EMPTY provided part as "not provided" so a
-            // single-token `name` (splitName -> firstName:"") never nulls an
-            // existing subfield (PU-2). Use `||`, not `??`, since the empty
-            // string is exactly the case we must fall back to existing on.
-            return {
-              firstName: providedFirst || String(en.firstName ?? ""),
-              lastName: providedLast || String(en.lastName ?? ""),
-            };
-          };
-
-          const commonFields: PersonWriteFields = {
-            ...(phone ? { phone } : {}),
-            ...(jobTitle ? { jobTitle } : {}),
-            ...(city ? { city } : {}),
-            ...(companyId ? { companyId } : {}),
-          };
-
-          // Idempotency lookup — decides create vs update.
-          const existingPerson = await findOnePersonByEmail(cfg, email);
-
-          let personId = existingPerson ? String(existingPerson.id ?? "") : "";
-          let action:
-            | "created"
-            | "updated"
-            | "planned-create"
-            | "planned-update";
-          let writeFields: PersonWriteFields;
-          // Track whether a bad phone was dropped on retry, so `fieldsSet` in the
-          // snapshot reports what was actually written, not what was requested.
-          let phoneDropped = false;
-
-          if (existingPerson) {
-            const nameField = nameFieldFor(existingPerson);
-            writeFields = {
-              ...commonFields,
-              ...(nameField ? { name: nameField } : {}),
-            };
-            action = args.dryRun ? "planned-update" : "updated";
-            if (!args.dryRun) {
-              const res = await updatePerson(cfg, personId, writeFields);
-              phoneDropped = res.phoneDropped;
-            }
-          } else {
-            const nameField = nameFieldFor(null);
-            writeFields = {
-              ...commonFields,
-              ...(nameField ? { name: nameField } : {}),
-            };
-            if (args.dryRun) {
-              action = "planned-create";
-            } else {
-              try {
-                const created = await createPersonCurated(
-                  cfg,
-                  email,
-                  writeFields,
-                );
-                personId = String(created.record.id ?? "");
-                phoneDropped = created.phoneDropped;
-                action = "created";
-              } catch (e) {
-                // PU-1: a concurrent run may have created this email between our
-                // lookup and POST — converge on it instead of duplicating.
-                const raced = await findOnePersonByEmail(cfg, email);
-                if (raced) {
-                  personId = String(raced.id ?? "");
-                  const mergedName = nameFieldFor(raced);
-                  writeFields = {
-                    ...commonFields,
-                    ...(mergedName ? { name: mergedName } : {}),
-                  };
-                  const res = await updatePerson(cfg, personId, writeFields);
-                  phoneDropped = res.phoneDropped;
-                  action = "updated";
-                } else {
-                  throw e;
-                }
-              }
-            }
-          }
-          // What was actually written: drop `phone` if the retry stripped it.
-          const setFields = personFieldsSet(writeFields).filter(
-            (k) => !(phoneDropped && k === "phone"),
+          // Delegate to the shared single-person primitive (find-or-create with
+          // field-diff/noop detection): an unchanged re-run now returns noop and
+          // issues NO PATCH.
+          const result = await upsertPersonCore(
+            cfg,
+            {
+              primaryEmail: args.email,
+              firstName: args.firstName,
+              lastName: args.lastName,
+              name: args.name,
+              phone: args.phone,
+              jobTitle: args.jobTitle,
+              city: args.city,
+              companyDomain: args.companyDomain,
+              companyName: args.companyName,
+            },
+            args.dryRun,
           );
+          const personId = result.personId ?? "";
 
           context.logger.info(
             "upsertPerson: {action} (person {person}){dry}",
             {
-              action,
+              action: result.action,
               person: personId || "-",
               dry: args.dryRun ? " [dryRun]" : "",
             },
@@ -13842,13 +14073,13 @@ export const model = {
 
           const snap: Record<string, unknown> = {
             baseUrl: cfg.baseUrl,
-            action,
+            action: result.action,
             dryRun: args.dryRun,
-            ...(personId ? { personId } : {}),
-            fieldsSet: setFields,
-            ...(companyId ? { companyId } : {}),
-            companyLinked: Boolean(companyId),
-            ...(companyNote ? { companyNote } : {}),
+            ...(result.personId ? { personId: result.personId } : {}),
+            fieldsSet: result.fieldsSet,
+            ...(result.companyId ? { companyId: result.companyId } : {}),
+            companyLinked: result.companyLinked,
+            ...(result.companyNote ? { companyNote: result.companyNote } : {}),
             retrievedAt: new Date().toISOString(),
           };
           const handle = await context.writeResource(
@@ -14141,6 +14372,176 @@ export const model = {
         } catch (e) {
           // SEC-8 parity with upsertCompany/exportCompanies: scrub the token so it
           // can never leak into a durable method-summary report on a hard error.
+          throw new Error(redactError(e, 300, cfg.apiToken));
+        }
+      },
+    },
+    reconcilePeople: {
+      description:
+        "Declarative Person reconcile fan-out (TWENTY-PERSON-UPSERT, repo rule 6): take a desired-state LIST of person entries (authored as tracked YAML, wired in by the caller - the extension has no filesystem primitive) and upsert each in ONE execution. primaryEmail-first find-or-create per entry; PER-ENTRY ISOLATION (one bad row is recorded as its INDEX + a REDACTED error ONLY - never the person name or primaryEmail - and never aborts the batch); a full per-entry plan under the default dryRun; confirm gates the" +
+        " whole batch. NEVER stamps a leadId (curated contacts stay out of the lead namespace). NO reconcile-delete (YAML-absent people are never archived). A MANDATORY per-run entry cap (default 100) refuses an over-cap batch unless maxEntries is explicitly raised (never uncapped). A clean re-run converges to every entry action==noop. Snapshots a scoped `peopleReconcile` audit (no raw PII - index/action/fieldsSet + redacted per-entry errors only).",
+      arguments: z.object({
+        entries: z
+          .array(
+            z.object({
+              primaryEmail: z.string(),
+              name: z
+                .object({
+                  firstName: z.string().optional(),
+                  lastName: z.string().optional(),
+                })
+                .optional(),
+              phone: z.string().optional(),
+              jobTitle: z.string().optional(),
+              city: z.string().optional(),
+              companyDomain: z.string().optional(),
+              companyName: z.string().optional(),
+            }),
+          )
+          .default([])
+          .describe("Desired-state person list (from the tracked YAML)"),
+        source: z
+          .string()
+          .default("crm/people.yaml")
+          .describe(
+            "Provenance label recorded in the audit (not read as a file)",
+          ),
+        confirm: z
+          .boolean()
+          .default(false)
+          .describe("Must be true to actually write the batch"),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe("Plan every entry, write nothing (defaults TRUE)"),
+        maxEntries: z
+          .number()
+          .int()
+          .positive()
+          .max(1000)
+          .default(100)
+          .describe(
+            "Per-run entry cap. A batch larger than this is refused - raise it explicitly to override (never uncapped by default).",
+          ),
+      }),
+      execute: async (
+        args: {
+          entries: Array<{
+            primaryEmail: string;
+            name?: { firstName?: string; lastName?: string };
+            phone?: string;
+            jobTitle?: string;
+            city?: string;
+            companyDomain?: string;
+            companyName?: string;
+          }>;
+          source: string;
+          confirm: boolean;
+          dryRun: boolean;
+          maxEntries: number;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const cfg = context.globalArgs;
+        if (!args.dryRun && !args.confirm) {
+          throw new Error(
+            "Refusing to reconcile without confirm:true (use dryRun:true to plan)",
+          );
+        }
+        try {
+          const entries = args.entries ?? [];
+          if (entries.length > args.maxEntries) {
+            throw new Error(
+              `Desired-state list has ${entries.length} entries, over the cap of ${args.maxEntries}; raise maxEntries explicitly to process more (refusing an uncapped batch)`,
+            );
+          }
+          const out: Array<Record<string, unknown>> = [];
+          const counts: Record<string, number> = {};
+          // An empty batch is trivially converged; any non-noop entry flips it false.
+          let converged = true;
+          for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            try {
+              const result = await upsertPersonCore(
+                cfg,
+                {
+                  primaryEmail: entry.primaryEmail,
+                  firstName: entry.name?.firstName,
+                  lastName: entry.name?.lastName,
+                  phone: entry.phone,
+                  jobTitle: entry.jobTitle,
+                  city: entry.city,
+                  companyDomain: entry.companyDomain,
+                  companyName: entry.companyName,
+                },
+                args.dryRun,
+              );
+              counts[result.action] = (counts[result.action] ?? 0) + 1;
+              if (result.action !== "noop") converged = false;
+              out.push({
+                index: i,
+                ok: true,
+                action: result.action,
+                found: result.found,
+                ...(result.personId ? { personId: result.personId } : {}),
+                fieldsSet: result.fieldsSet,
+                ...(result.companyId ? { companyId: result.companyId } : {}),
+                companyLinked: result.companyLinked,
+              });
+            } catch (e) {
+              // PER-ENTRY ISOLATION: one bad row never aborts the batch. The
+              // audit records the INDEX + a REDACTED error ONLY - deliberately
+              // NOT the person name or primaryEmail (unlike reconcileCompanies,
+              // which echoes company name/domain: a Person entry carries raw
+              // PII, so it is dropped). The entry's primaryEmail AND name tokens
+              // (firstName/lastName) are passed as extra secrets so even a value
+              // echoed back in a Twenty 4xx response body is scrubbed before it
+              // reaches the durable snapshot.
+              counts.error = (counts.error ?? 0) + 1;
+              converged = false;
+              out.push({
+                index: i,
+                ok: false,
+                error: redactError(e, 300, cfg.apiToken, [
+                  entry?.primaryEmail,
+                  entry?.name?.firstName,
+                  entry?.name?.lastName,
+                ]),
+              });
+            }
+          }
+          context.logger.info(
+            "reconcilePeople: {processed}/{total} processed, converged={converged}{dry}",
+            {
+              processed: out.length,
+              total: entries.length,
+              converged,
+              dry: args.dryRun ? " [dryRun]" : "",
+            },
+          );
+          const handle = await context.writeResource(
+            "peopleReconcile",
+            `people-reconcile-${await listInstanceHash({
+              source: args.source,
+              n: entries.length,
+            })}`,
+            {
+              baseUrl: cfg.baseUrl,
+              source: args.source,
+              dryRun: args.dryRun,
+              total: entries.length,
+              processed: out.length,
+              cap: args.maxEntries,
+              counts,
+              converged,
+              entries: out,
+              retrievedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } catch (e) {
+          // SEC-8 parity with reconcileCompanies: scrub the token so it can never
+          // leak into a durable method-summary report on a hard error.
           throw new Error(redactError(e, 300, cfg.apiToken));
         }
       },

@@ -75,6 +75,7 @@ import {
   OpportunityUpsertSchema,
   OppViewSchema,
   parseMicros,
+  PersonReconcileSchema,
   phoneLooksBogus,
   pickLastMessage,
   planLead,
@@ -12485,10 +12486,12 @@ Deno.test("redactError masks additional literal secrets (TE-1)", () => {
   );
   assert(!out.includes("hunter2"), "leaked the send password");
   assert(!out.includes("usr-token-xyz"), "leaked the minted user token");
-  // Backward compatible: undefined/short secrets are ignored, not thrown on.
+  // Backward compatible: undefined / 1-char secrets are ignored, not thrown on
+  // (only secrets of length >= 2 are scrubbed). "a" is a 1-char secret and is
+  // present in "plain" yet left untouched.
   const out2 = redactError(new Error("plain"), 300, undefined, [
     undefined,
-    "ab",
+    "a",
   ]);
   assertEquals(out2, "plain");
 });
@@ -13832,6 +13835,674 @@ Deno.test("upsertCompany: refuses a live write without confirm", async () => {
         ),
       Error,
       "confirm:true",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- upsertPersonCore noop (TWENTY-PERSON-UPSERT) ---------------------------
+// The upsertPerson rewire onto the shared core: an UNCHANGED re-run now returns
+// noop and issues NO PATCH (it no longer unconditionally PATCHes an existing
+// person). A stateful in-memory people store so the second lookup sees the
+// record the first run created.
+function statefulPeopleHandler(
+  people: Array<Record<string, unknown>>,
+): (
+  method: string,
+  path: string,
+  body: unknown,
+) => { status?: number; body?: unknown } {
+  let pid = people.length;
+  return (method, path, body) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      const m = path.match(/emails\.primaryEmail\[eq\]:([^&]+)/);
+      const email = m ? decodeURIComponent(m[1]).toLowerCase() : "";
+      const matches = people.filter((p) =>
+        String(
+          (p.emails as { primaryEmail?: unknown } | undefined)
+            ?.primaryEmail ?? "",
+        ).toLowerCase() === email
+      );
+      return { body: { data: { people: matches } } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      const rec = { id: `p${++pid}`, ...(body as Record<string, unknown>) };
+      people.push(rec);
+      return { body: { data: { createPerson: rec } } };
+    }
+    if (method === "PATCH" && path.startsWith("/rest/people/")) {
+      const id = path.split("/").pop();
+      const rec = people.find((p) => p.id === id);
+      if (rec) Object.assign(rec, body as Record<string, unknown>);
+      return { body: { data: { updatePerson: rec ?? {} } } };
+    }
+    return {};
+  };
+}
+
+Deno.test("upsertPerson: an unchanged re-run returns noop and issues NO PATCH", async () => {
+  const people: Array<Record<string, unknown>> = [];
+  const { calls, restore } = stubFetchStatus(statefulPeopleHandler(people));
+  const { writes, ctx } = readCtx();
+  try {
+    const run = () =>
+      model.methods.upsertPerson.execute(
+        {
+          ...PERSON_ARGS,
+          email: "ada@corp.com",
+          firstName: "Ada",
+          lastName: "Lovelace",
+          jobTitle: "CTO",
+          confirm: true,
+        } as never,
+        ctx as never,
+      );
+    await run(); // first run creates
+    assertEquals(writes.at(-1)!.data.action, "created");
+    await run(); // identical re-run -> noop, no PATCH
+    assertEquals(writes.at(-1)!.data.action, "noop");
+    assertEquals((writes.at(-1)!.data.fieldsSet as string[]).length, 0);
+    assert(!calls.some((c) => c.method === "PATCH"), "noop must not PATCH");
+    // Exactly one person ever created.
+    assertEquals(people.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+// --- reconcilePeople (TWENTY-PERSON-UPSERT) ---------------------------------
+// A stateful in-memory people + company server (reuses stubCompanyFetch's
+// generic payload wrapping). The people GET filters by primaryEmail so
+// find-or-create round-trips; companies carry domainName.primaryLinkUrl so the
+// per-person company link dedups by domain.
+function peopleServer(opts: {
+  people?: Array<Record<string, unknown>>;
+  companies?: Array<Record<string, unknown>>;
+} = {}) {
+  const people = opts.people ?? [];
+  const companies = opts.companies ?? [];
+  let nextPid = 1;
+  let nextCid = 1;
+  const handler = (method: string, path: string, body: unknown) => {
+    if (method === "GET" && path.startsWith("/rest/people")) {
+      const m = path.match(/emails\.primaryEmail\[eq\]:([^&]+)/);
+      const email = m ? decodeURIComponent(m[1]).toLowerCase() : null;
+      const matches = email
+        ? people.filter((p) =>
+          String(
+            (p.emails as { primaryEmail?: unknown } | undefined)
+              ?.primaryEmail ?? "",
+          ).toLowerCase() === email
+        )
+        : people;
+      return { data: { people: matches } };
+    }
+    if (method === "POST" && path === "/rest/people") {
+      const rec = { id: `p${nextPid++}`, ...(body as Record<string, unknown>) };
+      people.push(rec);
+      return { data: { createPerson: rec } };
+    }
+    if (method === "PATCH" && path.startsWith("/rest/people/")) {
+      const id = path.split("/").pop();
+      const rec = people.find((p) => p.id === id);
+      if (rec) Object.assign(rec, body as Record<string, unknown>);
+      return { data: { updatePerson: rec ?? {} } };
+    }
+    if (method === "GET" && path.startsWith("/rest/companies")) {
+      const m = path.match(/domainName\.primaryLinkUrl\[eq\]:([^&]+)/);
+      const domain = m ? decodeURIComponent(m[1]) : null;
+      const matches = domain
+        ? companies.filter((c) =>
+          String(
+            (c.domainName as { primaryLinkUrl?: unknown } | undefined)
+              ?.primaryLinkUrl ?? "",
+          ) === domain
+        )
+        : companies;
+      return { data: { companies: matches } };
+    }
+    if (method === "POST" && path === "/rest/companies") {
+      const rec = { id: `co${nextCid++}`, ...(body as Record<string, unknown>) };
+      companies.push(rec);
+      return { data: { createCompany: rec } };
+    }
+    return {};
+  };
+  return { people, companies, handler };
+}
+
+Deno.test("reconcilePeople: dryRun plans every entry and writes nothing", async () => {
+  const srv = peopleServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "a@corp.com", name: { firstName: "Al" } },
+          { primaryEmail: "b@corp.com", jobTitle: "VP" },
+        ],
+        source: "crm/people.yaml",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.processed, 2);
+    assertEquals(snap.entries[0].action, "planned-create");
+    assertEquals(snap.entries[1].action, "planned-create");
+    assert(
+      !calls.some((c) => c.method === "POST" || c.method === "PATCH"),
+      "dryRun writes nothing",
+    );
+    assertEquals(srv.people.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: confirm creates a new person and patches an existing one", async () => {
+  const srv = peopleServer({
+    people: [{
+      id: "pX",
+      emails: { primaryEmail: "exist@corp.com" },
+      name: { firstName: "Ex", lastName: "Ist" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "new@corp.com", name: { firstName: "Nw" } },
+          { primaryEmail: "exist@corp.com", jobTitle: "CTO" },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.entries[0].action, "created");
+    assertEquals(snap.entries[1].action, "updated");
+    assert(
+      calls.some((c) => c.method === "POST" && c.path === "/rest/people"),
+      "new person POSTed",
+    );
+    assert(
+      calls.some((c) => c.method === "PATCH" && c.path === "/rest/people/pX"),
+      "existing person PATCHed",
+    );
+    assert((snap.entries[1].fieldsSet ?? []).includes("jobTitle"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: a bad entry is index + redacted error (no name/email); batch continues", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "good@corp.com", name: { firstName: "Good" } },
+          // Invalid email -> aborts THIS entry only. The name is deliberately
+          // populated to prove it is NOT echoed into the audit.
+          { primaryEmail: "not-an-email", name: { firstName: "SecretFirst", lastName: "SecretLast" } },
+        ],
+        source: "crm/people.yaml",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.processed, 2);
+    assertEquals(snap.entries[0].ok, true);
+    assertEquals(snap.entries[0].action, "planned-create");
+    const bad = snap.entries[1];
+    assertEquals(bad.ok, false);
+    assertEquals(bad.index, 1);
+    assert(bad.error && bad.error.length > 0, "bad entry carries an error");
+    // No name/email on the bad entry - isolated per-entry record drops PII.
+    assert(!("name" in bad), "no name key on the bad entry");
+    const blob = JSON.stringify(bad);
+    assert(!blob.includes("SecretFirst"), "name must not leak");
+    assert(!blob.includes("SecretLast"), "name must not leak");
+    assert(!blob.includes("not-an-email"), "email must not leak");
+    assertEquals(snap.converged, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: an API error echoing the submitted name never leaks it into the snapshot", async () => {
+  // Regression (PII-scrub gap): twentyRequest embeds the server response body
+  // (text.slice(0,300)) in the thrown Error, so a Twenty 4xx whose body ECHOES
+  // the submitted firstName/lastName would carry that name into the durable
+  // peopleReconcile audit unless the per-entry error branch passes the name
+  // tokens to redactError. (Names are not caught by redactError's generic
+  // bearer/email/digit scrubbers, so this is the only thing that scrubs them.)
+  const LEAK_EMAIL = "leak@corp.com";
+  const FIRST = "Zmirblax";
+  const LAST = "Qwotzim";
+  const srv = peopleServer();
+  const handler = (method: string, path: string, body: unknown) => {
+    if (method === "POST" && path === "/rest/people") {
+      const b = body as {
+        emails?: { primaryEmail?: string };
+        name?: { firstName?: string; lastName?: string };
+      };
+      if (b?.emails?.primaryEmail === LEAK_EMAIL) {
+        // A Twenty 400 whose body reflects the submitted name back at us.
+        return {
+          __status: 400,
+          __body: {
+            messages: [
+              `Validation failed for firstName='${b?.name?.firstName}' ` +
+              `lastName='${b?.name?.lastName}'`,
+            ],
+          },
+        };
+      }
+    }
+    return srv.handler(method, path, body);
+  };
+  const { restore } = stubCompanyFetch(handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "good@corp.com", name: { firstName: "Good" } },
+          {
+            primaryEmail: LEAK_EMAIL,
+            name: { firstName: FIRST, lastName: LAST },
+          },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    // Per-entry isolation still holds: the good entry is created.
+    assertEquals(snap.entries[0].ok, true);
+    assertEquals(snap.entries[0].action, "created");
+    const bad = snap.entries[1];
+    assertEquals(bad.ok, false);
+    assertEquals(bad.index, 1);
+    assert(bad.error && bad.error.length > 0, "bad entry carries an error");
+    // The name echoed in the 400 body must be SCRUBBED out of the snapshot.
+    const blob = JSON.stringify(snap);
+    assert(
+      !blob.includes(FIRST),
+      "echoed firstName must not leak into the snapshot",
+    );
+    assert(
+      !blob.includes(LAST),
+      "echoed lastName must not leak into the snapshot",
+    );
+    assert(
+      bad.error!.includes("[redacted]"),
+      "the echoed name is redacted in place",
+    );
+    assertEquals(snap.converged, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: a 4xx echoing a SHORT (2-char) name still never leaks it into the snapshot", async () => {
+  // Regression (redactError >= 4 gap): the per-entry error branch passes the
+  // submitted firstName/lastName to redactError as explicit secrets, but the
+  // old `sec.length >= 4` guard SILENTLY SKIPPED short real names (< 4 chars —
+  // "Ed", "Li", "Eli", "Ann"). A Twenty 4xx echoing such a short submitted name
+  // would then carry it into the durable peopleReconcile audit. The >= 2 floor
+  // closes that gap. (Names are not caught by redactError's generic
+  // bearer/email/digit scrubbers, so this explicit scrub is the only thing that
+  // removes them.)
+  const LEAK_EMAIL = "leak@corp.com";
+  const FIRST = "Ed";
+  const LAST = "Li";
+  const srv = peopleServer();
+  const handler = (method: string, path: string, body: unknown) => {
+    if (method === "POST" && path === "/rest/people") {
+      const b = body as {
+        emails?: { primaryEmail?: string };
+        name?: { firstName?: string; lastName?: string };
+      };
+      if (b?.emails?.primaryEmail === LEAK_EMAIL) {
+        // A Twenty 400 whose body reflects the submitted short name back at us.
+        return {
+          __status: 400,
+          __body: {
+            messages: [
+              `Validation failed for firstName='${b?.name?.firstName}' ` +
+              `lastName='${b?.name?.lastName}'`,
+            ],
+          },
+        };
+      }
+    }
+    return srv.handler(method, path, body);
+  };
+  const { restore } = stubCompanyFetch(handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "good@corp.com", name: { firstName: "Good" } },
+          {
+            primaryEmail: LEAK_EMAIL,
+            name: { firstName: FIRST, lastName: LAST },
+          },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    const bad = snap.entries[1];
+    assertEquals(bad.ok, false);
+    assertEquals(bad.index, 1);
+    assert(bad.error && bad.error.length > 0, "bad entry carries an error");
+    // The SHORT name echoed in the 400 body must be SCRUBBED out of the snapshot.
+    const blob = JSON.stringify(snap);
+    assert(
+      !blob.includes(`firstName='${FIRST}'`),
+      "echoed short firstName must not leak into the snapshot",
+    );
+    assert(
+      !blob.includes(`lastName='${LAST}'`),
+      "echoed short lastName must not leak into the snapshot",
+    );
+    assert(
+      bad.error!.includes("[redacted]"),
+      "the echoed short name is redacted in place",
+    );
+    assertEquals(snap.converged, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: a clean re-run converges to all-noop with no PATCH", async () => {
+  const srv = peopleServer({
+    people: [{
+      id: "p-ada",
+      emails: { primaryEmail: "ada@corp.com" },
+      name: { firstName: "Ada", lastName: "Lovelace" },
+      jobTitle: "CTO",
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          {
+            primaryEmail: "ada@corp.com",
+            name: { firstName: "Ada", lastName: "Lovelace" },
+            jobTitle: "CTO",
+          },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.converged, true);
+    assertEquals(snap.entries[0].action, "noop");
+    assertEquals((snap.counts as Record<string, number>).noop, 1);
+    assert(!calls.some((c) => c.method === "PATCH"), "noop must not PATCH");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: an EMPTY batch is converged", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [],
+        source: "crm/people.yaml",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.processed, 0);
+    assertEquals(snap.converged, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: a partial name update never nulls the unset subfield", async () => {
+  const srv = peopleServer({
+    people: [{
+      id: "p1",
+      emails: { primaryEmail: "ada@corp.com" },
+      name: { firstName: "Ada", lastName: "Lovelace" },
+    }],
+  });
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "ada@corp.com", name: { firstName: "Augusta" } },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const patch = calls.find((c) => c.method === "PATCH");
+    const pbody = patch!.body as Record<string, unknown>;
+    // firstName updated, lastName preserved from the existing record.
+    assertEquals(pbody.name, { firstName: "Augusta", lastName: "Lovelace" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: company link dedupes by domain (one company for two people)", async () => {
+  const srv = peopleServer();
+  const { calls, restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "a@corp.com", companyDomain: "corp.com" },
+          { primaryEmail: "b@corp.com", companyDomain: "corp.com" },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const companyPosts = calls.filter(
+      (c) => c.method === "POST" && c.path === "/rest/companies",
+    );
+    assertEquals(companyPosts.length, 1); // second entry dedups onto the first
+    const snap = PersonReconcileSchema.parse(writes.at(-1)!.data);
+    assertEquals(snap.entries[0].companyLinked, true);
+    assertEquals(snap.entries[1].companyLinked, true);
+    assertEquals(snap.entries[0].companyId, snap.entries[1].companyId);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: an over-cap batch is refused unless maxEntries is raised", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.reconcilePeople.execute(
+          asAny({
+            entries: [
+              { primaryEmail: "a@corp.com" },
+              { primaryEmail: "b@corp.com" },
+            ],
+            source: "x",
+            confirm: false,
+            dryRun: true,
+            maxEntries: 1,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "over the cap",
+    );
+    // Raising the cap lets the same batch through.
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          { primaryEmail: "a@corp.com" },
+          { primaryEmail: "b@corp.com" },
+        ],
+        source: "x",
+        confirm: false,
+        dryRun: true,
+        maxEntries: 2,
+      }),
+      asAny(ctx),
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: the peopleReconcile snapshot carries no raw PII", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx, writes } = makeCaptureCtx();
+  try {
+    await model.methods.reconcilePeople.execute(
+      asAny({
+        entries: [
+          {
+            primaryEmail: "jane.doe@corp.com",
+            name: { firstName: "Jane", lastName: "Doe" },
+            phone: "781-555-0199",
+            jobTitle: "CFO",
+            city: "Boston",
+          },
+        ],
+        source: "crm/people.yaml",
+        confirm: true,
+        dryRun: false,
+        maxEntries: 100,
+      }),
+      asAny(ctx),
+    );
+    const w = writes.find((w) => w.type === "peopleReconcile")!;
+    PersonReconcileSchema.parse(w.data);
+    const blob = JSON.stringify(w.data);
+    for (
+      const pii of ["jane.doe@corp.com", "Jane", "Doe", "781", "CFO", "Boston"]
+    ) {
+      assert(!blob.includes(pii), `snapshot must not leak '${pii}'`);
+    }
+    // ...but it DOES carry the opaque personId + which fields were set.
+    const e0 = (w.data.entries as Array<Record<string, unknown>>)[0];
+    assert(typeof e0.personId === "string" && e0.personId.length > 0);
+    assert((e0.fieldsSet as string[]).includes("name"));
+    assert((e0.fieldsSet as string[]).includes("jobTitle"));
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: refuses a live write without confirm", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const { ctx } = makeCaptureCtx();
+  try {
+    await assertRejects(
+      () =>
+        model.methods.reconcilePeople.execute(
+          asAny({
+            entries: [{ primaryEmail: "a@corp.com" }],
+            source: "x",
+            confirm: false,
+            dryRun: false,
+            maxEntries: 100,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+      "confirm:true",
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("reconcilePeople: an outer failure rejects with a token-scrubbed error", async () => {
+  const srv = peopleServer();
+  const { restore } = stubCompanyFetch(srv.handler);
+  const SECRET = "sk-people-reconcile-secret";
+  const ctx = {
+    globalArgs: { baseUrl: "https://crm.example.com", apiToken: SECRET },
+    logger: { debug() {}, info() {}, warning() {}, error() {} },
+    writeResource: () => {
+      throw new Error(`persist failed with ${SECRET}`);
+    },
+  };
+  try {
+    const err = await assertRejects(
+      () =>
+        model.methods.reconcilePeople.execute(
+          asAny({
+            entries: [{ primaryEmail: "a@corp.com" }],
+            source: "x",
+            confirm: false,
+            dryRun: true,
+            maxEntries: 100,
+          }),
+          asAny(ctx),
+        ),
+      Error,
+    );
+    assert(
+      !err.message.includes(SECRET),
+      "the apiToken must be scrubbed from the outer error",
     );
   } finally {
     restore();
