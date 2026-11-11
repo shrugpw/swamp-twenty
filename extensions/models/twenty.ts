@@ -8523,7 +8523,9 @@ async function upsertPersonCore(
     };
   }
   const res = await updatePerson(cfg, personId, fields);
-  const setFields = fieldsSet.filter((k) => !(res.phoneDropped && k === "phone"));
+  const setFields = fieldsSet.filter((k) =>
+    !(res.phoneDropped && k === "phone")
+  );
   return {
     found: true,
     action: "updated",
